@@ -53,6 +53,8 @@ services:
       AGENT_CONSOLE_LOG_DIR: ${AGENT_CONSOLE_LOG_DIR:-/workspace/logs/console}
       # Explicit direct-input capability; false unless an adapter reads a PTY.
       AGENT_CONSOLE_DIRECT_INPUT: ${AGENT_CONSOLE_DIRECT_INPUT:-false}
+      # Ephemeral container-only location; deliberately never bind-mounted.
+      AGENT_CONSOLE_SOCKET_DIR: ${AGENT_CONSOLE_SOCKET_DIR:-/tmp/lao-console}
       HOME: /home/agent
       CODEX_HOME: /home/agent/.codex
     volumes:

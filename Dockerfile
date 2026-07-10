@@ -20,7 +20,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Baseline tools agent backends rely on (git, ps, curl, jq, rg).
+# Baseline tools agent backends rely on (git, ps, curl, jq, rg). tmux hosts the
+# optional per-run interactive console (AGENT_CONSOLE); it is inert when the
+# feature is disabled.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
        ca-certificates \
@@ -29,6 +31,7 @@ RUN apt-get update \
        jq \
        procps \
        ripgrep \
+       tmux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -45,14 +48,16 @@ COPY --from=agent-cli /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex \
     && ln -s /usr/local/lib/node_modules/oh-my-codex/dist/cli/omx.js /usr/local/bin/omx \
     && ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude \
-    && install -m 0755 scripts/agent-runner.sh /usr/local/bin/lao-agent-runner
+    && install -m 0755 scripts/agent-runner.sh /usr/local/bin/lao-agent-runner \
+    && install -m 0755 scripts/lao-pty-host.sh /usr/local/bin/lao-pty-host \
+    && install -m 0755 scripts/lao-pty-entry.sh /usr/local/bin/lao-pty-entry
 
 RUN pip install --upgrade pip \
     && pip install -e '.[test]'
 
 RUN (getent group "${LAO_GID}" >/dev/null || groupadd --gid "${LAO_GID}" agent) \
     && useradd --create-home --home-dir /home/agent --uid "${LAO_UID}" --gid "${LAO_GID}" --non-unique agent \
-    && mkdir -p /workspace/data /workspace/work /workspace/artifacts /workspace/project \
+    && mkdir -p /workspace/data /workspace/work /workspace/artifacts /workspace/project /workspace/logs \
     && chown -R "${LAO_UID}:${LAO_GID}" /app /workspace /home/agent
 
 ENV HOME=/home/agent \

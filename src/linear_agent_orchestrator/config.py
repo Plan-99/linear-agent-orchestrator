@@ -69,6 +69,20 @@ class RunnerConfig:
     allowed_env: tuple[str, ...] = field(default_factory=tuple)
     project_dir: str = "/workspace/project"
     backend: str = "omx"
+    # Interactive console (model-neutral tmux/PTY host). Default off keeps the
+    # execution path byte-identical. The tmux socket lives under an ephemeral,
+    # container-private path (never a bind mount, never the host tmux socket);
+    # only lifecycle JSONL and the output log live under the bind-mounted log
+    # root so a host supervisor can observe and attach via `docker exec`.
+    interactive_console: bool = False
+    console_log_dir: str = "/workspace/logs/console"
+    console_socket_dir: str = "/tmp/lao-console"
+    # Backend/model-neutral capability metadata: whether the hosted command
+    # actually reads the PTY, so a host supervisor may honestly offer read-write
+    # (operator-typing) attach. Default false — the bundled one-shot omx/codex/
+    # claude adapters ignore tty input. An interactive/custom runner opts in via
+    # AGENT_CONSOLE_DIRECT_INPUT=true. This never relaxes the result.json gate.
+    console_direct_input: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +274,10 @@ def load_config(
             allowed_env=_get_csv_tuple(source, "RUNNER_ALLOWED_ENV"),
             project_dir=_get_str(source, "AGENT_PROJECT_DIR", "/workspace/project"),
             backend=_get_str(source, "AGENT_BACKEND", "omx").casefold(),
+            interactive_console=_get_bool(source, "AGENT_CONSOLE", False),
+            console_log_dir=_get_str(source, "AGENT_CONSOLE_LOG_DIR", "/workspace/logs/console"),
+            console_socket_dir=_get_str(source, "AGENT_CONSOLE_SOCKET_DIR", "/tmp/lao-console"),
+            console_direct_input=_get_bool(source, "AGENT_CONSOLE_DIRECT_INPUT", False),
         ),
     )
 
@@ -393,3 +411,10 @@ def _get_int(source: Mapping[str, str], key: str, default: int) -> int:
 def _get_csv_tuple(source: Mapping[str, str], key: str) -> tuple[str, ...]:
     raw = source.get(key, "")
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _get_bool(source: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = source.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}

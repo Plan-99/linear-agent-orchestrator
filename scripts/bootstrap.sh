@@ -134,6 +134,15 @@ if grep -Fqx 'AGENT_BYPASS_PERMISSIONS=false' .env; then
   sed -i 's|^AGENT_BYPASS_PERMISSIONS=false$|AGENT_BYPASS_PERMISSIONS=true|' .env
 fi
 ensure_env_default AGENT_BYPASS_PERMISSIONS true
+# Optional per-run interactive console (tmux/PTY host). `auto` lets
+# scripts/daemon.sh enable it when launched inside tmux; direct Compose/headless
+# runs resolve unknown `auto` to false, so the execution path stays
+# byte-identical unless the daemon exports AGENT_CONSOLE=true. The tmux socket
+# always stays container-private.
+ensure_env_default AGENT_CONSOLE auto
+ensure_env_default AGENT_CONSOLE_DIRECT_INPUT false
+ensure_env_default AGENT_CONSOLE_LOG_DIR /workspace/logs/console
+ensure_env_default AGENT_CONSOLE_SOCKET_DIR /tmp/lao-console
 
 cat <<'MSG'
 Project-local runtime is ready:

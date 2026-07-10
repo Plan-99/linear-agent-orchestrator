@@ -18,9 +18,13 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
 from .config import AppConfig, LinearConfig, RunnerConfig, validate_project_workspace
+from .console_schema import CONSOLE_SCHEMA_VERSION
 from .issue_schema import clarification_comment, validate_issue_body
 from .linear_client import LinearComment, LinearIssue, WorkflowRole, WorkflowState
 from .state import StateStore
@@ -34,7 +38,53 @@ _PLACEHOLDERS = {
     "issue_identifier",
 }
 _SAFE_PATH_PART_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+# Strip ANSI/VT control sequences (CSI, OSC, and single-char escapes) before a
+# pty log reaches redaction or a Linear comment. Escape-split secrets would
+# otherwise survive redaction, and raw sequences render as garbage.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI ... final byte
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL or ST
+    r"|\x1b[P_^X][^\x1b]*(?:\x07|\x1b\\)"  # DCS/APC/PM/SOS ... ST or BEL
+    r"|\x1b[@-Z\\-_]"  # two-char escapes
+)
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ConsoleContext:
+    """Per-run interactive-console paths and the pty-host wrapper argv.
+
+    The socket and run directory live under a container-private, non-mounted
+    path keyed by a fresh run id, so ``materialize``'s per-issue cleanup can
+    never race them and the host tmux socket is never involved. Only the JSONL
+    lifecycle log and output log live under the bind-mounted console log root.
+    """
+
+    run_id: str
+    run_dir: Path
+    socket_path: Path
+    session: str
+    log_path: Path
+    jsonl_path: Path
+    backend: str
+    supports_direct_input: bool
+    wrapper_argv: tuple[str, ...]
+
+    @property
+    def backend_pid_path(self) -> Path:
+        return self.run_dir / "backend_pid"
+
+    @property
+    def backend_starttime_path(self) -> Path:
+        return self.run_dir / "backend_starttime"
+
+    @property
+    def terminated_path(self) -> Path:
+        return self.run_dir / "terminated"
+
+
+def _strip_ansi(value: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", value)
 
 
 class RunnerError(ValueError):
@@ -160,8 +210,17 @@ class ShellRunner:
             },
         )
         env = build_allowlisted_env(self.config.allowed_env)
+        # When the interactive console is enabled the backend is hosted inside a
+        # per-run private tmux session so an operator can watch (and later steer)
+        # it live. The wrapper runs the exact same rendered argv; only the
+        # transport wrapping changes, and RunnerResult still records the original
+        # backend command so audit/state stay truthful.
+        console = self._prepare_console(issue) if self.config.interactive_console else None
+        exec_command: list[str] = list(command)
+        if console is not None:
+            exec_command = [*console.wrapper_argv, *command]
         process = subprocess.Popen(  # noqa: S603 - command is explicitly tokenized without shell=True
-            command,
+            exec_command,
             cwd=paths.work_dir,
             env=env,
             text=True,
@@ -171,42 +230,305 @@ class ShellRunner:
             start_new_session=True,
         )
         try:
-            stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
-            structured_result, result_error = load_structured_result(paths.result_path)
-            return RunnerResult(
-                issue_id=issue.id,
-                issue_identifier=issue.identifier,
-                command=tuple(command),
-                paths=paths,
-                exit_code=process.returncode,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=False,
-                timeout_seconds=self.config.timeout_seconds,
-                structured_result=structured_result,
-                result_error=result_error,
-            )
-        except subprocess.TimeoutExpired:
-            # The backend may have spawned agents, test runners, or language
-            # servers. Killing only the direct process would let descendants
-            # continue mutating the trusted workspace after timeout. Each run
-            # owns a fresh session/process group, so terminate the entire group.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+                stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
+                if console is not None:
+                    stdout = self._console_stdout(console, stdout)
+                structured_result, result_error = load_structured_result(paths.result_path)
+                return RunnerResult(
+                    issue_id=issue.id,
+                    issue_identifier=issue.identifier,
+                    command=tuple(command),
+                    paths=paths,
+                    exit_code=process.returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=False,
+                    timeout_seconds=self.config.timeout_seconds,
+                    structured_result=structured_result,
+                    result_error=result_error,
+                )
+            except subprocess.TimeoutExpired:
+                # The backend may have spawned agents, test runners, or language
+                # servers. Killing only the direct process would let descendants
+                # continue mutating the trusted workspace after timeout. Each run
+                # owns a fresh session/process group, so terminate the entire group.
+                #
+                # With the console enabled the tmux server has daemonized OUT of
+                # this process group, so killpg alone would not reach the backend.
+                # Tear the private server down (and SIGKILL the recorded backend
+                # PID, verified via /proc) before the group kill.
+                if console is not None:
+                    self._teardown_console(console)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
+                if console is not None:
+                    stdout = self._console_stdout(console, stdout)
+                return RunnerResult(
+                    issue_id=issue.id,
+                    issue_identifier=issue.identifier,
+                    command=tuple(command),
+                    paths=paths,
+                    exit_code=None,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=True,
+                    timeout_seconds=self.config.timeout_seconds,
+                )
+        finally:
+            if console is not None:
+                self._cleanup_console(console)
+
+    def _prepare_console(self, issue: LinearIssue) -> _ConsoleContext:
+        """Allocate per-run console paths keyed by a fresh, tmux-safe run id."""
+
+        run_id = uuid.uuid4().hex
+        run_dir = Path(self.config.console_socket_dir) / run_id
+        socket_path = run_dir / "tmux.sock"
+        log_dir = Path(self.config.console_log_dir) / run_id
+        log_path = log_dir / "output.log"
+        jsonl_path = log_dir / "lifecycle.jsonl"
+        session = f"lao-{run_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            run_dir.chmod(0o700)
+        except OSError:
+            pass
+        log_dir.mkdir(parents=True, exist_ok=True)
+        backend = self.config.backend
+        supports_direct_input = self.config.console_direct_input
+        wrapper_argv = (
+            "lao-pty-host",
+            "--schema-version",
+            str(CONSOLE_SCHEMA_VERSION),
+            "--run-id",
+            run_id,
+            "--run-dir",
+            str(run_dir),
+            "--socket",
+            str(socket_path),
+            "--session",
+            session,
+            "--log",
+            str(log_path),
+            "--jsonl",
+            str(jsonl_path),
+            "--backend",
+            backend,
+            "--supports-direct-input",
+            "true" if supports_direct_input else "false",
+            "--issue-id",
+            issue.id,
+            "--issue-identifier",
+            issue.identifier,
+            "--",
+        )
+        return _ConsoleContext(
+            run_id=run_id,
+            run_dir=run_dir,
+            socket_path=socket_path,
+            session=session,
+            log_path=log_path,
+            jsonl_path=jsonl_path,
+            backend=backend,
+            supports_direct_input=supports_direct_input,
+            wrapper_argv=wrapper_argv,
+        )
+
+    def _console_stdout(self, console: _ConsoleContext, fallback: str) -> str:
+        """Prefer the ANSI-stripped pty log for the failure-comment body."""
+
+        text = self._read_console_log(console)
+        return text if text.strip() else fallback
+
+    def _read_console_log(self, console: _ConsoleContext) -> str:
+        try:
+            if console.log_path.is_symlink() or not console.log_path.is_file():
+                return ""
+            with console.log_path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 1024 * 1024))
+                raw = handle.read()
+        except OSError:
+            return ""
+        return _strip_ansi(raw.decode("utf-8", errors="replace"))
+
+    def _teardown_console(self, console: _ConsoleContext) -> None:
+        """Kill the escaped private tmux server and the recorded backend subtree.
+
+        killpg on this runner's own group does not reach a daemonized tmux
+        server, so this is what actually stops the backend from mutating the
+        workspace after a timeout. Steps, in order:
+
+        1. Drop a ``terminated`` marker so the pty host suppresses its own
+           terminal ``session_ended`` event — the runner owns the single
+           terminal event (``session_killed``) on the timeout path.
+        2. SIGKILL the backend's process group, but only after confirming the
+           recorded PID still refers to the same process (matching /proc start
+           time), so a recycled PID can never be killed by mistake. SIGKILL
+           cannot be caught or ignored, so HUP-ignoring in-group descendants die
+           too; only descendants that re-``setsid`` escape (the container remains
+           the outer backstop, exactly as for the non-console path).
+        3. Kill the private tmux server as a belt-and-suspenders reap.
+        """
+
+        try:
+            console.terminated_path.write_text("timeout", encoding="utf-8")
+        except OSError:
+            pass
+
+        backend_pid = self._read_backend_pid(console)
+        recorded_start = self._read_recorded_starttime(console)
+        if backend_pid is not None and self._pid_identity_matches(backend_pid, recorded_start):
+            self._kill_process_group(backend_pid)
+            try:
+                os.kill(backend_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
-            stdout, stderr = process.communicate()
-            return RunnerResult(
-                issue_id=issue.id,
-                issue_identifier=issue.identifier,
-                command=tuple(command),
-                paths=paths,
-                exit_code=None,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=True,
-                timeout_seconds=self.config.timeout_seconds,
+
+        self._kill_tmux_server(console)
+
+        if backend_pid is not None:
+            self._verify_pid_dead(backend_pid)
+        self._append_console_event(console, "session_killed", {"reason": "timeout"})
+
+    def _kill_process_group(self, pid: int) -> None:
+        try:
+            pgid = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        # Never signal the runner's own group (would be self-inflicted).
+        if pgid in (0, 1) or pgid == os.getpgrp():
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def _read_recorded_starttime(self, console: _ConsoleContext) -> str | None:
+        try:
+            value = console.backend_starttime_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value or None
+
+    def _pid_identity_matches(self, pid: int, recorded_start: str | None) -> bool:
+        """Guard against PID reuse: require the /proc start time to be unchanged.
+
+        If no start time was recorded (best-effort miss) fall back to killing the
+        recorded PID — the serial daemon means at most one backend exists, so the
+        reuse window is negligible, but the check is applied whenever possible.
+        """
+
+        current_start = self._read_proc_starttime(pid)
+        if current_start is None:
+            # Process already gone (nothing to kill) — treat as non-matching.
+            return recorded_start is None
+        if recorded_start is None:
+            return True
+        return current_start == recorded_start
+
+    @staticmethod
+    def _read_proc_starttime(pid: int) -> str | None:
+        """Field 22 (starttime) of /proc/<pid>/stat, robust to comm parentheses."""
+
+        try:
+            data = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            after_comm = data[data.rindex(")") + 1 :].split()
+            # After comm the fields start at #3 (state); starttime is field #22.
+            return after_comm[19]
+        except (ValueError, IndexError):
+            return None
+
+    def _kill_tmux_server(self, console: _ConsoleContext) -> None:
+        try:
+            subprocess.run(
+                ["tmux", "-S", str(console.socket_path), "kill-server"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
             )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _read_backend_pid(self, console: _ConsoleContext) -> int | None:
+        try:
+            raw = console.backend_pid_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        try:
+            pid = int(raw)
+        except ValueError:
+            return None
+        return pid if pid > 1 else None
+
+    @staticmethod
+    def _verify_pid_dead(pid: int, attempts: int = 20, interval: float = 0.1) -> bool:
+        # EPERM (PermissionError) means the PID EXISTS but is owned by another
+        # user — the process is still alive, never treat that as dead.
+        for _ in range(attempts):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass  # still alive (exists, not signalable)
+            except OSError:
+                break
+            time.sleep(interval)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _append_console_event(self, console: _ConsoleContext, event: str, extra: dict[str, Any]) -> None:
+        payload: dict[str, Any] = {
+            "event": event,
+            "schema_version": CONSOLE_SCHEMA_VERSION,
+            "run_id": console.run_id,
+        }
+        payload.update(extra)
+        payload["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = json.dumps(payload, separators=(",", ":"))
+        try:
+            console.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            with console.jsonl_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            LOGGER.warning("console_event_write_failed", extra={"run_id": console.run_id, "event": event})
+
+    def _cleanup_console(self, console: _ConsoleContext) -> None:
+        """Best-effort removal of the private server and socket after a run.
+
+        The bind-mounted log directory is intentionally left for host tooling.
+        """
+
+        self._kill_tmux_server(console)
+        try:
+            if console.socket_path.exists():
+                console.socket_path.unlink()
+        except OSError:
+            pass
+        for name in ("argv", "config", "backend_pid", "backend_starttime", "exit_code", "terminated"):
+            try:
+                (console.run_dir / name).unlink()
+            except OSError:
+                pass
+        try:
+            console.run_dir.rmdir()
+        except OSError:
+            pass
 
     def materialize(self, issue: LinearIssue) -> RunnerPaths:
         safe_name = sanitize_path_part(issue.identifier or issue.id)
