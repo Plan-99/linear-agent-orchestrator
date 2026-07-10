@@ -66,6 +66,8 @@ usage: console-supervisor.sh [options]
                       backends can split panes inside it) or "split" (sibling
                       pane in the daemon's window).
                       Default: $AGENT_CONSOLE_OPEN_TARGET | .env | window.
+  --focus <bool>      Switch the client to the newly opened run window/pane
+                      (true/false). Default: $AGENT_CONSOLE_FOCUS | .env | true.
   --layout <name>     Split mode only: window layout applied after opening a
                       run pane so the daemon (first pane) stays the main pane.
                       One of: main-vertical | main-horizontal | tiled |
@@ -112,13 +114,15 @@ open_pane() { # run_id
   if [[ "$direct" == "true" ]]; then attach_cmd+=(--write); mode="read-write (direct input)"
   else attach_cmd+=(--interactive); fi
   local shcmd; shcmd="$(printf '%q ' "${attach_cmd[@]}")"
+  local focus_suffix=""
+  [[ "$FOCUS" == "true" ]] && focus_suffix=" ; focus"
   if [[ "$DRY_RUN" == 1 ]]; then
     if [[ "$OPEN_TARGET" == "window" ]]; then
-      printf 'DRY: [%s] new-window -a -t %s sh -c %q ; select-pane -T lao:%s\n' \
-        "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run"
+      printf 'DRY: [%s] new-window -a -t %s sh -c %q ; select-pane -T lao:%s%s\n' \
+        "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run" "$focus_suffix"
     else
-      printf 'DRY: [%s] split-window -t %s sh -c %q ; select-pane -T lao:%s ; select-layout %s\n' \
-        "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run" "$LAYOUT"
+      printf 'DRY: [%s] split-window -t %s sh -c %q ; select-pane -T lao:%s ; select-layout %s%s\n' \
+        "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run" "$LAYOUT" "$focus_suffix"
     fi
     return 0
   fi
@@ -147,7 +151,11 @@ open_pane() { # run_id
   tmux select-pane -t "$pane_id" -T "lao:$run" 2>/dev/null || true
   if [[ "$OPEN_TARGET" == "window" ]]; then
     tmux rename-window -t "$pane_id" "lao:$run" 2>/dev/null || true
-    log "opened window for run $run [$mode] (pane $pane_id)"
+    # Jump the operator to the freshest run (AGENT_CONSOLE_FOCUS=false to stay put).
+    if [[ "$FOCUS" == "true" ]]; then
+      tmux select-window -t "$pane_id" 2>/dev/null || true
+    fi
+    log "opened window for run $run [$mode] (pane $pane_id, focus=$FOCUS)"
     return 0
   fi
   # Split mode: re-apply the window layout so the daemon (first pane) remains
@@ -155,7 +163,10 @@ open_pane() { # run_id
   if [[ "$LAYOUT" != "none" ]]; then
     tmux select-layout -t "$pane_id" "$LAYOUT" 2>/dev/null || true
   fi
-  log "opened pane $pane_id for run $run [$mode] (layout=$LAYOUT)"
+  if [[ "$FOCUS" == "true" ]]; then
+    tmux select-pane -t "$pane_id" 2>/dev/null || true
+  fi
+  log "opened pane $pane_id for run $run [$mode] (layout=$LAYOUT, focus=$FOCUS)"
 }
 
 headless_notice() { # run_id
@@ -228,6 +239,7 @@ main() {
   ORPHAN_SEEN=""
   LAYOUT=""
   OPEN_TARGET=""
+  FOCUS=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --log-dir) log_dir_opt="${2:-}"; shift 2 ;;
@@ -235,6 +247,7 @@ main() {
       --daemon-pane) DAEMON_PANE="${2:-}"; shift 2 ;;
       --parent-pid) PARENT_PID="${2:-}"; shift 2 ;;
       --open-target) OPEN_TARGET="${2:-}"; shift 2 ;;
+      --focus) FOCUS="${2:-}"; shift 2 ;;
       --layout) LAYOUT="${2:-}"; shift 2 ;;
       --interval) interval="${2:-}"; shift 2 ;;
       --once) once=1; shift ;;
@@ -256,6 +269,17 @@ main() {
     [[ -n "$OPEN_TARGET" ]] || OPEN_TARGET="window"
   fi
   [[ "$OPEN_TARGET" =~ ^(window|split)$ ]] || die "invalid --open-target: $OPEN_TARGET (expected window|split)"
+  # Focus: flag > process env > project .env > true (jump to the newest run).
+  if [[ -z "$FOCUS" ]]; then
+    FOCUS="${AGENT_CONSOLE_FOCUS:-}"
+    [[ -n "$FOCUS" ]] || FOCUS="$(read_env_value AGENT_CONSOLE_FOCUS "$(repo_root)/.env" 2>/dev/null || true)"
+    [[ -n "$FOCUS" ]] || FOCUS="true"
+  fi
+  case "${FOCUS,,}" in
+    1|true|yes|on) FOCUS="true" ;;
+    0|false|no|off) FOCUS="false" ;;
+    *) die "invalid --focus: $FOCUS (expected true|false)" ;;
+  esac
   # Layout (split mode): flag > process env > project .env > main-vertical
   # (daemon stays the large main pane; issue panes stack beside it).
   if [[ -z "$LAYOUT" ]]; then
@@ -279,7 +303,7 @@ main() {
   else
     MODE=headless
   fi
-  log "mode=$MODE log_dir=$LOG_DIR container=$CONTAINER daemon_pane=${DAEMON_PANE:-<none>} parent_pid=${PARENT_PID:-<none>} open_target=$OPEN_TARGET layout=$LAYOUT interval=${interval}s dry_run=$DRY_RUN"
+  log "mode=$MODE log_dir=$LOG_DIR container=$CONTAINER daemon_pane=${DAEMON_PANE:-<none>} parent_pid=${PARENT_PID:-<none>} open_target=$OPEN_TARGET focus=$FOCUS layout=$LAYOUT interval=${interval}s dry_run=$DRY_RUN"
 
   if [[ "$once" == 1 ]]; then reconcile_once; return 0; fi
   while [[ "$STOP" == 0 ]]; do

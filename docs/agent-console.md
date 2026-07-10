@@ -17,6 +17,7 @@ Canonical constants/helpers/validator: `src/linear_agent_orchestrator/console_sc
 | `AGENT_CONSOLE_SOCKET_DIR` | `/tmp/lao-console` | Container-private per-run tmux socket/argv root. Never bind-mounted. |
 | `AGENT_CONSOLE_DIRECT_INPUT` | `false` | Explicit capability metadata: may the console send keystrokes to the agent? Never inferred from the backend name. Forced `true` per run when `AGENT_INTERACTIVE=true` (the TUI genuinely reads the PTY). |
 | `AGENT_CONSOLE_OPEN_TARGET` | `window` | Where the supervisor opens each run: `window` (daemon keeps window 0, each run gets its own `lao:<run_id>` window so team-mode backends can split panes inside it) or `split` (sibling pane in the daemon's window). |
+| `AGENT_CONSOLE_FOCUS` | `true` | Switch the tmux client to the newly opened run window/pane. `false` keeps the operator where they are. |
 | `AGENT_CONSOLE_LAYOUT` | `main-vertical` | Split mode only: window layout re-applied when a run pane opens, keeping the daemon (first pane) as the main pane. One of `main-vertical` \| `main-horizontal` \| `tiled` \| `even-vertical` \| `even-horizontal` \| `none`. |
 | `AGENT_CONSOLE_HOST_LOG_DIR` | `${LAO_RUNTIME_DIR}/logs/console` | The **host console directory itself**, bind-mounted at `/workspace/logs/console`; override for host scripts. |
 

@@ -149,12 +149,20 @@ do
 done
 
 # --- console-supervisor.sh ---------------------------------------------------
-# Default open target: one window per run (daemon keeps window 0).
+# Default open target: one window per run (daemon keeps window 0), focused.
 out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' 2>&1)"
 check "supervisor R1 interactive window" "[interactive] new-window -a -t %1" "$out"
 check "supervisor R1 passes --interactive" "--interactive" "$out"
 check "supervisor R2 read-write window" "[read-write (direct input)] new-window -a -t %1" "$out"
+check "supervisor focuses new window by default" "; focus" "$out"
 [[ "$out" != *"select-layout"* ]] && ok "supervisor window mode skips layout" || bad "window mode must not apply layout"
+
+out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --focus false 2>&1)"
+[[ "$out" != *"; focus"* ]] && ok "supervisor --focus false stays put" || bad "--focus false must not focus"
+out="$(AGENT_CONSOLE_FOCUS=false "$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' 2>&1)"
+[[ "$out" != *"; focus"* ]] && ok "supervisor reads AGENT_CONSOLE_FOCUS env" || bad "AGENT_CONSOLE_FOCUS=false must not focus"
+out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --focus maybe 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && ok "supervisor rejects invalid focus" || bad "supervisor should reject invalid focus"
 [[ "$out" != *"lao:$R3"* ]] && ok "supervisor skips ended run" || bad "supervisor must skip ended run"
 [[ "$out" != *"lao:$R4"* ]] && ok "supervisor skips killed run" || bad "supervisor must skip killed run"
 
@@ -200,19 +208,26 @@ if command -v tmux >/dev/null 2>&1; then
   IT_SOCK="$TMP/it-tmux.sock"
   if tmux -S "$IT_SOCK" new-session -d -s it -x 80 -y 24 'sleep 60' 2>/dev/null; then
     IT_PANE="$(tmux -S "$IT_SOCK" list-panes -t it -F '#{pane_id}' | head -1)"
+    # A long-lived attach stub keeps the run window alive for focus assertions.
+    IT_ATTACH="$TMP/it-attach"; printf '#!/bin/sh\nsleep 30\n' > "$IT_ATTACH"; chmod +x "$IT_ATTACH"
     res="$(
       set +e
       source "$SUP" 2>/dev/null
       export TMUX="$IT_SOCK,0,0"
-      DRY_RUN=0; OPEN_TARGET=window; LAYOUT=main-vertical
+      DRY_RUN=0; OPEN_TARGET=window; LAYOUT=main-vertical; FOCUS=false
       LOG_DIR="$CD"; CONTAINER=lao-daemon; ATTACH_SCRIPT=/bin/echo
       DAEMON_PANE="$IT_PANE"
       open_pane "$R1" >/dev/null 2>&1 && echo "OPENED-WINDOW"
       OPEN_TARGET=split
       open_pane "$R1" >/dev/null 2>&1 && echo "OPENED-SPLIT"
+      OPEN_TARGET=window; FOCUS=true; ATTACH_SCRIPT="$IT_ATTACH"
+      open_pane "$R2" >/dev/null 2>&1 && echo "OPENED-FOCUSED"
+      tmux display-message -p -t it '#{window_name}' 2>/dev/null
     )"
     [[ "$res" == *OPENED-WINDOW* ]] && ok "real tmux: window mode opens from pane id" || bad "real tmux window open failed"
     [[ "$res" == *OPENED-SPLIT* ]] && ok "real tmux: split mode opens from pane id" || bad "real tmux split open failed"
+    [[ "$res" == *OPENED-FOCUSED* ]] && ok "real tmux: focused window opens" || bad "real tmux focused open failed"
+    [[ "$res" == *"lao:$R2"* ]] && ok "real tmux: focus switches to the new run window" || bad "focus did not switch active window: $res"
     tmux -S "$IT_SOCK" kill-server 2>/dev/null || true
   else
     ok "real tmux: skipped (no server available)"

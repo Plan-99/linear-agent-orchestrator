@@ -258,6 +258,8 @@ bind mount에 동일하게 적용됩니다.
 - **window 0 = daemon, window 1+ = agent run** (기본
   `AGENT_CONSOLE_OPEN_TARGET=window`). run마다 `lao:<run_id>` 이름의 별도 window가
   열리므로 OMX team 모드가 자기 window 안에서 pane을 자유롭게 분할할 수 있습니다.
+  새 run이 열리면 자동으로 그 window로 전환됩니다(`AGENT_CONSOLE_FOCUS=false`로
+  현재 위치 유지 가능).
   `split`으로 바꾸면 daemon window 안 sibling pane 방식이 되며, 이때 레이아웃은
   `AGENT_CONSOLE_LAYOUT`(기본 `main-vertical`)이 관리합니다.
 - supervisor가 여는 window/pane은 기본 **interactive attach**입니다: 마우스 스크롤
