@@ -95,9 +95,12 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # busy_timeout MUST come first: switching journal_mode takes an
+        # exclusive lock, and parallel workers opening the same fresh database
+        # would otherwise fail immediately with "database is locked".
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
-        self._conn.execute("PRAGMA busy_timeout = 5000")
         self.migrate()
 
     def close(self) -> None:
@@ -125,7 +128,13 @@ class StateStore:
     def _ensure_finalization_issue_json_column(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(finalization_state)").fetchall()}
         if "issue_json" not in columns:
-            self._conn.execute("ALTER TABLE finalization_state ADD COLUMN issue_json TEXT")
+            try:
+                self._conn.execute("ALTER TABLE finalization_state ADD COLUMN issue_json TEXT")
+            except sqlite3.OperationalError as exc:
+                # A concurrent migration (parallel worker startup) may have
+                # added the column between our check and the ALTER.
+                if "duplicate column name" not in str(exc).casefold():
+                    raise
 
     def acquire_claim(
         self,

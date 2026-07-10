@@ -1173,8 +1173,9 @@ def test_active_work_config_drift_preserves_competing_owner_lease(tmp_path):
         result = process_next_issue_once(config=new_config, state=store, linear=FakePollingLinear([]), runner=no_run, owner_id="owner-2")
         claim = store.get_claim(issue.id)
 
-    assert result.status == "not_claimed"
-    assert result.message == "active_lease:claimed"
+    # Another owner's live-leased active work is skipped (never hijacked or
+    # spun on); with nothing else in Todo the sweep reports no candidate.
+    assert result.status == "no_candidate"
     assert no_run.calls == 0
     assert claim.status == "claimed"
     assert claim.owner_id == "owner-1"
@@ -1517,10 +1518,15 @@ def write_fake_agent_runner(tmp_path):
 
 
 def test_dirty_workspace_blocks_without_state_and_cleanup_retries_same_key(tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+
     import linear_agent_orchestrator.runner as runner_module
 
     script = write_fake_agent_runner(tmp_path)
     config = app_config(tmp_path, f"{script} {{prompt_path}} {{result_path}}")
+    # Legacy fixed-directory mode: dirty-workspace blocking only applies when
+    # per-run worktree isolation is off.
+    config = AppConfig(linear=config.linear, runner=dc_replace(config.runner, worktree_isolation=False))
     issue = make_issue(identifier="DEV-DIRTY")
     exec_key = execution_key(issue, config.runner)
     db = tmp_path / "state.sqlite3"
@@ -1528,7 +1534,7 @@ def test_dirty_workspace_blocks_without_state_and_cleanup_retries_same_key(tmp_p
     monkeypatch.setattr(
         runner_module,
         "validate_project_workspace",
-        lambda project_dir: [f"Agent project git worktree is dirty: {project_dir}"],
+        lambda project_dir, **kwargs: [f"Agent project git worktree is dirty: {project_dir}"],
     )
 
     with StateStore(db) as store:
@@ -1555,7 +1561,7 @@ def test_dirty_workspace_blocks_without_state_and_cleanup_retries_same_key(tmp_p
     assert no_run.calls == 0
 
     # After cleanup the same execution key must complete and transition to Done.
-    monkeypatch.setattr(runner_module, "validate_project_workspace", lambda project_dir: [])
+    monkeypatch.setattr(runner_module, "validate_project_workspace", lambda project_dir, **kwargs: [])
     clean_fake = FakeLinear()
     with StateStore(db) as store:
         completed = process_issue_once(issue=issue, config=config, state=store, linear=clean_fake, runner=ShellRunner(config.runner), owner_id="owner-1")

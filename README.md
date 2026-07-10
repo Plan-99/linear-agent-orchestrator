@@ -70,10 +70,15 @@ AGENT_MODEL=gpt-5.5
 AGENT_BYPASS_PERMISSIONS=true
 ```
 
-`LAO_PROJECT_DIR`을 생략하면 orchestrator 폴더 자체가 대상이 됩니다. 실제 작업을 위해서는
-대상 경로가 **writable한 clean Git worktree**여야 합니다. 한 이슈의 변경이 남아 있으면
-다음 이슈 실행은 fail-closed로 차단되므로 사람이 변경을 검토·통합하거나 되돌린 뒤 다음
-작업을 진행해야 합니다.
+`LAO_PROJECT_DIR`을 생략하면 orchestrator 폴더 자체가 대상이 됩니다. 대상 경로는
+**writable한 Git 저장소**여야 합니다.
+
+기본값(`AGENT_WORKTREE_ISOLATION=true`)에서는 run마다 HEAD에서 분기한 전용 git
+worktree에서 작업하고, 의미적으로 성공한 run만 로컬 `lao/<issue>-<key>` 브랜치에
+커밋됩니다(push 없음). base 저장소는 항상 clean하게 유지되며, 사람이 브랜치를
+리뷰해 머지하거나 버리면 됩니다. 실패한 run의 변경은 `.runtime/work/worktrees/`에
+조사용으로 남습니다. `false`로 끄면 기존 고정-디렉토리 모드로 돌아가며, 이때는
+run 전 clean worktree가 강제되고 남은 변경이 다음 실행을 fail-closed로 차단합니다.
 
 협업 시 각 개발자는 자신의 API key를 사용하고 `LINEAR_ASSIGNEE_ID`를 비워 두거나 자신의
 Linear user ID로 설정하면 됩니다. 미할당 이슈와 다른 사람에게 할당된 이슈는 가져오지
@@ -118,7 +123,9 @@ foreground 실행:
 ./scripts/daemon.sh
 ```
 
-`Ctrl-C` 또는 SIGTERM을 받으면 현재 iteration을 정리한 뒤 종료합니다. 별도 terminal에서
+`Ctrl-C` 또는 SIGTERM을 받으면 유휴(polling 대기) 중에는 약 1초 안에 종료하고,
+agent 실행 중에는 해당 run을 정리한 뒤 종료합니다(실행 중인 agent를 중간에 죽이지
+않기 위한 의도된 동작입니다). 별도 terminal에서
 실행 상태를 확인하려면 명령을 한 줄로 입력하세요.
 
 ```bash
@@ -167,10 +174,12 @@ custom `RUNNER_COMMAND_TEMPLATE`도 가능하지만 다음 책임은 custom runn
 daemon의 순서는 다음과 같습니다.
 
 1. 설정된 project의 Todo 중 설정된 assignee에게 할당된 유효 이슈를 선택합니다.
-2. 실행 직전에 고정 저장소가 clean/writable Git worktree인지 다시 검사합니다.
+2. 실행 직전에 고정 저장소를 다시 검사하고, 격리 모드에서는 HEAD에서 분기한 run 전용
+   git worktree를 만듭니다(legacy 모드에서는 clean worktree를 요구).
 3. 이슈를 In Progress로 바꾸고 agent에 이슈 본문과 실행 context를 전달합니다.
 4. agent가 `{result_path}`에 결과를 기록합니다.
-5. transport와 semantic validation이 모두 성공한 경우에만 이슈를 Done으로 바꿉니다.
+5. transport와 semantic validation이 모두 성공한 경우에만 이슈를 Done으로 바꾸고,
+   변경 사항을 로컬 `lao/<issue>-<key>` 브랜치로 커밋합니다(push 없음).
 
 완료 결과 형식:
 
@@ -223,20 +232,22 @@ validation exit code, backend timeout/실패는 모두 Done 전환을 막습니�
 
 기본값은 **`auto`**입니다(host tmux 안이면 활성화, 아니면 headless). `true`/`false`로
 강제할 수 있습니다. 활성화되면 각 agent 실행이 컨테이너 안에서 tmux 세션으로 열리고,
-운영자는 host에서 read-only로 실시간 관찰할 수 있습니다.
+운영자는 host에서 실시간으로 관찰(및 대화 모드에서는 입력)할 수 있습니다.
 
-`./scripts/daemon.sh`를 host tmux pane에서 실행하면 새 이슈를 claim할 때마다 같은 tmux
-window에 `lao:<run_id>` sibling pane이 자동으로 열립니다. 실행이 끝나면 attach pane도
-종료되고, daemon은 기존 pane에서 계속 polling합니다.
+`./scripts/daemon.sh`를 host tmux 안에서 실행하면 새 이슈를 claim할 때마다
+`lao:<run_id>` 이름의 **새 tmux window**가 자동으로 열립니다(window 0 = daemon,
+window 1+ = agent run). 실행이 끝나면 해당 window도 종료되고, daemon은 window 0에서
+계속 polling합니다.
 
 ```bash
-# daemon과 sibling console pane 자동 실행
+# daemon과 run별 console window 자동 실행
 ./scripts/daemon.sh
 
 # live/종료 run 조회 또는 수동 attach
 ./scripts/console-attach.sh --list
-./scripts/console-attach.sh --run <32-char-run-id>          # read-only
-./scripts/console-attach.sh --run <32-char-run-id> --write  # capability=true만 허용
+./scripts/console-attach.sh --run <32-char-run-id>                # read-only
+./scripts/console-attach.sh --run <32-char-run-id> --interactive  # 스크롤/마우스
+./scripts/console-attach.sh --run <32-char-run-id> --write        # capability=true만 허용
 ```
 
 tmux 밖에서 `auto`는 기존 headless 실행으로 돌아갑니다. `AGENT_CONSOLE=true`로 강제하면
@@ -244,11 +255,19 @@ pane 대신 `.runtime/logs/console/supervisor.log`에 수동 attach 명령을 �
 `.env`의 `LAO_RUNTIME_DIR`/`AGENT_CONSOLE_HOST_LOG_DIR`도 host supervisor와 Compose
 bind mount에 동일하게 적용됩니다.
 
-- 모든 backend는 **live 관찰**(read-only attach)이 가능합니다.
+- **window 0 = daemon, window 1+ = agent run** (기본
+  `AGENT_CONSOLE_OPEN_TARGET=window`). run마다 `lao:<run_id>` 이름의 별도 window가
+  열리므로 OMX team 모드가 자기 window 안에서 pane을 자유롭게 분할할 수 있습니다.
+  `split`으로 바꾸면 daemon window 안 sibling pane 방식이 되며, 이때 레이아웃은
+  `AGENT_CONSOLE_LAYOUT`(기본 `main-vertical`)이 관리합니다.
+- supervisor가 여는 window/pane은 기본 **interactive attach**입니다: 마우스 스크롤
+  (copy-mode), 클릭으로 inner pane 선택이 동작합니다. 수동 attach 기본값은 여전히
+  read-only이며 `--interactive`로 동일한 UX를 얻습니다.
 - **직접 입력(타이핑)은 명시적 설정 metadata**(`AGENT_CONSOLE_DIRECT_INPUT`, 기본
-  false)로만 결정되며 backend 이름으로 추론하지 않습니다. 현재 one-shot
-  `omx`/`codex`/`claude`는 prompt를 stdin으로 한 번만 받으므로 기본 false지만, PTY를
-  실제로 읽는 interactive/custom harness는 어떤 backend든 opt-in(true)할 수 있습니다.
+  false)로만 결정되며 backend 이름으로 추론하지 않습니다. interactive attach에서
+  타이핑한 키는 PTY에 도달하지만 one-shot `omx`/`codex`/`claude`는 prompt를
+  stdin으로 한 번만 받으므로 이를 읽지 않습니다. PTY를 실제로 읽는
+  interactive/custom harness는 어떤 backend든 opt-in(true)할 수 있습니다.
 - 실행별 lifecycle JSONL과 output 로그는 `AGENT_CONSOLE_LOG_DIR`
   (기본 `/workspace/logs/console`)에 기록되며, Compose가 이를 `.runtime/logs/console`
   에 bind-mount하여 host 소유로 durable하게 남깁니다.
@@ -258,9 +277,36 @@ bind mount에 동일하게 적용됩니다.
 이벤트 스키마 계약과 host/container tmux 보안 리뷰는
 [docs/agent-console.md](docs/agent-console.md)를 참고하세요.
 
+## 병렬 워커
+
+`MAX_PARALLEL_RUNS`(기본 1)로 한 daemon 안의 동시 이슈 워커 수를 늘릴 수 있습니다.
+
+- 워커마다 별도 Linear polling/SQLite 연결과 고유 claim owner를 사용하며, lease가
+  같은 이슈의 중복 실행을 막습니다.
+- `AGENT_WORKTREE_ISOLATION=true`가 필수입니다(워커별 전용 worktree).
+- 워커 수만큼 polling API 호출이 늘어나므로 `POLL_INTERVAL_SECONDS`는 15 이상을
+  권장합니다.
+- tmux 콘솔 사용 시 run pane이 워커 수만큼 열립니다(레이아웃은
+  `AGENT_CONSOLE_LAYOUT`).
+
+## 대화형 실행 (AGENT_INTERACTIVE)
+
+`AGENT_INTERACTIVE=true`면 one-shot `exec` 대신 backend의 **대화형 TUI**가 run 전용
+tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 콘솔 pane에서 직접
+타이핑해 에이전트와 대화할 수 있습니다(`supports_direct_input`이 자동으로 true).
+
+- 완료 판정: 에이전트가 `{result_path}`에 구조화 결과를 쓰면 orchestrator가 이를
+  감지해 세션을 정리하고, TUI를 조작자가 직접 종료해도 동일하게 처리됩니다.
+  timeout도 그대로 적용됩니다.
+- **Done 게이트는 불변입니다** — 대화 여부와 무관하게 유효한 validation 증거가 있는
+  `completed` 결과만 Done으로 전환됩니다.
+- `AGENT_CONSOLE`이 필요하며, 사람이 지켜보는 세션이므로 `MAX_PARALLEL_RUNS=1`
+  권장입니다.
+
 ## 운영 제한
 
-- 한 daemon은 한 저장소에서 이슈를 직렬 처리합니다.
+- 기본 설정에서 한 daemon은 한 저장소에서 이슈를 직렬 처리합니다
+  (`MAX_PARALLEL_RUNS`로 동일 저장소 내 병렬 처리 가능).
 - 동일 assignee를 사용하는 여러 machine 사이의 distributed claim은 없습니다.
 - 자동 push/PR/merge/이슈 삭제는 없습니다.
 - Docker socket과 issue-controlled bind mount는 지원하지 않습니다.

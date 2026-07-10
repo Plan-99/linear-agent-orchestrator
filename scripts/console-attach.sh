@@ -43,6 +43,11 @@ usage: console-attach.sh [options]
   --run <run_id>        Run to attach to (uuid4 hex). If omitted, lists live runs.
   --write               Request read-write (direct input) attach. Refused unless
                         the run's adapter declares supports_direct_input=true.
+  --interactive         Read-write tmux client WITHOUT the direct-input gate:
+                        enables scrollback (mouse/copy-mode) and selecting inner
+                        panes (team-mode splits). Keystrokes typed here reach the
+                        PTY but the bundled one-shot adapters never read them;
+                        use --write when the backend really supports steering.
   --container <name>    Container to docker-exec into (default: $AGENT_CONSOLE_CONTAINER
                         | $LAO_DAEMON_CONTAINER_NAME | lao-daemon)
   --log-dir <dir>       Host console log root (default: $AGENT_CONSOLE_HOST_LOG_DIR
@@ -95,11 +100,12 @@ list_runs() {
 }
 
 main() {
-  local run_id="" want_write=0 container="$CONTAINER_DEFAULT" log_dir_opt="" print_cmd=0 do_list=0
+  local run_id="" want_write=0 want_interactive=0 container="$CONTAINER_DEFAULT" log_dir_opt="" print_cmd=0 do_list=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --run) run_id="${2:-}"; shift 2 ;;
       --write) want_write=1; shift ;;
+      --interactive) want_interactive=1; shift ;;
       --container) container="${2:-}"; shift 2 ;;
       --log-dir) log_dir_opt="${2:-}"; shift 2 ;;
       --print-cmd) print_cmd=1; shift ;;
@@ -142,15 +148,20 @@ main() {
   [[ -n "$ev_session" && "$ev_session" != "$session" ]] && log "warn: event session '$ev_session' != derived '$session' (using derived)"
   [[ -n "$ev_socket"  && "$ev_socket"  != "$socket"  ]] && log "warn: event socket '$ev_socket' != derived '$socket' (using derived)"
 
-  # Build the tmux attach argv. Read-only unless --write AND adapter supports it.
+  # Build the tmux attach argv. Read-only unless --write (gated on the adapter's
+  # direct-input capability) or --interactive (ungated read-write client for
+  # scrollback/mouse/inner-pane navigation; typing is inert for one-shot
+  # adapters that never read the PTY).
   local -a attach=(tmux -S "$socket" attach -t "$session")
   if [[ "$want_write" == 1 ]]; then
     local direct; direct="$(jsonl_field "$jsonl" session_started supports_direct_input || echo false)"
     if [[ "$direct" != "true" ]]; then
       local backend; backend="$(jsonl_field "$jsonl" session_started backend || echo '?')"
-      die "refusing --write: backend '$backend' does not declare supports_direct_input=true for run $run_id (Task 3 safety gate). Retry read-only (omit --write)."
+      die "refusing --write: backend '$backend' does not declare supports_direct_input=true for run $run_id (Task 3 safety gate). Retry read-only (omit --write) or use --interactive for scroll/mouse without steering."
     fi
     log "direct-input attach ENABLED for run $run_id (adapter supports it); keystrokes reach the backend PTY."
+  elif [[ "$want_interactive" == 1 ]]; then
+    log "interactive attach for run $run_id: scroll/mouse/pane-select enabled; this backend does not read typed input unless it declares supports_direct_input=true."
   else
     attach=(tmux -S "$socket" attach -r -t "$session")
   fi
@@ -163,7 +174,10 @@ main() {
   fi
 
   command -v docker >/dev/null 2>&1 || die "docker not found on PATH (needed to exec into $container)"
-  log "attaching to run $run_id (session $session) in container $container [$([[ $want_write == 1 ]] && echo read-write || echo read-only)]"
+  local mode=read-only
+  [[ "$want_interactive" == 1 ]] && mode=interactive
+  [[ "$want_write" == 1 ]] && mode=read-write
+  log "attaching to run $run_id (session $session) in container $container [$mode]"
   exec "${cmd[@]}"
 }
 

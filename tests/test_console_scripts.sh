@@ -112,6 +112,13 @@ check "attach --list shows R2 direct" "true" "$out"
 out="$("$ATTACH" --run "$R1" --log-dir "$CD" --print-cmd 2>&1)"
 check "attach R1 read-only (-r)" "attach -r -t lao-$R1" "$out"
 
+# --interactive: read-write tmux client (scroll/mouse) without the direct-input
+# gate — allowed even for non-direct backends.
+out="$("$ATTACH" --run "$R1" --log-dir "$CD" --interactive --print-cmd 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && ok "attach --interactive allowed for non-direct backend" || bad "attach --interactive should be allowed (exit $rc)"
+check "attach --interactive is read-write client" "attach -t lao-$R1" "$out"
+[[ "$out" != *"attach -r"* ]] && ok "attach --interactive drops -r" || bad "attach --interactive must not use -r"
+
 out="$("$ATTACH" --run "$R1" --log-dir "$CD" --write --print-cmd 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && ok "attach --write refused for non-direct backend (exit $rc)" || bad "attach --write should refuse non-direct"
 check "attach --write refuse message" "safety gate" "$out"
@@ -142,11 +149,29 @@ do
 done
 
 # --- console-supervisor.sh ---------------------------------------------------
+# Default open target: one window per run (daemon keeps window 0).
 out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' 2>&1)"
-check "supervisor R1 read-only pane" "[read-only] split-window -t %1" "$out"
-check "supervisor R2 read-write pane" "[read-write (direct input)] split-window -t %1" "$out"
+check "supervisor R1 interactive window" "[interactive] new-window -a -t %1" "$out"
+check "supervisor R1 passes --interactive" "--interactive" "$out"
+check "supervisor R2 read-write window" "[read-write (direct input)] new-window -a -t %1" "$out"
+[[ "$out" != *"select-layout"* ]] && ok "supervisor window mode skips layout" || bad "window mode must not apply layout"
 [[ "$out" != *"lao:$R3"* ]] && ok "supervisor skips ended run" || bad "supervisor must skip ended run"
 [[ "$out" != *"lao:$R4"* ]] && ok "supervisor skips killed run" || bad "supervisor must skip killed run"
+
+# Split mode (opt-in): sibling panes with layout management.
+out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --open-target split 2>&1)"
+check "supervisor split mode uses split-window" "[interactive] split-window -t %1" "$out"
+check "supervisor split applies default layout" "select-layout main-vertical" "$out"
+out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --open-target split --layout tiled 2>&1)"
+check "supervisor honors --layout" "select-layout tiled" "$out"
+out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --layout bogus 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && ok "supervisor rejects invalid layout" || bad "supervisor should reject invalid layout"
+out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --open-target bogus 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && ok "supervisor rejects invalid open-target" || bad "supervisor should reject invalid open-target"
+out="$(AGENT_CONSOLE_LAYOUT=even-vertical "$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' --open-target split 2>&1)"
+check "supervisor reads AGENT_CONSOLE_LAYOUT env" "select-layout even-vertical" "$out"
+out="$(AGENT_CONSOLE_OPEN_TARGET=split "$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' 2>&1)"
+check "supervisor reads AGENT_CONSOLE_OPEN_TARGET env" "split-window -t %1" "$out"
 
 # A directory whose name is not a valid run id must be ignored entirely.
 mkdir -p "$CD/NOTHEX"; printf '{"event":"session_started","run_id":"NOTHEX"}\n' > "$CD/NOTHEX/lifecycle.jsonl"
@@ -155,7 +180,7 @@ out="$("$SUP" --once --dry-run --log-dir "$CD" --daemon-pane '%1' 2>&1)"
 rm -rf "$CD/NOTHEX"
 
 out="$("$SUP" --once --headless --log-dir "$CD" 2>&1)"
-check "supervisor headless R1 read-only" "run $R1 live (headless) [read-only]" "$out"
+check "supervisor headless R1 interactive" "run $R1 live (headless) [interactive]" "$out"
 check "supervisor headless R2 read-write" "run $R2 live (headless) [read-write (direct input)]" "$out"
 check "supervisor headless hint keeps custom log dir" "--log-dir $CD" "$out"
 
@@ -167,6 +192,34 @@ check "spoofed terminal text stays live (supervisor)" "lao:$R5" "$out"
 
 out="$("$SUP" --once --dry-run --log-dir "$CD" --interval 0 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && ok "supervisor rejects --interval 0" || bad "supervisor should reject --interval 0"
+
+# --- real tmux: open_pane window mode must accept a daemon PANE id -----------
+# The dry-run path never executes tmux, so target-type mistakes (new-window -t
+# with a pane id fails with "can't specify pane here") only surface here.
+if command -v tmux >/dev/null 2>&1; then
+  IT_SOCK="$TMP/it-tmux.sock"
+  if tmux -S "$IT_SOCK" new-session -d -s it -x 80 -y 24 'sleep 60' 2>/dev/null; then
+    IT_PANE="$(tmux -S "$IT_SOCK" list-panes -t it -F '#{pane_id}' | head -1)"
+    res="$(
+      set +e
+      source "$SUP" 2>/dev/null
+      export TMUX="$IT_SOCK,0,0"
+      DRY_RUN=0; OPEN_TARGET=window; LAYOUT=main-vertical
+      LOG_DIR="$CD"; CONTAINER=lao-daemon; ATTACH_SCRIPT=/bin/echo
+      DAEMON_PANE="$IT_PANE"
+      open_pane "$R1" >/dev/null 2>&1 && echo "OPENED-WINDOW"
+      OPEN_TARGET=split
+      open_pane "$R1" >/dev/null 2>&1 && echo "OPENED-SPLIT"
+    )"
+    [[ "$res" == *OPENED-WINDOW* ]] && ok "real tmux: window mode opens from pane id" || bad "real tmux window open failed"
+    [[ "$res" == *OPENED-SPLIT* ]] && ok "real tmux: split mode opens from pane id" || bad "real tmux split open failed"
+    tmux -S "$IT_SOCK" kill-server 2>/dev/null || true
+  else
+    ok "real tmux: skipped (no server available)"
+  fi
+else
+  ok "real tmux: skipped (tmux not installed)"
+fi
 
 # --- supervisor internals: orphan skip + open dedupe (mocked docker/tmux) -----
 res="$(

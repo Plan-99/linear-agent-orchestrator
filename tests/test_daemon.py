@@ -174,7 +174,36 @@ def test_daemon_no_candidate_gracefully_sleeps_until_stopped(tmp_path):
     assert result.iterations == 1
     assert result.stop_requested is True
     assert result.last_status == "no_candidate"
-    assert stop.sleeps == [7]
+    # Chunked interruptible sleep: the stop request lands during the first 1s
+    # chunk and the remaining 6s of the poll interval are never slept.
+    assert stop.sleeps == [1.0]
+
+
+def test_interruptible_sleep_wakes_on_stop_request():
+    from linear_agent_orchestrator.daemon import GracefulStop, interruptible_sleep
+
+    stopper = GracefulStop()
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            stopper.requested = True
+
+    interruptible_sleep(60, stopper, fake_sleep)
+    assert sleeps == [1.0, 1.0, 1.0]
+
+    # No stop request: the full duration is slept in bounded chunks.
+    sleeps.clear()
+    interruptible_sleep(2.5, GracefulStop(), sleeps.append)
+    assert sleeps == [1.0, 1.0, 0.5]
+
+    # Already-requested stop skips the wait entirely.
+    stopped = GracefulStop()
+    stopped.requested = True
+    sleeps.clear()
+    interruptible_sleep(60, stopped, sleeps.append)
+    assert sleeps == []
 
 
 def test_daemon_reaps_stale_leases_each_loop(tmp_path):

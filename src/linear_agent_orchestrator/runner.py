@@ -6,7 +6,7 @@ It intentionally does not run live end-to-end Linear validation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import hashlib
 import json
@@ -133,6 +133,12 @@ class RunnerResult:
     timeout_seconds: int
     structured_result: StructuredResult | None = None
     result_error: str | None = None
+    # Local branch the run's changes were committed to (worktree isolation);
+    # never pushed. None when isolation is off or the run changed nothing.
+    worktree_branch: str | None = None
+    # Operator-facing note about the isolated workspace (e.g. a kept dirty
+    # worktree after a failed run, or a commit failure).
+    worktree_note: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -176,6 +182,15 @@ class LinearReporter(Protocol):
     def resolve_workflow_states(self, config: LinearConfig) -> dict[WorkflowRole, WorkflowState]: ...
 
 
+@dataclass(frozen=True)
+class _WorkspaceContext:
+    """Effective workspace for one run: the base repo or an isolated worktree."""
+
+    project_dir: str
+    worktree_path: Path | None = None
+    branch: str | None = None
+
+
 class ShellRunner:
     """Materialize prompt/context files and execute a no-shell command template."""
 
@@ -185,19 +200,133 @@ class ShellRunner:
         self.config = config
         self.command_template = config.command_template
 
-    def preflight_workspace(self) -> list[str]:
-        """Recheck the fixed repository immediately before an agent execution."""
-
+    def _uses_standard_wrapper(self) -> bool:
         try:
             tokens = shlex.split(self.command_template, posix=True)
         except ValueError as exc:
             raise RunnerError(f"Invalid runner command template: {exc}") from exc
-        if not tokens or Path(tokens[0]).name != "lao-agent-runner":
+        return bool(tokens) and Path(tokens[0]).name == "lao-agent-runner"
+
+    def preflight_workspace(self) -> list[str]:
+        """Recheck the fixed repository immediately before an agent execution."""
+
+        if not self._uses_standard_wrapper():
             return []
-        return validate_project_workspace(self.config.project_dir)
+        # With worktree isolation each run branches from HEAD into its own
+        # orchestrator-owned checkout, so the base repository may legitimately
+        # be dirty (e.g. an operator reviewing a lao/<issue> branch).
+        return validate_project_workspace(
+            self.config.project_dir,
+            require_clean=not self.config.worktree_isolation,
+        )
+
+    # --- per-run git worktree isolation -----------------------------------
+
+    def _isolation_enabled(self) -> bool:
+        return self.config.worktree_isolation and self._uses_standard_wrapper()
+
+    @staticmethod
+    def _git(cwd: Path | str, *args: str) -> tuple[int, str, str]:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 1, "", str(exc)
+        return completed.returncode, completed.stdout, completed.stderr
+
+    def _unique_branch(self, base: Path, name: str) -> str:
+        candidate = name
+        suffix = 1
+        while self._git(base, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}")[0] == 0:
+            suffix += 1
+            candidate = f"{name}-{suffix}"
+        return candidate
+
+    def _remove_worktree(self, base: Path, worktree: Path, *, delete_branch: str | None = None) -> None:
+        self._git(base, "worktree", "remove", "--force", str(worktree))
+        if worktree.exists():
+            shutil.rmtree(worktree, ignore_errors=True)
+        self._git(base, "worktree", "prune")
+        if delete_branch:
+            self._git(base, "branch", "-D", delete_branch)
+
+    def _prepare_workspace(self, issue: LinearIssue) -> _WorkspaceContext:
+        if not self._isolation_enabled():
+            return _WorkspaceContext(project_dir=self.config.project_dir)
+        base = Path(self.config.project_dir)
+        safe_name = sanitize_path_part(issue.identifier or issue.id)
+        worktree = Path(self.config.work_dir) / "worktrees" / safe_name
+        # A previous crashed/kept run of this issue may have left a worktree.
+        if worktree.exists() or worktree.is_symlink():
+            self._remove_worktree(base, worktree)
+        branch = self._unique_branch(base, f"lao/{safe_name}-{execution_key(issue, self.config)[:8]}")
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        code, out, err = self._git(base, "worktree", "add", "-b", branch, str(worktree), "HEAD")
+        if code != 0:
+            raise RunnerError(
+                f"Failed to create isolated worktree for {issue.identifier}: {(err or out).strip()[:300]}"
+            )
+        return _WorkspaceContext(project_dir=str(worktree), worktree_path=worktree, branch=branch)
+
+    def _finish_workspace(
+        self,
+        workspace: _WorkspaceContext,
+        issue: LinearIssue,
+        *,
+        completed: bool,
+    ) -> tuple[str | None, str | None]:
+        """Commit or preserve the isolated worktree; returns (branch, note)."""
+
+        worktree = workspace.worktree_path
+        if worktree is None:
+            return None, None
+        base = Path(self.config.project_dir)
+        code, out, err = self._git(worktree, "status", "--porcelain")
+        if code != 0:
+            return None, f"Could not inspect isolated worktree {worktree}: {(err or out).strip()[:300]}"
+        dirty = bool(out.strip())
+        if not completed:
+            if dirty:
+                # Keep partial changes for post-mortem; the next run of this
+                # issue recreates the worktree from a fresh HEAD.
+                return None, (
+                    f"Run did not complete semantically; isolated worktree kept for inspection at "
+                    f"{worktree} (branch `{workspace.branch}`)"
+                )
+            self._remove_worktree(base, worktree, delete_branch=workspace.branch)
+            return None, None
+        if not dirty:
+            self._remove_worktree(base, worktree, delete_branch=workspace.branch)
+            return None, "Run completed without file changes; no branch was kept."
+        self._git(worktree, "add", "-A")
+        title = f"lao: {issue.identifier} {issue.title}".strip()
+        code, out, err = self._git(
+            worktree,
+            "-c",
+            "user.name=Linear Agent Orchestrator",
+            "-c",
+            "user.email=lao-agent@localhost",
+            "commit",
+            "--no-verify",
+            "-m",
+            title,
+        )
+        if code != 0:
+            return None, (
+                f"Local commit to `{workspace.branch}` failed; worktree kept at {worktree}: "
+                f"{(err or out).strip()[:300]}"
+            )
+        self._remove_worktree(base, worktree)
+        return workspace.branch, None
 
     def run(self, issue: LinearIssue) -> RunnerResult:
-        paths = self.materialize(issue)
+        workspace = self._prepare_workspace(issue)
+        paths = self.materialize(issue, project_dir=workspace.project_dir)
         command = render_command_template(
             self.command_template,
             {
@@ -210,6 +339,13 @@ class ShellRunner:
             },
         )
         env = build_allowlisted_env(self.config.allowed_env)
+        if workspace.worktree_path is not None:
+            # The standard wrapper reads AGENT_PROJECT_DIR; point it (and the
+            # backend) at the isolated worktree instead of the base checkout.
+            env["AGENT_PROJECT_DIR"] = str(workspace.worktree_path)
+        # Explicit (not allowlist-dependent) so the wrapper picks the one-shot
+        # or interactive-TUI launch path deterministically.
+        env["AGENT_INTERACTIVE"] = "true" if self.config.interactive else "false"
         # When the interactive console is enabled the backend is hosted inside a
         # per-run private tmux session so an operator can watch (and later steer)
         # it live. The wrapper runs the exact same rendered argv; only the
@@ -231,11 +367,48 @@ class ShellRunner:
         )
         try:
             try:
+                if self.config.interactive and console is not None:
+                    outcome = self._wait_interactive(process, paths.result_path)
+                    if outcome == "timeout":
+                        raise subprocess.TimeoutExpired(exec_command, self.config.timeout_seconds)
+                    if outcome == "result":
+                        # The agent submitted its structured result; the still-
+                        # running TUI session is reaped deliberately, so the
+                        # transport exit code is the orchestrator's (0), not the
+                        # killed TUI's. The Done gate still requires the result
+                        # itself to prove completion.
+                        self._teardown_console(console)
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        stdout, stderr = process.communicate()
+                        stdout = self._console_stdout(console, stdout)
+                        structured_result, result_error = load_structured_result(paths.result_path)
+                        result = RunnerResult(
+                            issue_id=issue.id,
+                            issue_identifier=issue.identifier,
+                            command=tuple(command),
+                            paths=paths,
+                            exit_code=0,
+                            stdout=stdout,
+                            stderr=stderr,
+                            timed_out=False,
+                            timeout_seconds=self.config.timeout_seconds,
+                            structured_result=structured_result,
+                            result_error=result_error,
+                        )
+                        branch, note = self._finish_workspace(workspace, issue, completed=result.completed_semantically)
+                        if branch or note:
+                            result = replace(result, worktree_branch=branch, worktree_note=note)
+                        return result
+                    # outcome == "exited": the operator or backend ended the
+                    # TUI itself; fall through to the one-shot handling below.
                 stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
                 if console is not None:
                     stdout = self._console_stdout(console, stdout)
                 structured_result, result_error = load_structured_result(paths.result_path)
-                return RunnerResult(
+                result = RunnerResult(
                     issue_id=issue.id,
                     issue_identifier=issue.identifier,
                     command=tuple(command),
@@ -248,6 +421,10 @@ class ShellRunner:
                     structured_result=structured_result,
                     result_error=result_error,
                 )
+                branch, note = self._finish_workspace(workspace, issue, completed=result.completed_semantically)
+                if branch or note:
+                    result = replace(result, worktree_branch=branch, worktree_note=note)
+                return result
             except subprocess.TimeoutExpired:
                 # The backend may have spawned agents, test runners, or language
                 # servers. Killing only the direct process would let descendants
@@ -267,6 +444,7 @@ class ShellRunner:
                 stdout, stderr = process.communicate()
                 if console is not None:
                     stdout = self._console_stdout(console, stdout)
+                _, note = self._finish_workspace(workspace, issue, completed=False)
                 return RunnerResult(
                     issue_id=issue.id,
                     issue_identifier=issue.identifier,
@@ -277,10 +455,31 @@ class ShellRunner:
                     stderr=stderr,
                     timed_out=True,
                     timeout_seconds=self.config.timeout_seconds,
+                    worktree_note=note,
                 )
         finally:
             if console is not None:
                 self._cleanup_console(console)
+
+    def _wait_interactive(self, process: subprocess.Popen, result_path: Path) -> str:
+        """Wait for an interactive run to finish.
+
+        Returns "result" when a parseable structured result appears (the
+        conversation's work is submitted), "exited" when the TUI process ends
+        first, and "timeout" when neither happens within timeout_seconds.
+        """
+
+        deadline = time.monotonic() + self.config.timeout_seconds
+        while True:
+            if process.poll() is not None:
+                return "exited"
+            structured, _error = load_structured_result(result_path)
+            if structured is not None:
+                return "result"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout"
+            time.sleep(min(2.0, max(0.05, remaining)))
 
     def _prepare_console(self, issue: LinearIssue) -> _ConsoleContext:
         """Allocate per-run console paths keyed by a fresh, tmux-safe run id."""
@@ -299,7 +498,9 @@ class ShellRunner:
             pass
         log_dir.mkdir(parents=True, exist_ok=True)
         backend = self.config.backend
-        supports_direct_input = self.config.console_direct_input
+        # Interactive TUI mode genuinely reads the PTY, so it always declares
+        # direct input honestly regardless of the static metadata flag.
+        supports_direct_input = self.config.console_direct_input or self.config.interactive
         wrapper_argv = (
             "lao-pty-host",
             "--schema-version",
@@ -530,7 +731,8 @@ class ShellRunner:
         except OSError:
             pass
 
-    def materialize(self, issue: LinearIssue) -> RunnerPaths:
+    def materialize(self, issue: LinearIssue, *, project_dir: str | None = None) -> RunnerPaths:
+        effective_project_dir = project_dir or self.config.project_dir
         safe_name = sanitize_path_part(issue.identifier or issue.id)
         issue_dir = Path(self.config.work_dir) / safe_name
         inputs_dir = issue_dir / "inputs"
@@ -548,12 +750,12 @@ class ShellRunner:
         if result_path.exists() or result_path.is_symlink():
             result_path.unlink()
         prompt_path.write_text(
-            render_prompt(issue, project_dir=self.config.project_dir, result_path=result_path),
+            render_prompt(issue, project_dir=effective_project_dir, result_path=result_path),
             encoding="utf-8",
         )
         context_path.write_text(
             json.dumps(
-                render_context(issue, project_dir=self.config.project_dir, result_path=result_path),
+                render_context(issue, project_dir=effective_project_dir, result_path=result_path),
                 indent=2,
                 sort_keys=True,
             ),
@@ -1063,7 +1265,12 @@ def process_active_work_once(
     runner: ShellRunner,
     owner_id: str,
 ) -> ProcessResult | None:
-    """Resume one locally persisted active work item that may no longer be Todo."""
+    """Resume one locally persisted active work item that may no longer be Todo.
+
+    Entries held by another owner's live lease (a parallel worker's in-flight
+    run) are skipped, not returned: a worker must fall through to polling for
+    new Todo issues instead of spinning on a sibling's active work.
+    """
 
     for work in state.list_active_work():
         issue = _issue_from_work(work)
@@ -1077,17 +1284,7 @@ def process_active_work_once(
                 execution_key=stored_key,
             )
             if not claim.acquired:
-                return ProcessResult(
-                    issue.id,
-                    issue.identifier,
-                    "not_claimed",
-                    False,
-                    False,
-                    False,
-                    (),
-                    message=_claim_skip_message(claim.claim, stored_key),
-                    issue_url=issue.url,
-                )
+                continue
             return _fail_in_doubt_execution(
                 issue=issue,
                 state=state,
@@ -1097,7 +1294,7 @@ def process_active_work_once(
                 comments=[],
                 message=_config_drift_message(stored_key, current_key),
             )
-        return process_issue_once(
+        result = process_issue_once(
             issue=issue,
             config=config,
             state=state,
@@ -1106,6 +1303,9 @@ def process_active_work_once(
             owner_id=owner_id,
             move_in_progress=_active_work_needs_in_progress_transition(issue, config),
         )
+        if result.status == "not_claimed":
+            continue
+        return result
     return None
 
 
@@ -1528,6 +1728,8 @@ def _runner_result_to_state(result: RunnerResult) -> dict[str, Any]:
         "timeout_seconds": result.timeout_seconds,
         "structured_result": _structured_result_to_state(result.structured_result),
         "result_error": result.result_error,
+        "worktree_branch": result.worktree_branch,
+        "worktree_note": result.worktree_note,
     }
 
 
@@ -1554,6 +1756,8 @@ def _runner_result_from_state(data: dict[str, Any]) -> RunnerResult:
         timeout_seconds=int(data["timeout_seconds"]),
         structured_result=structured_result,
         result_error=data.get("result_error") or persisted_result_error,
+        worktree_branch=data.get("worktree_branch"),
+        worktree_note=data.get("worktree_note"),
     )
 
 
@@ -1839,6 +2043,10 @@ def _result_body(title: str, result: RunnerResult) -> str:
         f"Artifacts: `{result.paths.artifacts_dir}`",
         f"Structured result: `{result.paths.result_path}`",
     ]
+    if result.worktree_branch:
+        lines.append(f"Local branch (not pushed): `{result.worktree_branch}` — review and merge or discard manually.")
+    if result.worktree_note:
+        lines.append(f"Workspace note: {redact_sensitive_text(result.worktree_note)}")
     stdout = _truncate_tail(redact_sensitive_text(result.stdout.strip()))
     stderr = _truncate_tail(redact_sensitive_text(result.stderr.strip()))
     if stdout:

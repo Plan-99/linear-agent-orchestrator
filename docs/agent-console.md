@@ -15,8 +15,20 @@ Canonical constants/helpers/validator: `src/linear_agent_orchestrator/console_sc
 | `AGENT_CONSOLE` | `auto` | Master gate. `auto` = enable inside a host tmux, headless otherwise; `true`/`false` force. |
 | `AGENT_CONSOLE_LOG_DIR` | `/workspace/logs/console` | Container path for the host-readable per-run JSONL + output logs. |
 | `AGENT_CONSOLE_SOCKET_DIR` | `/tmp/lao-console` | Container-private per-run tmux socket/argv root. Never bind-mounted. |
-| `AGENT_CONSOLE_DIRECT_INPUT` | `false` | Explicit capability metadata: may the console send keystrokes to the agent? Never inferred from the backend name. |
+| `AGENT_CONSOLE_DIRECT_INPUT` | `false` | Explicit capability metadata: may the console send keystrokes to the agent? Never inferred from the backend name. Forced `true` per run when `AGENT_INTERACTIVE=true` (the TUI genuinely reads the PTY). |
+| `AGENT_CONSOLE_OPEN_TARGET` | `window` | Where the supervisor opens each run: `window` (daemon keeps window 0, each run gets its own `lao:<run_id>` window so team-mode backends can split panes inside it) or `split` (sibling pane in the daemon's window). |
+| `AGENT_CONSOLE_LAYOUT` | `main-vertical` | Split mode only: window layout re-applied when a run pane opens, keeping the daemon (first pane) as the main pane. One of `main-vertical` \| `main-horizontal` \| `tiled` \| `even-vertical` \| `even-horizontal` \| `none`. |
 | `AGENT_CONSOLE_HOST_LOG_DIR` | `${LAO_RUNTIME_DIR}/logs/console` | The **host console directory itself**, bind-mounted at `/workspace/logs/console`; override for host scripts. |
+
+The inner private tmux server enables `mouse on` plus a 50k-line scrollback, so
+an attached client can wheel-scroll into copy-mode and click between inner
+panes (e.g. a team-mode backend splitting its own session). A read-only
+(`attach -r`) client cannot do either, so the supervisor opens non-direct-input
+runs with `console-attach.sh --interactive`: a read-write tmux client without
+the `--write` gate. Typed keys reach the PTY but the bundled one-shot adapters
+never read them; `--write` (gated on `supports_direct_input`) remains the only
+honest "operator steers the backend" mode, and manual attach still defaults to
+read-only.
 
 - Default is **`auto`**: `scripts/daemon.sh` enables the console when it runs
   inside a host tmux and falls back to the normal headless path otherwise;

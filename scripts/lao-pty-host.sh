@@ -155,6 +155,11 @@ fi
 tmux -S "$socket" set-option -t "$session" status off 2>/dev/null || true
 tmux -S "$socket" set-option -t "$session" remain-on-exit off 2>/dev/null || true
 tmux -S "$socket" set-option -g allow-passthrough off 2>/dev/null || true
+# Operator UX on the private server: wheel scroll enters copy-mode and clicking
+# selects panes (matters when a team-mode backend splits panes inside this
+# session). Attached clients must not be read-only (-r) for these to work.
+tmux -S "$socket" set-option -g mouse on 2>/dev/null || true
+tmux -S "$socket" set-option -g history-limit 50000 2>/dev/null || true
 
 # Wait briefly for the entry script to record the real backend PID.
 backend_pid=""

@@ -69,6 +69,17 @@ class RunnerConfig:
     allowed_env: tuple[str, ...] = field(default_factory=tuple)
     project_dir: str = "/workspace/project"
     backend: str = "omx"
+    # Per-run git worktree isolation (standard lao-agent-runner wrapper only).
+    # Each run works in an orchestrator-owned worktree branched from the fixed
+    # repository's HEAD; a semantically successful run is committed to a local
+    # lao/<issue> branch (never pushed) and the worktree is removed. The base
+    # repository therefore stays clean and no longer blocks the next run.
+    worktree_isolation: bool = True
+    # Interactive conversation mode: host the backend's interactive TUI in the
+    # per-run console instead of the one-shot exec path. Run completion is then
+    # detected from the structured result file (or TUI exit); the Done gate is
+    # unchanged. Requires the interactive console.
+    interactive: bool = False
     # Interactive console (model-neutral tmux/PTY host). Default off keeps the
     # execution path byte-identical. The tmux socket lives under an ephemeral,
     # container-private path (never a bind mount, never the host tmux socket);
@@ -93,6 +104,11 @@ class AppConfig:
     log_level: str = "INFO"
     log_format: str = "json"
     state_db_path: str = "/workspace/data/state.sqlite3"
+    # Number of concurrent issue workers inside this one daemon. Each worker
+    # polls with its own Linear client/state connection and a distinct claim
+    # owner id; SQLite claims prevent two workers from taking the same issue.
+    # Values > 1 require per-run worktree isolation.
+    max_parallel_runs: int = 1
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS
     lease_renewal_interval_seconds: int = DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS
@@ -124,6 +140,12 @@ class AppConfig:
             errors.append("backoff.max_seconds must be >= backoff.initial_seconds")
         if self.backoff.max_attempts <= 0:
             errors.append("backoff.max_attempts must be positive")
+        if self.runner.interactive and not self.runner.interactive_console:
+            errors.append("AGENT_INTERACTIVE=true requires AGENT_CONSOLE=true (the TUI needs the per-run tmux console)")
+        if self.max_parallel_runs <= 0:
+            errors.append("MAX_PARALLEL_RUNS must be positive")
+        if self.max_parallel_runs > 1 and not self.runner.worktree_isolation:
+            errors.append("MAX_PARALLEL_RUNS > 1 requires AGENT_WORKTREE_ISOLATION=true (parallel runs must not share one checkout)")
         if require_secrets:
             if not self.linear.api_key:
                 errors.append("LINEAR_API_KEY is required")
@@ -244,6 +266,7 @@ def load_config(
         log_level=_get_str(source, "LOG_LEVEL", "INFO").upper(),
         log_format=_get_str(source, "LOG_FORMAT", "json"),
         state_db_path=_get_str(source, "STATE_DB_PATH", "/workspace/data/state.sqlite3"),
+        max_parallel_runs=_get_int(source, "MAX_PARALLEL_RUNS", 1),
         poll_interval_seconds=_get_int(source, "POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL_SECONDS),
         lease_ttl_seconds=_get_int(source, "LEASE_TTL_SECONDS", DEFAULT_LEASE_TTL_SECONDS),
         lease_renewal_interval_seconds=_get_int(
@@ -274,6 +297,8 @@ def load_config(
             allowed_env=_get_csv_tuple(source, "RUNNER_ALLOWED_ENV"),
             project_dir=_get_str(source, "AGENT_PROJECT_DIR", "/workspace/project"),
             backend=_get_str(source, "AGENT_BACKEND", "omx").casefold(),
+            worktree_isolation=_get_bool(source, "AGENT_WORKTREE_ISOLATION", True),
+            interactive=_get_bool(source, "AGENT_INTERACTIVE", False),
             interactive_console=_get_bool(source, "AGENT_CONSOLE", False),
             console_log_dir=_get_str(source, "AGENT_CONSOLE_LOG_DIR", "/workspace/logs/console"),
             console_socket_dir=_get_str(source, "AGENT_CONSOLE_SOCKET_DIR", "/tmp/lao-console"),
@@ -298,7 +323,10 @@ def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[
         return [f"Unsupported AGENT_BACKEND: {runner.backend!r}"]
 
     project_dir = Path(runner.project_dir)
-    errors.extend(validate_project_workspace(project_dir))
+    # With per-run worktree isolation the base repository never hosts agent
+    # edits directly, so a dirty base worktree (e.g. an unreviewed lao/<issue>
+    # branch checkout) must not block runs; each run branches from HEAD.
+    errors.extend(validate_project_workspace(project_dir, require_clean=not runner.worktree_isolation))
 
     missing_tools = [tool for tool in ("rg", "ps") if shutil.which(tool) is None]
     if missing_tools:
@@ -343,8 +371,8 @@ def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[
     return errors
 
 
-def validate_project_workspace(project_dir: str | Path) -> list[str]:
-    """Validate the trusted repository path and require a clean git worktree."""
+def validate_project_workspace(project_dir: str | Path, *, require_clean: bool = True) -> list[str]:
+    """Validate the trusted repository path; optionally require a clean git worktree."""
 
     path = Path(project_dir)
     errors: list[str] = []
@@ -362,11 +390,12 @@ def validate_project_workspace(project_dir: str | Path) -> list[str]:
     if git_check[0] != 0 or git_check[1].strip() != "true":
         errors.append(f"Agent project directory is not a git worktree: {path}")
         return errors
-    git_status = _run_preflight_command(("git", "-C", str(path), "status", "--porcelain"))
-    if git_status[0] != 0:
-        errors.append(f"Could not inspect agent project git status: {_preflight_output(git_status)}")
-    elif git_status[1].strip():
-        errors.append(f"Agent project git worktree is dirty: {path}")
+    if require_clean:
+        git_status = _run_preflight_command(("git", "-C", str(path), "status", "--porcelain"))
+        if git_status[0] != 0:
+            errors.append(f"Could not inspect agent project git status: {_preflight_output(git_status)}")
+        elif git_status[1].strip():
+            errors.append(f"Agent project git worktree is dirty: {path}")
     return errors
 
 

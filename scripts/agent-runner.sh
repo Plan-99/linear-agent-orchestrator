@@ -30,6 +30,11 @@ export LAO_RESULT_PATH="$result_path"
 backend="${AGENT_BACKEND:-omx}"
 project_dir="${AGENT_PROJECT_DIR:-/workspace/project}"
 model="${AGENT_MODEL:-}"
+# Interactive conversation mode: launch the backend's TUI (inside the per-run
+# tmux console) with the issue prompt as the initial message instead of the
+# one-shot exec path. The orchestrator detects completion from the structured
+# result file; typing reaches the TUI because the console declares direct input.
+interactive="${AGENT_INTERACTIVE:-false}"
 
 if [[ ! -d "$project_dir" ]]; then
   echo "lao-agent-runner: project directory does not exist: $project_dir" >&2
@@ -45,12 +50,22 @@ bypass="${AGENT_BYPASS_PERMISSIONS:-true}"
 
 case "$backend" in
   omx|codex)
-    if [[ "$backend" == "omx" ]]; then
-      command=(omx exec)
+    if [[ "$interactive" == "true" ]]; then
+      # TUI with the prompt as the initial message; stdin stays on the PTY.
+      if [[ "$backend" == "omx" ]]; then
+        command=(omx)
+      else
+        command=(codex)
+      fi
+      command+=(--cd "$project_dir")
     else
-      command=(codex exec)
+      if [[ "$backend" == "omx" ]]; then
+        command=(omx exec)
+      else
+        command=(codex exec)
+      fi
+      command+=(--cd "$project_dir" --skip-git-repo-check)
     fi
-    command+=(--cd "$project_dir" --skip-git-repo-check)
     if [[ -n "$model" ]]; then
       command+=(--model "$model")
     fi
@@ -59,11 +74,18 @@ case "$backend" in
     else
       command+=(--sandbox "${AGENT_SANDBOX:-workspace-write}")
     fi
+    if [[ "$interactive" == "true" ]]; then
+      exec "${command[@]}" "$(cat "$prompt_path")"
+    fi
     command+=(-)
     exec "${command[@]}" < "$prompt_path"
     ;;
   claude)
-    command=(claude --print)
+    if [[ "$interactive" == "true" ]]; then
+      command=(claude)
+    else
+      command=(claude --print)
+    fi
     if [[ "$bypass" == "true" ]]; then
       command+=(--dangerously-skip-permissions)
     else
@@ -71,6 +93,9 @@ case "$backend" in
     fi
     if [[ -n "$model" ]]; then
       command+=(--model "$model")
+    fi
+    if [[ "$interactive" == "true" ]]; then
+      exec "${command[@]}" "$(cat "$prompt_path")"
     fi
     exec "${command[@]}" < "$prompt_path"
     ;;

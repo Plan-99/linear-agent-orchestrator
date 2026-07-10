@@ -61,6 +61,16 @@ usage: console-supervisor.sh [options]
                       | $LAO_DAEMON_CONTAINER_NAME | lao-daemon)
   --daemon-pane <id>  tmux pane id to split beside (default: $TMUX_PANE)
   --parent-pid <pid>  Exit when this launcher pid is gone (no-orphan guarantee).
+  --open-target <t>   Where each run opens: "window" (default; daemon keeps
+                      window 0, each agent gets its own window so team-mode
+                      backends can split panes inside it) or "split" (sibling
+                      pane in the daemon's window).
+                      Default: $AGENT_CONSOLE_OPEN_TARGET | .env | window.
+  --layout <name>     Split mode only: window layout applied after opening a
+                      run pane so the daemon (first pane) stays the main pane.
+                      One of: main-vertical | main-horizontal | tiled |
+                      even-vertical | even-horizontal | none.
+                      Default: $AGENT_CONSOLE_LAYOUT | .env | main-vertical.
   --interval <sec>    Poll interval, integer >= 1 (default: 2)
   --once              Run a single reconcile pass and exit (for tests/cron).
   --headless          Force headless mode (log attach commands, never split panes).
@@ -96,23 +106,56 @@ open_pane() { # run_id
   local run="$1"
   local direct; direct="$(run_direct_input "$LOG_DIR/$run/lifecycle.jsonl")"
   local -a attach_cmd=("$ATTACH_SCRIPT" --run "$run" --container "$CONTAINER" --log-dir "$LOG_DIR")
-  local mode="read-only"
-  if [[ "$direct" == "true" ]]; then attach_cmd+=(--write); mode="read-write (direct input)"; fi
+  # Direct-input adapters get a gated read-write attach; everything else gets an
+  # interactive client so scrollback, mouse, and inner team-pane selection work.
+  local mode="interactive"
+  if [[ "$direct" == "true" ]]; then attach_cmd+=(--write); mode="read-write (direct input)"
+  else attach_cmd+=(--interactive); fi
   local shcmd; shcmd="$(printf '%q ' "${attach_cmd[@]}")"
   if [[ "$DRY_RUN" == 1 ]]; then
-    printf 'DRY: [%s] split-window -t %s sh -c %q ; select-pane -T lao:%s\n' "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run"
+    if [[ "$OPEN_TARGET" == "window" ]]; then
+      printf 'DRY: [%s] new-window -a -t %s sh -c %q ; select-pane -T lao:%s\n' \
+        "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run"
+    else
+      printf 'DRY: [%s] split-window -t %s sh -c %q ; select-pane -T lao:%s ; select-layout %s\n' \
+        "$mode" "${DAEMON_PANE:-<pane>}" "$shcmd" "$run" "$LAYOUT"
+    fi
     return 0
   fi
-  local -a split=(tmux split-window -d -PF '#{pane_id}')
-  [[ -n "$DAEMON_PANE" ]] && split+=(-t "$DAEMON_PANE")
-  split+=("$shcmd")
+  local -a open_cmd
+  if [[ "$OPEN_TARGET" == "window" ]]; then
+    # One window per run: the daemon keeps window 0 and each agent gets its own
+    # window, so a team-mode backend can split panes inside it freely.
+    # new-window's -t takes a WINDOW target ("can't specify pane here"), so the
+    # daemon pane id must be resolved to its session:window first.
+    open_cmd=(tmux new-window -d -PF '#{pane_id}')
+    if [[ -n "$DAEMON_PANE" ]]; then
+      local daemon_window
+      daemon_window="$(tmux display-message -p -t "$DAEMON_PANE" '#{session_name}:#{window_index}' 2>/dev/null || true)"
+      [[ -n "$daemon_window" ]] && open_cmd+=(-a -t "$daemon_window")
+    fi
+  else
+    open_cmd=(tmux split-window -d -PF '#{pane_id}')
+    [[ -n "$DAEMON_PANE" ]] && open_cmd+=(-t "$DAEMON_PANE")
+  fi
+  open_cmd+=("$shcmd")
   local pane_id
-  if ! pane_id="$("${split[@]}" 2>&1)"; then
-    log "failed to split pane for run $run: $pane_id"
+  if ! pane_id="$("${open_cmd[@]}" 2>&1)"; then
+    log "failed to open $OPEN_TARGET for run $run: $pane_id"
     return 1
   fi
   tmux select-pane -t "$pane_id" -T "lao:$run" 2>/dev/null || true
-  log "opened pane $pane_id for run $run [$mode]"
+  if [[ "$OPEN_TARGET" == "window" ]]; then
+    tmux rename-window -t "$pane_id" "lao:$run" 2>/dev/null || true
+    log "opened window for run $run [$mode] (pane $pane_id)"
+    return 0
+  fi
+  # Split mode: re-apply the window layout so the daemon (first pane) remains
+  # the main pane and issue panes stack beside it as more runs open.
+  if [[ "$LAYOUT" != "none" ]]; then
+    tmux select-layout -t "$pane_id" "$LAYOUT" 2>/dev/null || true
+  fi
+  log "opened pane $pane_id for run $run [$mode] (layout=$LAYOUT)"
 }
 
 headless_notice() { # run_id
@@ -120,7 +163,7 @@ headless_notice() { # run_id
   case " $HEADLESS_SEEN " in *" $run "*) return 0 ;; esac
   HEADLESS_SEEN="$HEADLESS_SEEN $run"
   local direct; direct="$(run_direct_input "$LOG_DIR/$run/lifecycle.jsonl")"
-  local -a extra=(); local mode="read-only"
+  local -a extra=(--interactive); local mode="interactive"
   if [[ "$direct" == "true" ]]; then extra=(--write); mode="read-write (direct input)"; fi
   log "run $run live (headless) [$mode]. Attach with:"
   printf '  %s --run %s --container %s --log-dir %q' \
@@ -183,12 +226,16 @@ main() {
   PARENT_PID=""
   OPENED_SEEN=""
   ORPHAN_SEEN=""
+  LAYOUT=""
+  OPEN_TARGET=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --log-dir) log_dir_opt="${2:-}"; shift 2 ;;
       --container) CONTAINER="${2:-}"; shift 2 ;;
       --daemon-pane) DAEMON_PANE="${2:-}"; shift 2 ;;
       --parent-pid) PARENT_PID="${2:-}"; shift 2 ;;
+      --open-target) OPEN_TARGET="${2:-}"; shift 2 ;;
+      --layout) LAYOUT="${2:-}"; shift 2 ;;
       --interval) interval="${2:-}"; shift 2 ;;
       --once) once=1; shift ;;
       --headless) force_headless=1; shift ;;
@@ -201,6 +248,23 @@ main() {
   [[ "$CONTAINER" =~ $CONTAINER_RE ]] || die "invalid container name: $CONTAINER"
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "invalid --interval (integer >= 1): $interval"
   [[ -z "$PARENT_PID" || "$PARENT_PID" =~ ^[0-9]+$ ]] || die "invalid parent pid: $PARENT_PID"
+  # Open target: flag > process env > project .env > window (daemon keeps
+  # window 0; each run gets its own window for team-mode pane splits).
+  if [[ -z "$OPEN_TARGET" ]]; then
+    OPEN_TARGET="${AGENT_CONSOLE_OPEN_TARGET:-}"
+    [[ -n "$OPEN_TARGET" ]] || OPEN_TARGET="$(read_env_value AGENT_CONSOLE_OPEN_TARGET "$(repo_root)/.env" 2>/dev/null || true)"
+    [[ -n "$OPEN_TARGET" ]] || OPEN_TARGET="window"
+  fi
+  [[ "$OPEN_TARGET" =~ ^(window|split)$ ]] || die "invalid --open-target: $OPEN_TARGET (expected window|split)"
+  # Layout (split mode): flag > process env > project .env > main-vertical
+  # (daemon stays the large main pane; issue panes stack beside it).
+  if [[ -z "$LAYOUT" ]]; then
+    LAYOUT="${AGENT_CONSOLE_LAYOUT:-}"
+    [[ -n "$LAYOUT" ]] || LAYOUT="$(read_env_value AGENT_CONSOLE_LAYOUT "$(repo_root)/.env" 2>/dev/null || true)"
+    [[ -n "$LAYOUT" ]] || LAYOUT="main-vertical"
+  fi
+  [[ "$LAYOUT" =~ ^(main-vertical|main-horizontal|tiled|even-vertical|even-horizontal|none)$ ]] \
+    || die "invalid --layout: $LAYOUT (expected main-vertical|main-horizontal|tiled|even-vertical|even-horizontal|none)"
   LOG_DIR="$(if [[ -n "$log_dir_opt" ]]; then printf '%s\n' "$log_dir_opt"; else resolve_host_console_log_dir "$(repo_root)"; fi)"
   ATTACH_SCRIPT="$(repo_root)/scripts/console-attach.sh"
   [[ -x "$ATTACH_SCRIPT" ]] || log "warn: $ATTACH_SCRIPT not executable"
@@ -215,7 +279,7 @@ main() {
   else
     MODE=headless
   fi
-  log "mode=$MODE log_dir=$LOG_DIR container=$CONTAINER daemon_pane=${DAEMON_PANE:-<none>} parent_pid=${PARENT_PID:-<none>} interval=${interval}s dry_run=$DRY_RUN"
+  log "mode=$MODE log_dir=$LOG_DIR container=$CONTAINER daemon_pane=${DAEMON_PANE:-<none>} parent_pid=${PARENT_PID:-<none>} open_target=$OPEN_TARGET layout=$LAYOUT interval=${interval}s dry_run=$DRY_RUN"
 
   if [[ "$once" == 1 ]]; then reconcile_once; return 0; fi
   while [[ "$STOP" == 0 ]]; do

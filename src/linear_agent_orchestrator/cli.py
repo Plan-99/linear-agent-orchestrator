@@ -363,17 +363,29 @@ def _daemon(
         LOGGER.info("daemon_startup_ready", extra={"schema_version": schema_version, "db_path": str(db_path)})
         return 0
 
-    linear = LinearClient.from_config(config.linear)
-    runner = ShellRunner(config.runner)
-    with StateStore(db_path) as state:
+    if config.max_parallel_runs > 1:
         result = run_daemon(
             config=config,
-            state=state,
-            linear=linear,
-            runner=runner,
             owner_id=owner_id,
             max_iterations=max_iterations,
+            component_factory=lambda: (
+                StateStore(db_path),
+                LinearClient.from_config(config.linear),
+                ShellRunner(config.runner),
+            ),
         )
+    else:
+        linear = LinearClient.from_config(config.linear)
+        runner = ShellRunner(config.runner)
+        with StateStore(db_path) as state:
+            result = run_daemon(
+                config=config,
+                state=state,
+                linear=linear,
+                runner=runner,
+                owner_id=owner_id,
+                max_iterations=max_iterations,
+            )
     LOGGER.info(
         "daemon_stopped",
         extra={"iterations": result.iterations, "stop_requested": result.stop_requested, "last_status": result.last_status},

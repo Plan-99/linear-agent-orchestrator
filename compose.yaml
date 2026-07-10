@@ -40,6 +40,14 @@ services:
       AGENT_BACKEND: ${AGENT_BACKEND:-omx}
       AGENT_MODEL: ${AGENT_MODEL:-}
       AGENT_PROJECT_DIR: ${AGENT_PROJECT_DIR:-/workspace/project}
+      # Per-run git worktree isolation; runs commit to local lao/<issue>
+      # branches (never pushed) and the base checkout stays clean.
+      AGENT_WORKTREE_ISOLATION: ${AGENT_WORKTREE_ISOLATION:-true}
+      # Interactive TUI conversation mode (requires the tmux console).
+      AGENT_INTERACTIVE: ${AGENT_INTERACTIVE:-false}
+      # Concurrent issue workers in one daemon; >1 requires worktree isolation.
+      MAX_PARALLEL_RUNS: ${MAX_PARALLEL_RUNS:-1}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
       AGENT_SANDBOX: ${AGENT_SANDBOX:-workspace-write}
       AGENT_PERMISSION_MODE: ${AGENT_PERMISSION_MODE:-acceptEdits}
       # Docker is the security boundary; agent CLIs bypass permissions inside.
