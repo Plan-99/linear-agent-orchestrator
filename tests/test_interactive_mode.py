@@ -209,11 +209,15 @@ def test_interactive_run_completes_when_result_is_submitted(tmp_path, monkeypatc
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("LAO_PTY_ENTRY", str(bin_dir / "lao-pty-entry"))
 
-    # A "TUI" that writes its structured result then keeps running forever;
-    # only the orchestrator's result-detection can end this run.
+    # A "TUI" that, like real interactive backends, refuses to run unless its
+    # stdout is a terminal (regression: tee-captured stdout broke codex with
+    # "stdout is not a terminal"), writes its structured result, then keeps
+    # running forever; only the orchestrator's result-detection ends this run.
     backend = tmp_path / "fake-tui"
     backend.write_text(
         "#!/usr/bin/env bash\n"
+        "[ -t 1 ] || { echo 'fake-tui: stdout is not a terminal' >&2; exit 91; }\n"
+        "echo 'fake-tui banner'\n"
         "sleep 1\n"
         f"printf '%s' '{COMPLETED_RESULT}' > \"$2\"\n"
         "sleep 120\n",

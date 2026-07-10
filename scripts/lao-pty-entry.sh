@@ -54,7 +54,15 @@ fi
 # accidental stdin readers from hanging until the runner timeout.
 stdin_path="/dev/null"
 [[ "$direct_input" == "true" ]] && stdin_path="/dev/tty"
-if [[ -n "$log_path" ]]; then
+if [[ "$direct_input" == "true" ]]; then
+  # Interactive/TUI backends must own the pane PTY as stdout/stderr; the tee
+  # redirection below would turn stdout into a pipe and TUIs refuse to start
+  # ("stdout is not a terminal"). The pty host mirrors the pane to the
+  # persistent log via `tmux pipe-pane` instead; pause briefly so the mirror
+  # attaches before the backend's first output.
+  sleep 0.3
+  "${argv[@]}" <"$stdin_path" &
+elif [[ -n "$log_path" ]]; then
   mkdir -p -- "$(dirname -- "$log_path")" 2>/dev/null || true
   "${argv[@]}" <"$stdin_path" > >(tee -a -- "$log_path") 2>&1 &
 else

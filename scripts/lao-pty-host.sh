@@ -161,6 +161,14 @@ tmux -S "$socket" set-option -g allow-passthrough off 2>/dev/null || true
 tmux -S "$socket" set-option -g mouse on 2>/dev/null || true
 tmux -S "$socket" set-option -g history-limit 50000 2>/dev/null || true
 
+# Direct-input (TUI) runs keep the pane PTY as stdout, so the entry script does
+# not tee; mirror the pane's output to the persistent log here instead. The
+# entry delays its exec briefly so this attaches before the first output.
+if [[ -n "$log_path" && "$supports_direct_input" == "true" ]]; then
+  mkdir -p -- "$(dirname -- "$log_path")" 2>/dev/null || true
+  tmux -S "$socket" pipe-pane -O -t "$session" "cat >> $(printf '%q' "$log_path")" 2>/dev/null || true
+fi
+
 # Wait briefly for the entry script to record the real backend PID.
 backend_pid=""
 for _ in $(seq 1 50); do
