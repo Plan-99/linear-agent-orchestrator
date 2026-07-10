@@ -63,6 +63,7 @@ def test_agent_runner_bypasses_permissions_by_default(tmp_path: Path, backend: s
         "AGENT_PROJECT_DIR": str(project_dir),
     }
     env.pop("AGENT_BYPASS_PERMISSIONS", None)
+    env.pop("AGENT_EFFORT", None)
 
     result = run_script(tmp_path, prompt, result_path, env)
 
@@ -70,6 +71,39 @@ def test_agent_runner_bypasses_permissions_by_default(tmp_path: Path, backend: s
     expected = [str(project_dir) if value == "{project}" else value for value in expected_args]
     assert Path(captures["CAPTURE_ARGS"]).read_text(encoding="utf-8").splitlines() == expected
     assert Path(captures["CAPTURE_STDIN"]).read_text(encoding="utf-8") == "analyze this project\n"
+
+
+@pytest.mark.parametrize(
+    ("backend", "binary", "expected_effort_args"),
+    [
+        ("omx", "omx", ["-c", "model_reasoning_effort=xhigh"]),
+        ("codex", "codex", ["-c", "model_reasoning_effort=xhigh"]),
+        ("claude", "claude", ["--effort", "xhigh"]),
+    ],
+)
+def test_agent_runner_passes_reasoning_effort(tmp_path: Path, backend: str, binary: str, expected_effort_args: list[str]):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    captures = make_fake_backend(tmp_path, binary)
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("analyze this project\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        **captures,
+        "AGENT_BACKEND": backend,
+        "AGENT_MODEL": "test-model",
+        "AGENT_EFFORT": "xhigh",
+        "AGENT_PROJECT_DIR": str(project_dir),
+    }
+
+    result = run_script(tmp_path, prompt, tmp_path / "result.json", env)
+
+    assert result.returncode == 0, result.stderr
+    args = Path(captures["CAPTURE_ARGS"]).read_text(encoding="utf-8").splitlines()
+    joined = " ".join(args)
+    assert " ".join(expected_effort_args) in joined
+    # Effort rides with the model selection, before the prompt/stdin marker.
+    assert "--model test-model" in joined
 
 
 @pytest.mark.parametrize(
@@ -97,6 +131,7 @@ def test_agent_runner_falls_back_to_backend_sandbox_when_bypass_disabled(tmp_pat
         "AGENT_PERMISSION_MODE": "acceptEdits",
         "AGENT_BYPASS_PERMISSIONS": "false",
     }
+    env.pop("AGENT_EFFORT", None)
 
     result = run_script(tmp_path, prompt, result_path, env)
 

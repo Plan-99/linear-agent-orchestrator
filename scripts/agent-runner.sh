@@ -30,6 +30,10 @@ export LAO_RESULT_PATH="$result_path"
 backend="${AGENT_BACKEND:-omx}"
 project_dir="${AGENT_PROJECT_DIR:-/workspace/project}"
 model="${AGENT_MODEL:-}"
+# Reasoning effort. omx/codex take it as a config override
+# (model_reasoning_effort); claude has a native --effort flag. Empty = backend
+# default.
+effort="${AGENT_EFFORT:-}"
 # Interactive conversation mode: launch the backend's TUI (inside the per-run
 # tmux console) with the issue prompt as the initial message instead of the
 # one-shot exec path. The orchestrator detects completion from the structured
@@ -69,6 +73,9 @@ case "$backend" in
     if [[ -n "$model" ]]; then
       command+=(--model "$model")
     fi
+    if [[ -n "$effort" ]]; then
+      command+=(-c "model_reasoning_effort=$effort")
+    fi
     if [[ "$bypass" == "true" ]]; then
       command+=(--dangerously-bypass-approvals-and-sandbox)
     else
@@ -93,6 +100,9 @@ case "$backend" in
     fi
     if [[ -n "$model" ]]; then
       command+=(--model "$model")
+    fi
+    if [[ -n "$effort" ]]; then
+      command+=(--effort "$effort")
     fi
     if [[ "$interactive" == "true" ]]; then
       exec "${command[@]}" "$(cat "$prompt_path")"

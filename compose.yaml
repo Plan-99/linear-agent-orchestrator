@@ -39,6 +39,7 @@ services:
       RUNNER_ALLOWED_ENV: ${RUNNER_ALLOWED_ENV:-}
       AGENT_BACKEND: ${AGENT_BACKEND:-omx}
       AGENT_MODEL: ${AGENT_MODEL:-}
+      AGENT_EFFORT: ${AGENT_EFFORT:-}
       AGENT_PROJECT_DIR: ${AGENT_PROJECT_DIR:-/workspace/project}
       # Per-run git worktree isolation; runs commit to local lao/<issue>
       # branches (never pushed) and the base checkout stays clean.

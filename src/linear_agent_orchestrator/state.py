@@ -14,6 +14,7 @@ from pathlib import Path
 import json
 import random
 import sqlite3
+import time
 from typing import Any, Callable
 
 from .config import BackoffConfig
@@ -100,7 +101,18 @@ class StateStore:
         # would otherwise fail immediately with "database is locked".
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
+        # The rollback->WAL conversion needs an exclusive lock upgrade, and
+        # SQLite returns SQLITE_BUSY for lock *upgrades* immediately (the busy
+        # handler is bypassed to avoid deadlocks). Concurrent workers opening
+        # the same fresh database therefore need an explicit retry here.
+        for attempt in range(100):
+            try:
+                self._conn.execute("PRAGMA journal_mode = WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).casefold() or attempt == 99:
+                    raise
+                time.sleep(0.02)
         self.migrate()
 
     def close(self) -> None:
