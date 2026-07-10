@@ -6,6 +6,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 
 import pytest
@@ -171,10 +172,11 @@ class FakeProcess:
         return None
 
 
-def interactive_config(tmp_path, command, *, timeout=6, autoclose=False):
+def interactive_config(tmp_path, command, *, timeout=6, autoclose=False, max_lifetime=21600):
     return RunnerConfig(
         command_template=command,
         timeout_seconds=timeout,
+        max_lifetime_seconds=max_lifetime,
         work_dir=str(tmp_path / "work"),
         artifacts_dir=str(tmp_path / "artifacts"),
         allowed_env=("PATH", "HOME", "LAO_PTY_ENTRY"),
@@ -205,6 +207,104 @@ def test_wait_interactive_default_waits_for_exit_and_keeps_timeout(tmp_path):
     started = time.monotonic()
     assert runner._wait_interactive(FakeProcess(), result_path) == "timeout"
     assert time.monotonic() - started < 5
+
+
+# --------------------------------------------------------------------------- #
+# Activity-based idle timeout + hard lifetime cap
+# --------------------------------------------------------------------------- #
+
+class TimedFakeProcess:
+    """poll() returns None until the wall-clock deadline, then 0."""
+
+    def __init__(self, exits_after_seconds):
+        self.deadline = time.monotonic() + exits_after_seconds
+
+    def poll(self):
+        return 0 if time.monotonic() >= self.deadline else None
+
+
+def feed_activity(log_path, stop, interval=0.2):
+    def writer():
+        tick = 0
+        while not stop.is_set():
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"tick {tick}\n")
+            tick += 1
+            stop.wait(interval)
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_wait_interactive_continuing_activity_resets_idle_timeout(tmp_path):
+    config = interactive_config(tmp_path, "/bin/true {prompt_path} {result_path}", timeout=1)
+    runner = ShellRunner(config)
+    log_path = tmp_path / "output.log"
+    log_path.write_text("boot\n", encoding="utf-8")
+
+    stop = threading.Event()
+    thread = feed_activity(log_path, stop)
+    started = time.monotonic()
+    try:
+        # The TUI exits well after timeout_seconds; ongoing console output must
+        # keep pushing the idle deadline back until then.
+        outcome = runner._wait_interactive(
+            TimedFakeProcess(exits_after_seconds=2.5), tmp_path / "result.json", activity_path=log_path
+        )
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert outcome == "exited"
+    assert elapsed >= 2.0, f"activity should extend the run past timeout_seconds ({elapsed:.1f}s)"
+
+
+def test_wait_interactive_idle_timeout_fires_when_activity_stops(tmp_path):
+    config = interactive_config(tmp_path, "/bin/true {prompt_path} {result_path}", timeout=1)
+    runner = ShellRunner(config)
+    log_path = tmp_path / "output.log"
+    log_path.write_text("boot\n", encoding="utf-8")
+
+    stop = threading.Event()
+    thread = feed_activity(log_path, stop)
+    timer = threading.Timer(1.5, stop.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        outcome = runner._wait_interactive(FakeProcess(), tmp_path / "result.json", activity_path=log_path)
+    finally:
+        timer.cancel()
+        stop.set()
+        thread.join(timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert outcome == "timeout"
+    assert elapsed >= 2.0, f"idle timeout should count from the last activity ({elapsed:.1f}s)"
+    assert elapsed < 8, f"idle timeout should fire ~timeout_seconds after activity stops ({elapsed:.1f}s)"
+
+
+def test_wait_interactive_hard_cap_overrides_activity(tmp_path):
+    config = interactive_config(
+        tmp_path, "/bin/true {prompt_path} {result_path}", timeout=30, max_lifetime=1
+    )
+    runner = ShellRunner(config)
+    log_path = tmp_path / "output.log"
+    log_path.write_text("boot\n", encoding="utf-8")
+
+    stop = threading.Event()
+    thread = feed_activity(log_path, stop)
+    started = time.monotonic()
+    try:
+        outcome = runner._wait_interactive(FakeProcess(), tmp_path / "result.json", activity_path=log_path)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert outcome == "timeout"
+    assert elapsed < 5, f"hard cap must end the run despite continuous activity ({elapsed:.1f}s)"
 
 
 def test_wait_interactive_autoclose_detects_result(tmp_path):

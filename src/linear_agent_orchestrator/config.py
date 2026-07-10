@@ -22,6 +22,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_LEASE_TTL_SECONDS = 900
 DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS = 120
 DEFAULT_RUNNER_TIMEOUT_SECONDS = 3600
+DEFAULT_RUNNER_MAX_LIFETIME_SECONDS = 21600
 DEFAULT_BACKOFF_INITIAL_SECONDS = 5
 DEFAULT_BACKOFF_MAX_SECONDS = 300
 DEFAULT_BACKOFF_MAX_ATTEMPTS = 5
@@ -64,6 +65,11 @@ class RunnerConfig:
 
     command_template: str | None = None
     timeout_seconds: int = DEFAULT_RUNNER_TIMEOUT_SECONDS
+    # Interactive runs treat timeout_seconds as an idle timeout: console output
+    # activity keeps pushing the deadline back. This hard cap ends the run
+    # regardless of activity so a chatty backend can never extend forever.
+    # One-shot runs ignore it and keep the fixed timeout_seconds deadline.
+    max_lifetime_seconds: int = DEFAULT_RUNNER_MAX_LIFETIME_SECONDS
     work_dir: str = "/workspace/work"
     artifacts_dir: str = "/workspace/artifacts"
     allowed_env: tuple[str, ...] = field(default_factory=tuple)
@@ -138,6 +144,8 @@ class AppConfig:
             errors.append("lease_renewal_interval_seconds must be less than lease_ttl_seconds")
         if self.runner.timeout_seconds <= 0:
             errors.append("runner_timeout_seconds must be positive")
+        if self.runner.max_lifetime_seconds <= 0:
+            errors.append("runner_max_lifetime_seconds must be positive")
         if self.backoff.initial_seconds <= 0:
             errors.append("backoff.initial_seconds must be positive")
         if self.backoff.max_seconds < self.backoff.initial_seconds:
@@ -296,6 +304,11 @@ def load_config(
         runner=RunnerConfig(
             command_template=_get_optional_str(source, "RUNNER_COMMAND_TEMPLATE"),
             timeout_seconds=_get_int(source, "RUNNER_TIMEOUT_SECONDS", DEFAULT_RUNNER_TIMEOUT_SECONDS),
+            max_lifetime_seconds=_get_int(
+                source,
+                "RUNNER_MAX_LIFETIME_SECONDS",
+                DEFAULT_RUNNER_MAX_LIFETIME_SECONDS,
+            ),
             work_dir=_get_str(source, "RUNNER_WORK_DIR", "/workspace/work"),
             artifacts_dir=_get_str(source, "RUNNER_ARTIFACTS_DIR", "/workspace/artifacts"),
             allowed_env=_get_csv_tuple(source, "RUNNER_ALLOWED_ENV"),

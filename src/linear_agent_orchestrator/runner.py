@@ -396,7 +396,7 @@ class ShellRunner:
         try:
             try:
                 if self.config.interactive and console is not None:
-                    outcome = self._wait_interactive(process, paths.result_path)
+                    outcome = self._wait_interactive(process, paths.result_path, activity_path=console.log_path)
                     if outcome == "timeout":
                         raise subprocess.TimeoutExpired(exec_command, self.config.timeout_seconds)
                     if outcome == "result":
@@ -497,16 +497,28 @@ class ShellRunner:
             if console is not None:
                 self._cleanup_console(console)
 
-    def _wait_interactive(self, process: subprocess.Popen, result_path: Path) -> str:
+    def _wait_interactive(
+        self,
+        process: subprocess.Popen,
+        result_path: Path,
+        activity_path: Path | None = None,
+    ) -> str:
         """Wait for an interactive run to finish.
 
         Returns "exited" when the TUI process ends and "timeout" when it does
-        not end within timeout_seconds. If ``interactive_autoclose`` is true,
-        also returns "result" when a parseable structured result appears, which
-        restores the legacy result-driven teardown behavior.
+        not. timeout_seconds is an idle timeout here: any mtime/size change of
+        ``activity_path`` (the run's console output log) pushes the deadline
+        back, so the session survives as long as the backend keeps producing
+        output or the operator keeps the conversation going. max_lifetime_seconds
+        caps the run regardless of activity. If ``interactive_autoclose`` is
+        true, also returns "result" when a parseable structured result appears,
+        which restores the legacy result-driven teardown behavior.
         """
 
-        deadline = time.monotonic() + self.config.timeout_seconds
+        now = time.monotonic()
+        hard_deadline = now + self.config.max_lifetime_seconds
+        idle_deadline = now + self.config.timeout_seconds
+        last_activity = self._activity_signature(activity_path)
         while True:
             if process.poll() is not None:
                 return "exited"
@@ -514,10 +526,27 @@ class ShellRunner:
                 structured, _error = load_structured_result(result_path)
                 if structured is not None:
                     return "result"
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            activity = self._activity_signature(activity_path)
+            if activity != last_activity:
+                last_activity = activity
+                idle_deadline = now + self.config.timeout_seconds
+            remaining = min(idle_deadline, hard_deadline) - now
             if remaining <= 0:
                 return "timeout"
             time.sleep(min(2.0, max(0.05, remaining)))
+
+    @staticmethod
+    def _activity_signature(path: Path | None) -> tuple[float, int] | None:
+        """Console-log identity (mtime, size) used to detect run activity."""
+
+        if path is None:
+            return None
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        return (stat_result.st_mtime, stat_result.st_size)
 
     def _prepare_console(self, issue: LinearIssue) -> _ConsoleContext:
         """Allocate per-run console paths keyed by a fresh, tmux-safe run id."""

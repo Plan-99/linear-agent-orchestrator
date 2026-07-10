@@ -305,8 +305,10 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
 
 - 완료 판정(기본): 에이전트가 `{result_path}`에 구조화 결과를 써도 세션을 닫지
   않습니다. operator가 TUI에서 exit하여 프로세스가 종료된 뒤 orchestrator가
-  `result.json`을 로드/검증합니다. `RUNNER_TIMEOUT_SECONDS`는 operator가 exit하지
-  않는 경우의 backstop으로 그대로 적용됩니다.
+  `result.json`을 로드/검증합니다. `RUNNER_TIMEOUT_SECONDS`는 대화형 모드에서
+  **idle timeout**으로 동작합니다 — 콘솔 출력 활동이 이어지는 동안 마감이 계속
+  연장되고, 활동 없이 해당 시간이 지나면 종료됩니다. 활동과 무관한 hard cap은
+  `RUNNER_MAX_LIFETIME_SECONDS`(기본 21600초 = 6시간)입니다.
 - 이전 자동 종료 동작이 필요하면 `AGENT_INTERACTIVE_AUTOCLOSE=true`를 설정하세요.
   이때는 유효한 구조화 결과가 감지되는 즉시 orchestrator가 TUI 세션을 정리합니다.
 - **Done 게이트는 불변입니다** — 대화 여부와 무관하게 유효한 validation 증거가 있는
