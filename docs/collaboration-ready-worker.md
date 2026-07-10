@@ -40,11 +40,25 @@ the boundary narrow:
 - drop Linux capabilities and enable `no-new-privileges`;
 - use dedicated, persistent agent credential homes instead of read-write mounts
   of the developer's live Codex or Claude homes;
-- keep Linear secrets out of the agent subprocess environment; and
+- keep Linear secrets out of the agent subprocess environment;
+- treat orchestrator runtime state — SQLite, artifacts, and the agent-console
+  logs under `.runtime` — as host-owned, non-issue-controlled paths, and keep
+  the tmux control socket container-private so the console never widens the
+  host/container boundary (see [agent-console.md](agent-console.md)); and
 - never derive a bind-mount source or other host path from issue content.
 
 Permission bypass is a container-scoped operating mode, not a safe default for
 running these backends directly on the host.
+
+The optional agent console defaults to `auto` (enabled inside a host tmux,
+headless otherwise) and, when enabled, gives read-only live observation for every
+backend; direct keyboard input is explicit capability metadata
+(`AGENT_CONSOLE_DIRECT_INPUT`, default false, false for the bundled one-shot
+omx/codex/claude adapters) and is never inferred from the backend name. The
+read-only default and this flag are an honest UI capability gate, not an
+authorization control against a trusted host operator who can already
+`docker exec`. Its lifecycle JSONL is secret-free by contract, but the raw
+`output.log` inherits agent-output sensitivity.
 
 ## Structured result contract
 
@@ -165,6 +179,11 @@ Complete all checks without performing a destructive live Linear mutation:
    combinations remain non-Done.
 6. Confirm the polling request includes the resolved assignee and excludes
    unassigned or differently assigned issues.
+7. Confirm the agent-console contract: emitted events validate against the v1
+   schema in [agent-console.md](agent-console.md); the console is off by default;
+   `supports_direct_input` is false for one-shot omx/codex/claude; the log root
+   resolves under the host `.runtime/logs/console` mount while the tmux socket
+   stays container-private; and no secret appears in `lifecycle.jsonl`.
 
 Do not paste raw `docker compose config` output into logs or reports: Compose can
 expand secrets from the local environment. Assert only the sanitized fields

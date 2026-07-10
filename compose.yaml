@@ -44,6 +44,15 @@ services:
       AGENT_PERMISSION_MODE: ${AGENT_PERMISSION_MODE:-acceptEdits}
       # Docker is the security boundary; agent CLIs bypass permissions inside.
       AGENT_BYPASS_PERMISSIONS: ${AGENT_BYPASS_PERMISSIONS:-true}
+      # Interactive agent console (tmux). Off by default; scripts/daemon.sh may
+      # auto-enable inside a host tmux. The tmux control socket stays container-
+      # private; only the per-run JSONL/output log root is bind-mounted.
+      # auto = scripts/daemon.sh enables the console when inside a host tmux and
+      # falls back to headless otherwise; set true/false to force.
+      AGENT_CONSOLE: ${AGENT_CONSOLE:-auto}
+      AGENT_CONSOLE_LOG_DIR: ${AGENT_CONSOLE_LOG_DIR:-/workspace/logs/console}
+      # Explicit direct-input capability; false unless an adapter reads a PTY.
+      AGENT_CONSOLE_DIRECT_INPUT: ${AGENT_CONSOLE_DIRECT_INPUT:-false}
       HOME: /home/agent
       CODEX_HOME: /home/agent/.codex
     volumes:
@@ -51,6 +60,11 @@ services:
       - ${LAO_RUNTIME_DIR:-./.runtime}/data:/workspace/data
       - ${LAO_RUNTIME_DIR:-./.runtime}/work:/workspace/work
       - ${LAO_RUNTIME_DIR:-./.runtime}/artifacts:/workspace/artifacts
+      # Host-readable agent-console dir (per-run lifecycle JSONL + output.log),
+      # mounted at AGENT_CONSOLE_LOG_DIR=/workspace/logs/console. This is the exact
+      # directory the host resolver watches. AGENT_CONSOLE_HOST_LOG_DIR overrides
+      # the host source. Container-private tmux socket/argv are NOT mounted.
+      - ${AGENT_CONSOLE_HOST_LOG_DIR:-${LAO_RUNTIME_DIR:-./.runtime}/logs/console}:/workspace/logs/console
       # Dedicated persistent agent home with credential copies; never the live
       # host CLI homes. Seeded by scripts/bootstrap.sh.
       - ${LAO_RUNTIME_DIR:-./.runtime}/agent-home:/home/agent
@@ -76,6 +90,9 @@ services:
       LOG_LEVEL: INFO
       LOG_FORMAT: json
       STATE_DB_PATH: /tmp/lao-tests/state.sqlite3
+      AGENT_CONSOLE: "false"
+      AGENT_CONSOLE_LOG_DIR: /tmp/lao-tests/logs/console
+      AGENT_CONSOLE_DIRECT_INPUT: "false"
       LINEAR_API_KEY: ""
       LINEAR_TEAM_ID: ""
       LINEAR_ASSIGNEE_ID: ""

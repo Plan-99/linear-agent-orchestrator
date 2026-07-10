@@ -219,6 +219,26 @@ validation exit code, backend timeout/실패는 모두 Done 전환을 막습니�
 ./scripts/compose.sh run --rm orchestrator process-once --json
 ```
 
+## 대화형 agent 콘솔 (tmux)
+
+기본값은 **`auto`**입니다(host tmux 안이면 활성화, 아니면 headless). `true`/`false`로
+강제할 수 있습니다. 활성화되면 각 agent 실행이 컨테이너 안에서 tmux 세션으로 열리고,
+운영자는 host에서 read-only로 실시간 관찰할 수 있습니다.
+
+- 모든 backend는 **live 관찰**(read-only attach)이 가능합니다.
+- **직접 입력(타이핑)은 명시적 설정 metadata**(`AGENT_CONSOLE_DIRECT_INPUT`, 기본
+  false)로만 결정되며 backend 이름으로 추론하지 않습니다. 현재 one-shot
+  `omx`/`codex`/`claude`는 prompt를 stdin으로 한 번만 받으므로 기본 false지만, PTY를
+  실제로 읽는 interactive/custom harness는 어떤 backend든 opt-in(true)할 수 있습니다.
+- 실행별 lifecycle JSONL과 output 로그는 `AGENT_CONSOLE_LOG_DIR`
+  (기본 `/workspace/logs/console`)에 기록되며, Compose가 이를 `.runtime/logs/console`
+  에 bind-mount하여 host 소유로 durable하게 남깁니다.
+- tmux 제어 socket은 컨테이너-private이며 bind-mount되지 않습니다. host는 자신의
+  `docker exec`로만 접근합니다(컨테이너는 host tmux/Docker socket을 보지 않음).
+
+이벤트 스키마 계약과 host/container tmux 보안 리뷰는
+[docs/agent-console.md](docs/agent-console.md)를 참고하세요.
+
 ## 운영 제한
 
 - 한 daemon은 한 저장소에서 이슈를 직렬 처리합니다.
