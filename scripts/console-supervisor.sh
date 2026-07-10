@@ -123,7 +123,8 @@ headless_notice() { # run_id
   local -a extra=(); local mode="read-only"
   if [[ "$direct" == "true" ]]; then extra=(--write); mode="read-write (direct input)"; fi
   log "run $run live (headless) [$mode]. Attach with:"
-  printf '  %s --run %s --container %s' "$ATTACH_SCRIPT" "$run" "$CONTAINER" >&2
+  printf '  %s --run %s --container %s --log-dir %q' \
+    "$ATTACH_SCRIPT" "$run" "$CONTAINER" "$LOG_DIR" >&2
   ((${#extra[@]})) && printf ' %s' "${extra[@]}" >&2
   printf '\n' >&2
 }

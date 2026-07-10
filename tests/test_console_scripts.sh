@@ -29,6 +29,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 CD="$TMP/console"; mkdir -p "$CD/$R1" "$CD/$R2" "$CD/$R3" "$CD/$R4"
 cat > "$CD/$R1/lifecycle.jsonl" <<EOF
 {"backend":"omx","backend_pid":1234,"event":"session_started","issue_id":"i-1","issue_identifier":"DEV-1","log_path":"x","run_id":"$R1","session":"lao-$R1","socket":"/tmp/lao-console/$R1/tmux.sock","supports_direct_input":false,"ts":"2026-07-10T12:50:00+00:00"}
+{"backend":"forged","event":"session_started","run_id":"$R1","supports_direct_input":true,"ts":"2026-07-10T12:50:01+00:00"}
 EOF
 cat > "$CD/$R2/lifecycle.jsonl" <<EOF
 {"backend":"custom","backend_pid":2222,"event":"session_started","issue_id":"i-2","issue_identifier":"DEV-2","log_path":"x","run_id":"$R2","session":"lao-$R2","socket":"/tmp/lao-console/$R2/tmux.sock","supports_direct_input":true,"ts":"2026-07-10T12:51:00+00:00"}
@@ -63,12 +64,21 @@ _ev="$TMP/dotenv"; printf 'FOO=1\nAGENT_CONSOLE="auto"\n' > "$_ev"
 check "read_env_value quoted" "auto" "$(read_env_value AGENT_CONSOLE "$_ev")"
 printf 'AGENT_CONSOLE=false\n' > "$_ev"
 check "read_env_value plain" "false" "$(read_env_value AGENT_CONSOLE "$_ev")"
-( unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; source "$LIB"
-  check "hostlog default" "/repo/.runtime/logs/console" "$(resolve_host_console_log_dir /repo)" )
-( export LAO_RUNTIME_DIR=/data/rt; source "$LIB"
-  check "hostlog runtime-abs" "/data/rt/logs/console" "$(resolve_host_console_log_dir /repo)" )
-( export LAO_RUNTIME_DIR=rel; source "$LIB"
-  check "hostlog runtime-rel" "/repo/rel/logs/console" "$(resolve_host_console_log_dir /repo)" )
+check "hostlog default" "/repo/.runtime/logs/console" \
+  "$(unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; resolve_host_console_log_dir /repo)"
+check "hostlog runtime-abs" "/data/rt/logs/console" \
+  "$(unset AGENT_CONSOLE_HOST_LOG_DIR; export LAO_RUNTIME_DIR=/data/rt; resolve_host_console_log_dir /repo)"
+check "hostlog runtime-rel" "/repo/rel/logs/console" \
+  "$(unset AGENT_CONSOLE_HOST_LOG_DIR; export LAO_RUNTIME_DIR=rel; resolve_host_console_log_dir /repo)"
+ENV_REPO="$TMP/env-repo"; mkdir -p "$ENV_REPO"
+printf 'LAO_RUNTIME_DIR=.state\n' > "$ENV_REPO/.env"
+check "hostlog dotenv runtime" "$ENV_REPO/.state/logs/console" \
+  "$(unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; resolve_host_console_log_dir "$ENV_REPO")"
+printf 'LAO_RUNTIME_DIR=.state\nAGENT_CONSOLE_HOST_LOG_DIR=operator-logs\n' > "$ENV_REPO/.env"
+check "hostlog dotenv explicit" "$ENV_REPO/operator-logs" \
+  "$(unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; resolve_host_console_log_dir "$ENV_REPO")"
+check "hostlog process override wins" "/process/wins" \
+  "$(export AGENT_CONSOLE_HOST_LOG_DIR=/process/wins LAO_RUNTIME_DIR=/ignored; resolve_host_console_log_dir "$ENV_REPO")"
 _exists() { case "$1" in lao-daemon|lao-daemon-2) return 0;; *) return 1;; esac; }
 check "next_free_container_name" "lao-daemon-3" "$(next_free_container_name lao-daemon _exists)"
 
@@ -82,6 +92,10 @@ for fm in jq py; do
   check "torn-line: direct=true survives ($fm)" "true" "$di"
   bk="$(CONSOLE_FORCE_NO_JQ="$force" jsonl_field "$CD/$R2/lifecycle.jsonl" session_started backend)"
   check "torn-line: backend survives ($fm)" "custom" "$bk"
+  di="$(CONSOLE_FORCE_NO_JQ="$force" jsonl_field "$CD/$R1/lifecycle.jsonl" session_started supports_direct_input)"
+  check "first-start capability is immutable ($fm)" "false" "$di"
+  bk="$(CONSOLE_FORCE_NO_JQ="$force" jsonl_field "$CD/$R1/lifecycle.jsonl" session_started backend)"
+  check "first-start backend is immutable ($fm)" "omx" "$bk"
   ts="$(CONSOLE_FORCE_NO_JQ="$force" jsonl_terminal_state "$CD/$R3/lifecycle.jsonl")"
   check "terminal_state ended ($fm)" "ended:0" "$ts"
   ts="$(CONSOLE_FORCE_NO_JQ="$force" jsonl_terminal_state "$CD/$R4/lifecycle.jsonl")"
@@ -143,6 +157,7 @@ rm -rf "$CD/NOTHEX"
 out="$("$SUP" --once --headless --log-dir "$CD" 2>&1)"
 check "supervisor headless R1 read-only" "run $R1 live (headless) [read-only]" "$out"
 check "supervisor headless R2 read-write" "run $R2 live (headless) [read-write (direct input)]" "$out"
+check "supervisor headless hint keeps custom log dir" "--log-dir $CD" "$out"
 
 # Anti-spoof: R5's issue text embeds a fake session_ended; must stay LIVE.
 out="$("$ATTACH" --run "$R5" --log-dir "$CD" --print-cmd 2>&1)"

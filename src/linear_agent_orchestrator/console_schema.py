@@ -1,12 +1,12 @@
 """Agent console lifecycle v1 — JSONL event contract and path layout.
 
 This module is the *integration contract* for the interactive agent-console
-feature. The core emitter (worker-1) writes one JSON object per line to a
+feature. The core emitter writes one JSON object per line to a
 per-run ``lifecycle.jsonl``; a host supervisor consumes it to attach to, and
 reap, live agent tmux sessions.
 
 It has no dependency on ``runner``/``daemon`` so both the emitter and any
-consumer can import it without an import cycle. Contract owner: worker-4.
+consumer can import it without an import cycle.
 
 Trust/secret rules (see ``docs/agent-console.md`` for the full security review):
 - ``lifecycle.jsonl`` and ``output.log`` are bind-mounted host-readable; they
@@ -49,7 +49,7 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 class ConsoleEvent:
     """Canonical console lifecycle ``event`` names."""
 
-    # Emitted by the core runner (worker-1).
+    # Emitted by the core runner.
     SESSION_STARTED = "session_started"
     SESSION_ENDED = "session_ended"
     SESSION_KILLED = "session_killed"
@@ -68,8 +68,8 @@ SUPERVISOR_EVENTS = frozenset(
 EVENT_TYPES = EMITTER_EVENTS | SUPERVISOR_EVENTS
 
 # reason values for session_killed. ``timeout`` = run exceeded its deadline;
-# ``teardown`` = daemon shutdown/graceful reap; ``start_failed`` = the session or
-# backend process failed to start. These are the terminal kill semantics.
+# ``start_failed`` = the session/backend failed to start; ``teardown`` is
+# reserved for an explicit future graceful reaper.
 KILL_REASONS = frozenset({"timeout", "teardown", "start_failed"})
 
 # Direct-input capability is EXPLICIT adapter/config metadata, never inferred
@@ -82,7 +82,7 @@ KILL_REASONS = frozenset({"timeout", "teardown", "start_failed"})
 # it is carried as a plain boolean on session_started.
 
 
-# Required fields per emitter event (v1 frozen contract for worker-1).
+# Required fields per emitter event (v1 frozen contract).
 # ``backend`` (descriptive string) and ``supports_direct_input`` (explicit bool
 # metadata) are carried on session_started so consumers can render observe-only
 # vs. type-capable sessions without probing.
@@ -106,7 +106,13 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 
 _SENSITIVE_NAME_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|API_KEY)", re.IGNORECASE)
 _SENSITIVE_ASSIGN_RE = re.compile(
-    r"(?i)([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*\s*[=:]\s*)([^\s`'\";]+)"
+    r"""(?ix)
+    (?P<prefix>
+        ["']?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*["']?
+        \s*[=:]\s*
+    )
+    (?P<value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s`'";,}\]]+)
+    """
 )
 
 
@@ -257,7 +263,7 @@ def redact_text(value: str, *, environ: Mapping[str, str] | None = None) -> str:
     for key, secret in source.items():
         if secret and _SENSITIVE_NAME_RE.search(key):
             redacted = redacted.replace(secret, "[REDACTED]")
-    return _SENSITIVE_ASSIGN_RE.sub(r"\1[REDACTED]", redacted)
+    return _SENSITIVE_ASSIGN_RE.sub(r"\g<prefix>[REDACTED]", redacted)
 
 
 def redact_event(

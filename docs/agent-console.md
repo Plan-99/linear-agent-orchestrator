@@ -6,10 +6,6 @@ session, while a host supervisor consumes an append-only lifecycle JSONL to
 attach to and reap sessions. This document is the authoritative **v1 contract**
 and the security review of the host/container boundary.
 
-- Contract owner (schema/config/docs/review): worker-4.
-- Emitter (writes `session_started/ended/killed`): core / worker-1.
-- Host supervisor (consumes JSONL; may add supervisor events): host lane.
-
 Canonical constants/helpers/validator: `src/linear_agent_orchestrator/console_schema.py`.
 
 ## Feature gate & configuration (backend-neutral)
@@ -18,23 +14,22 @@ Canonical constants/helpers/validator: `src/linear_agent_orchestrator/console_sc
 | --- | --- | --- |
 | `AGENT_CONSOLE` | `auto` | Master gate. `auto` = enable inside a host tmux, headless otherwise; `true`/`false` force. |
 | `AGENT_CONSOLE_LOG_DIR` | `/workspace/logs/console` | Container path for the host-readable per-run JSONL + output logs. |
+| `AGENT_CONSOLE_SOCKET_DIR` | `/tmp/lao-console` | Container-private per-run tmux socket/argv root. Never bind-mounted. |
 | `AGENT_CONSOLE_DIRECT_INPUT` | `false` | Explicit capability metadata: may the console send keystrokes to the agent? Never inferred from the backend name. |
 | `AGENT_CONSOLE_HOST_LOG_DIR` | `${LAO_RUNTIME_DIR}/logs/console` | The **host console directory itself**, bind-mounted at `/workspace/logs/console`; override for host scripts. |
 
 - Default is **`auto`**: `scripts/daemon.sh` enables the console when it runs
   inside a host tmux and falls back to the normal headless path otherwise;
-  `true`/`false` force the choice. (Host-script behavior is owned by the host
-  lane; this doc states the contract the config surface exposes.)
+  `true`/`false` force the choice.
 - Compose bind-mounts the host console directory
   `${AGENT_CONSOLE_HOST_LOG_DIR:-${LAO_RUNTIME_DIR:-./.runtime}/logs/console}`
   at `/workspace/logs/console` — the exact directory the host resolver watches.
   It is durable and host-owned under the checkout's `.runtime/logs/console`.
   `scripts/bootstrap.sh` creates `.runtime/logs`.
 
-The config surface that parses these env vars into the runner is owned by the
-core lane (worker-1/worker-2); this contract module provides the env parsers
-(`console_enabled`, `direct_input_enabled`, `resolve_console_log_dir`) and the
-event/path helpers, but does not itself add fields to `AppConfig`.
+The contract module provides env parsers (`console_enabled`,
+`direct_input_enabled`, `resolve_console_log_dir`) plus event/path helpers;
+`config.py` maps the runtime values into `RunnerConfig`.
 
 ## Path layout
 
@@ -61,8 +56,10 @@ The tmux session is named `lao-<run_id>`. Because `run_id` is strictly
 - One JSON object per line, `O_APPEND`, newline-terminated.
 - Consumers must **tolerate a torn final line** (a crash mid-write): parse
   line-by-line and skip a trailing partial line rather than failing the stream.
-- Ordering guarantee: `session_started` precedes exactly one of
-  `session_ended` | `session_killed` for a given `run_id`.
+- For cleanly observed runs, `session_started` precedes exactly one of
+  `session_ended` | `session_killed` for a given `run_id`. Abrupt container/PID 1
+  loss can leave only `session_started`; the host supervisor verifies the
+  private tmux session and treats such persisted records as orphans.
 
 ### Emitter events (frozen v1)
 
@@ -81,10 +78,11 @@ The tmux session is named `lao-<run_id>`. Because `run_id` is strictly
 {"event":"session_killed","run_id":"<hex>","reason":"timeout","ts":"<iso8601>"}
 ```
 
-Terminal kill semantics: `timeout` = the run exceeded its deadline; `teardown` =
-daemon shutdown / graceful reap; `start_failed` = the tmux session or backend
-process failed to start. A `session_killed` is terminal and mutually exclusive
-with `session_ended` for the same `run_id`.
+Terminal kill semantics: `timeout` = the run exceeded its deadline;
+`start_failed` = the tmux session or backend process failed to start;
+`teardown` is reserved for a future explicit graceful reaper. A
+`session_killed` is terminal and mutually exclusive with `session_ended` for
+the same cleanly observed run.
 
 Each record also carries `schema_version` (currently `1`). Keys serialize
 sorted for stable diffs.
@@ -174,8 +172,15 @@ socket.** No new host→container privilege is granted by this feature.
   runtime state under `.runtime`, never an issue-controlled path, consistent
   with the SQLite/artifacts trust boundary in
   [collaboration-ready-worker.md](collaboration-ready-worker.md).
+- **Lifecycle metadata is not an authorization/audit boundary.** The YOLO
+  backend runs as the same container UID and can rewrite its bind-mounted
+  `lifecycle.jsonl` or `output.log`. Consumers freeze identity/capability from
+  the first parsed `session_started` and verify live sessions through the
+  container-private socket, but these files remain operational UI hints—not
+  tamper-proof evidence against the agent itself. Strong isolation would
+  require a separate backend UID/process boundary or an authenticated emitter.
 
-## Emitter integration sketch (for worker-1)
+## Emitter integration sketch
 
 ```python
 from .console_schema import (

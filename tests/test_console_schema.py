@@ -19,6 +19,7 @@ from linear_agent_orchestrator.console_schema import (
     output_log_path,
     private_run_dir,
     redact_event,
+    redact_text,
     resolve_console_log_dir,
     serialize_event,
     session_name,
@@ -152,6 +153,14 @@ def test_redact_event_scrubs_secret_in_string_values():
     redacted = redact_event(event, environ={"LINEAR_API_KEY": "lin_api_secret"})
     assert "lin_api_secret" not in json.dumps(redacted)
     assert redacted["backend"] == "omx"  # non-secret fields preserved
+
+
+def test_redact_text_scrubs_assignments_not_present_in_environment():
+    text = 'API_KEY=alpha ACCESS_TOKEN: beta {"refresh_token":"gamma"} PASSWORD="secret phrase"'
+    redacted = redact_text(text, environ={})
+    for secret in ("alpha", "beta", "gamma", "secret phrase"):
+        assert secret not in redacted
+    assert redacted.count("[REDACTED]") == 4
 
 
 def test_console_enabled_gate_defaults_off():

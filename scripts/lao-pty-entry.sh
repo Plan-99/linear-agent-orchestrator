@@ -19,12 +19,14 @@ fi
 
 # Orchestrator-generated paths only (log destination); never issue content.
 log_path=""
+direct_input="false"
 # shellcheck disable=SC1090
 if [[ -f "$run_dir/config" ]]; then
-  # config contains only LAO_PTY_LOG=<abs path> lines written by the pty host.
+  # config contains only orchestrator-generated log/capability values.
   while IFS='=' read -r key value; do
     case "$key" in
       LAO_PTY_LOG) log_path="$value" ;;
+      LAO_PTY_DIRECT_INPUT) [[ "$value" == "true" ]] && direct_input="true" ;;
     esac
   done <"$run_dir/config"
 fi
@@ -47,11 +49,16 @@ fi
 # Run the backend as a child so this script can record the real backend PID and
 # its exit status. Output is teed to the persistent log (host-readable, for
 # failure comments) while still reaching the pane pty for live observation.
+# stdin is connected to the PTY only for an explicit direct-input capability;
+# otherwise it is /dev/null, matching the read-only UI contract and preventing
+# accidental stdin readers from hanging until the runner timeout.
+stdin_path="/dev/null"
+[[ "$direct_input" == "true" ]] && stdin_path="/dev/tty"
 if [[ -n "$log_path" ]]; then
   mkdir -p -- "$(dirname -- "$log_path")" 2>/dev/null || true
-  "${argv[@]}" > >(tee -a -- "$log_path") 2>&1 &
+  "${argv[@]}" <"$stdin_path" > >(tee -a -- "$log_path") 2>&1 &
 else
-  "${argv[@]}" &
+  "${argv[@]}" <"$stdin_path" &
 fi
 backend_pid=$!
 printf '%s' "$backend_pid" >"$run_dir/backend_pid"

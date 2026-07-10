@@ -225,6 +225,25 @@ validation exit code, backend timeout/실패는 모두 Done 전환을 막습니�
 강제할 수 있습니다. 활성화되면 각 agent 실행이 컨테이너 안에서 tmux 세션으로 열리고,
 운영자는 host에서 read-only로 실시간 관찰할 수 있습니다.
 
+`./scripts/daemon.sh`를 host tmux pane에서 실행하면 새 이슈를 claim할 때마다 같은 tmux
+window에 `lao:<run_id>` sibling pane이 자동으로 열립니다. 실행이 끝나면 attach pane도
+종료되고, daemon은 기존 pane에서 계속 polling합니다.
+
+```bash
+# daemon과 sibling console pane 자동 실행
+./scripts/daemon.sh
+
+# live/종료 run 조회 또는 수동 attach
+./scripts/console-attach.sh --list
+./scripts/console-attach.sh --run <32-char-run-id>          # read-only
+./scripts/console-attach.sh --run <32-char-run-id> --write  # capability=true만 허용
+```
+
+tmux 밖에서 `auto`는 기존 headless 실행으로 돌아갑니다. `AGENT_CONSOLE=true`로 강제하면
+pane 대신 `.runtime/logs/console/supervisor.log`에 수동 attach 명령을 남깁니다.
+`.env`의 `LAO_RUNTIME_DIR`/`AGENT_CONSOLE_HOST_LOG_DIR`도 host supervisor와 Compose
+bind mount에 동일하게 적용됩니다.
+
 - 모든 backend는 **live 관찰**(read-only attach)이 가능합니다.
 - **직접 입력(타이핑)은 명시적 설정 metadata**(`AGENT_CONSOLE_DIRECT_INPUT`, 기본
   false)로만 결정되며 backend 이름으로 추론하지 않습니다. 현재 one-shot

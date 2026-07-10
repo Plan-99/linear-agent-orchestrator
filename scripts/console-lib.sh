@@ -33,18 +33,30 @@ read_env_value() {
   printf '%s\n' "$val"
 }
 
-# resolve_host_console_log_dir <repo_root> -> host filesystem path
+# resolve_host_console_log_dir <repo_root> [dotenv_file] -> host filesystem path
 # IMPORTANT: this is the HOST path the bind mount lands on, NOT the in-container
 # AGENT_CONSOLE_LOG_DIR (=/workspace/logs/console). Resolution order:
-#   1. AGENT_CONSOLE_HOST_LOG_DIR (explicit host override)
-#   2. <LAO_RUNTIME_DIR>/logs/console  (LAO_RUNTIME_DIR relative -> repo_root)
-#   3. <repo_root>/.runtime/logs/console
+#   1. process AGENT_CONSOLE_HOST_LOG_DIR (explicit host override)
+#   2. dotenv AGENT_CONSOLE_HOST_LOG_DIR
+#   3. process/dotenv <LAO_RUNTIME_DIR>/logs/console (relative -> repo_root)
+#   4. <repo_root>/.runtime/logs/console
+# Compose reads project .env automatically, while these host scripts do not.
+# Reading the same keys safely here keeps the watched host path identical to the
+# bind mount even when operators configure paths only in .env.
 resolve_host_console_log_dir() {
-  local repo_root="${1:-}"
-  if [[ -n "${AGENT_CONSOLE_HOST_LOG_DIR:-}" ]]; then
-    printf '%s\n' "$AGENT_CONSOLE_HOST_LOG_DIR"; return
-  fi
+  local repo_root="${1:-}" env_file="${2:-${1:-}/.env}"
+  local host_override="${AGENT_CONSOLE_HOST_LOG_DIR:-}"
   local runtime="${LAO_RUNTIME_DIR:-}"
+  if [[ -z "$host_override" ]]; then
+    host_override="$(read_env_value AGENT_CONSOLE_HOST_LOG_DIR "$env_file" 2>/dev/null || true)"
+  fi
+  if [[ -n "$host_override" ]]; then
+    case "$host_override" in /*) : ;; *) host_override="$repo_root/$host_override" ;; esac
+    printf '%s\n' "$host_override"; return
+  fi
+  if [[ -z "$runtime" ]]; then
+    runtime="$(read_env_value LAO_RUNTIME_DIR "$env_file" 2>/dev/null || true)"
+  fi
   if [[ -n "$runtime" ]]; then
     case "$runtime" in /*) : ;; *) runtime="$repo_root/$runtime" ;; esac
     printf '%s\n' "$runtime/logs/console"; return
@@ -57,35 +69,40 @@ default_container_name() {
   printf '%s\n' "${AGENT_CONSOLE_CONTAINER:-${LAO_DAEMON_CONTAINER_NAME:-lao-daemon}}"
 }
 
-# jsonl_field <file> <event> <field> -> last matching value (structured).
+# jsonl_field <file> <event> <field> -> first matching value (structured).
 # Parses each line as JSON and selects objects whose .event == <event>, then
-# returns the requested field of the LAST such object. Never executes JSONL
-# content and never substring-matches (issue text cannot spoof the event type).
+# returns the requested field of the FIRST such object. Identity/capability
+# metadata is immutable after the orchestrator's initial session_started; later
+# appended records cannot elevate direct-input. Never executes JSONL content or
+# substring-matches (issue text cannot spoof the event type).
 jsonl_field() {
   local file="$1" event="$2" field="$3"
   [[ -r "$file" ]] || return 1
   if [[ -z "${CONSOLE_FORCE_NO_JQ:-}" ]] && command -v jq >/dev/null 2>&1; then
     # Raw line-by-line: `fromjson?` skips a torn/partial final line instead of
     # failing the whole file (slurp mode `-s` would). `has()` (not `//`)
-    # preserves legitimate false/0 field values. tail -n1 = last match.
+    # preserves legitimate false/0 field values. sed prints the first match but
+    # still drains jq's output, avoiding SIGPIPE under this file's pipefail mode.
     jq -Rr --arg ev "$event" --arg f "$field" '
       fromjson? | select(type=="object" and .event==$ev)
       | if has($f) then .[$f] else empty end | tostring
-    ' "$file" 2>/dev/null | tail -n1
+    ' "$file" 2>/dev/null | sed -n '1p'
   else
     python3 - "$file" "$event" "$field" <<'PY' 2>/dev/null
 import json,sys
 path,ev,field=sys.argv[1],sys.argv[2],sys.argv[3]
 val=None
+found=False
 with open(path,encoding="utf-8",errors="replace") as fh:
     for line in fh:
         line=line.strip()
         if not line: continue
         try: obj=json.loads(line)
         except Exception: continue
-        if isinstance(obj,dict) and obj.get("event")==ev and field in obj:
+        if not found and isinstance(obj,dict) and obj.get("event")==ev and field in obj:
             val=obj[field]
-if val is None: sys.exit(1)
+            found=True
+if not found: sys.exit(1)
 print(val if not isinstance(val,bool) else ("true" if val else "false"))
 PY
   fi

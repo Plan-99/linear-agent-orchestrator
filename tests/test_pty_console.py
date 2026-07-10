@@ -11,7 +11,10 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
+import time
+import uuid
 
 import pytest
 
@@ -229,6 +232,133 @@ def test_console_direct_input_capability_is_emitted(tmp_path, monkeypatch):
     ShellRunner(config).run(make_issue())
     events = _read_events(config, tmp_path)
     assert events[0]["supports_direct_input"] is True
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
+def test_private_tmux_session_delivers_direct_input_to_backend(tmp_path):
+    """A capability-enabled backend can read bytes typed into its private PTY."""
+
+    run_id = uuid.uuid4().hex
+    # Unix-domain socket paths are typically capped at ~108 bytes; pytest's
+    # descriptive tmp path can exceed that before the run id is appended.
+    private_root = Path(tempfile.mkdtemp(prefix="lc"))
+    run_dir = private_root / run_id
+    socket = run_dir / "tmux.sock"
+    session = f"lao-{run_id}"
+    log_path = tmp_path / "logs" / run_id / "output.log"
+    jsonl_path = log_path.parent / "lifecycle.jsonl"
+    backend = _fake_backend(
+        tmp_path,
+        "interactive.sh",
+        'echo READY\nIFS= read -r reply\nprintf "REPLY:%s\\n" "$reply"\n',
+    )
+    env = dict(os.environ, LAO_PTY_ENTRY=str(PTY_ENTRY))
+    proc = subprocess.Popen(
+        [
+            str(PTY_HOST),
+            "--run-id", run_id,
+            "--run-dir", str(run_dir),
+            "--socket", str(socket),
+            "--session", session,
+            "--log", str(log_path),
+            "--jsonl", str(jsonl_path),
+            "--backend", "custom",
+            "--supports-direct-input", "true",
+            "--issue-id", "issue-direct",
+            "--issue-identifier", "DEV-DIRECT",
+            "--", str(backend),
+        ],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if jsonl_path.exists() and "session_started" in jsonl_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("private tmux session did not publish session_started")
+
+        sent = subprocess.run(
+            ["tmux", "-S", str(socket), "send-keys", "-t", session, "--", "hello from operator", "Enter"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        assert sent.returncode == 0, sent.stderr
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 0, stderr
+        assert "REPLY:hello from operator" in log_path.read_text(encoding="utf-8")
+        assert "REPLY:hello from operator" in stdout
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        subprocess.run(
+            ["tmux", "-S", str(socket), "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        shutil.rmtree(private_root, ignore_errors=True)
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
+def test_private_tmux_without_capability_provides_stdin_eof(tmp_path):
+    """Observe-only runs cannot hang by accidentally reading the pane PTY."""
+
+    run_id = uuid.uuid4().hex
+    private_root = Path(tempfile.mkdtemp(prefix="lc"))
+    run_dir = private_root / run_id
+    socket = run_dir / "tmux.sock"
+    log_path = tmp_path / "logs" / run_id / "output.log"
+    jsonl_path = log_path.parent / "lifecycle.jsonl"
+    backend = _fake_backend(
+        tmp_path,
+        "observe-only.sh",
+        'if IFS= read -r reply; then echo "UNEXPECTED:$reply"; else echo EOF; fi\n',
+    )
+    proc = subprocess.Popen(
+        [
+            str(PTY_HOST),
+            "--run-id", run_id,
+            "--run-dir", str(run_dir),
+            "--socket", str(socket),
+            "--session", f"lao-{run_id}",
+            "--log", str(log_path),
+            "--jsonl", str(jsonl_path),
+            "--backend", "custom",
+            "--supports-direct-input", "false",
+            "--issue-id", "issue-observe",
+            "--issue-identifier", "DEV-OBSERVE",
+            "--", str(backend),
+        ],
+        env=dict(os.environ, LAO_PTY_ENTRY=str(PTY_ENTRY)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 0, stderr
+        assert "EOF" in stdout
+        assert "UNEXPECTED:" not in stdout
+        events = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+        assert events[0]["supports_direct_input"] is False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        subprocess.run(
+            ["tmux", "-S", str(socket), "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        shutil.rmtree(private_root, ignore_errors=True)
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")

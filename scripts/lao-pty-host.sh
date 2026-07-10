@@ -52,6 +52,10 @@ backend_argv=("$@")
 if [[ -z "$run_dir" || -z "$socket" || -z "$session" || -z "$log_path" || -z "$jsonl_path" || ${#backend_argv[@]} -eq 0 ]]; then
   usage
 fi
+case "${supports_direct_input,,}" in
+  1|true|yes|on) supports_direct_input="true" ;;
+  *) supports_direct_input="false" ;;
+esac
 
 mkdir -p -- "$run_dir" "$(dirname -- "$socket")" "$(dirname -- "$log_path")" "$(dirname -- "$jsonl_path")"
 chmod 700 -- "$run_dir" "$(dirname -- "$socket")" 2>/dev/null || true
@@ -95,9 +99,17 @@ if ! command -v tmux >/dev/null 2>&1; then
   set +e
   if [[ -n "$log_path" ]]; then
     mkdir -p -- "$(dirname -- "$log_path")" 2>/dev/null || true
-    "${backend_argv[@]}" > >(tee -a -- "$log_path") 2>&1
+    if [[ "$supports_direct_input" == "true" ]]; then
+      "${backend_argv[@]}" > >(tee -a -- "$log_path") 2>&1
+    else
+      "${backend_argv[@]}" </dev/null > >(tee -a -- "$log_path") 2>&1
+    fi
   else
-    "${backend_argv[@]}"
+    if [[ "$supports_direct_input" == "true" ]]; then
+      "${backend_argv[@]}"
+    else
+      "${backend_argv[@]}" </dev/null
+    fi
   fi
   code=$?
   set -e 2>/dev/null || true
@@ -112,7 +124,8 @@ fi
 
 # Write the fixed entry's config (orchestrator-generated log path only) and the
 # NUL-delimited backend argv. No issue text is ever interpreted by a shell.
-printf 'LAO_PTY_LOG=%s\n' "$log_path" >"$run_dir/config"
+printf 'LAO_PTY_LOG=%s\nLAO_PTY_DIRECT_INPUT=%s\n' \
+  "$log_path" "$supports_direct_input" >"$run_dir/config"
 printf '%s\0' "${backend_argv[@]}" >"$run_dir/argv"
 : >"$log_path"
 rm -f -- "$run_dir/backend_pid" "$run_dir/exit_code"

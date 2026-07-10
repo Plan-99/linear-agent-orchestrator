@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 AGENT_HOME=.runtime/agent-home
 
-mkdir -p .runtime/data .runtime/work .runtime/artifacts .runtime/logs \
+mkdir -p .runtime/data .runtime/work .runtime/artifacts .runtime/logs/console \
   "$AGENT_HOME/.codex" "$AGENT_HOME/.claude"
 touch .runtime/data/.gitkeep .runtime/work/.gitkeep .runtime/artifacts/.gitkeep .runtime/logs/.gitkeep
 

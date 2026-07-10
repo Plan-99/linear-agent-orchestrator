@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
 from .config import AppConfig, LinearConfig, RunnerConfig, validate_project_workspace
-from .console_schema import CONSOLE_SCHEMA_VERSION
+from .console_schema import CONSOLE_SCHEMA_VERSION, redact_text
 from .issue_schema import clarification_comment, validate_issue_body
 from .linear_client import LinearComment, LinearIssue, WorkflowRole, WorkflowState
 from .state import StateStore
@@ -1839,8 +1839,8 @@ def _result_body(title: str, result: RunnerResult) -> str:
         f"Artifacts: `{result.paths.artifacts_dir}`",
         f"Structured result: `{result.paths.result_path}`",
     ]
-    stdout = _truncate(redact_sensitive_text(result.stdout.strip()))
-    stderr = _truncate(redact_sensitive_text(result.stderr.strip()))
+    stdout = _truncate_tail(redact_sensitive_text(result.stdout.strip()))
+    stderr = _truncate_tail(redact_sensitive_text(result.stderr.strip()))
     if stdout:
         lines.extend(["", "Stdout:", "```", stdout, "```"])
     if stderr:
@@ -1887,19 +1887,9 @@ def _sanitize_error_message(message: str, limit: int = 500) -> str:
 
 
 def redact_sensitive_text(value: str) -> str:
-    if not value:
-        return value
-    redacted = value
-    sensitive_names = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|API_KEY)", re.IGNORECASE)
-    for key, secret in os.environ.items():
-        if sensitive_names.search(key) and secret:
-            redacted = redacted.replace(secret, "[REDACTED]")
-    redacted = re.sub(
-        r"(?i)([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*\\s*[=:]\\s*)([^\\s`'\";]+)",
-        r"\1[REDACTED]",
-        redacted,
-    )
-    return redacted
+    """Use the console contract's tested redactor for every Linear message."""
+
+    return redact_text(value)
 
 
 def _failure_summary(result: RunnerResult) -> str:
@@ -1927,6 +1917,14 @@ def _truncate(value: str, limit: int = 4000) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "\n... <truncated>"
+
+
+def _truncate_tail(value: str, limit: int = 4000) -> str:
+    """Keep the failure-side tail, where command errors normally appear."""
+
+    if len(value) <= limit:
+        return value
+    return "... <truncated; showing tail>\n" + value[-limit:]
 
 
 def sanitize_path_part(value: str) -> str:

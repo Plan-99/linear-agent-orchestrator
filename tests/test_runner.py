@@ -18,10 +18,12 @@ from linear_agent_orchestrator.runner import (
     StructuredResult,
     ValidationEvidence,
     _runner_result_to_state,
+    _truncate_tail,
     execution_key,
     load_structured_result,
     process_issue_once,
     process_next_issue_once,
+    redact_sensitive_text,
     render_command_template,
     render_context,
 )
@@ -303,6 +305,22 @@ def test_result_comment_redacts_secret_like_env_values(tmp_path, monkeypatch):
     assert result_comments
     assert secret_value not in result_comments[0]
     assert "[REDACTED]" in result_comments[0]
+
+
+def test_redaction_catches_non_environment_secret_assignments():
+    text = 'API_TOKEN=source-secret {"refresh_token":"file-secret"}'
+    redacted = redact_sensitive_text(text)
+    assert "source-secret" not in redacted
+    assert "file-secret" not in redacted
+    assert redacted.count("[REDACTED]") == 2
+
+
+def test_failure_output_truncation_keeps_tail_evidence():
+    value = "start-marker\n" + ("x" * 5000) + "\nfinal-error-evidence"
+    truncated = _truncate_tail(value, limit=100)
+    assert truncated.startswith("... <truncated; showing tail>")
+    assert "start-marker" not in truncated
+    assert truncated.endswith("final-error-evidence")
 
 
 def test_command_template_rejects_embedded_placeholder_in_shell_fragment():

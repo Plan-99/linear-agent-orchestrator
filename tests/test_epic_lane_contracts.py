@@ -109,20 +109,51 @@ def _scripts_mentioning(pattern: str) -> list[Path]:
     return [p for p in _shell_scripts() if rx.search(p.read_text(encoding="utf-8"))]
 
 
-def test_tmux_usage_requires_private_socket():
-    """Any tmux invocation must pin a private ``-S`` socket, never the default one."""
+def test_container_tmux_usage_requires_private_socket():
+    """Container-side tmux calls pin ``-S``; host pane management does not.
 
-    tmux_scripts = _scripts_mentioning(r"\btmux\b")
-    if not tmux_scripts:
-        pytest.skip("no tmux usage in scripts/ yet (private-socket contract pending task 6)")
-    for script in tmux_scripts:
+    ``console-supervisor.sh`` intentionally talks to the host's current tmux
+    server to create a sibling pane. Only calls made *inside* the container may
+    use the per-run private socket. Conflating those boundaries would either
+    reject the valid host UI or tempt an unsafe host-socket mount.
+    """
+
+    private_socket_scripts = [
+        SCRIPTS_DIR / "lao-pty-host.sh",
+        SCRIPTS_DIR / "console-attach.sh",
+    ]
+    for script in private_socket_scripts:
+        if not script.exists():
+            pytest.skip(f"{script.name} not implemented yet")
         text = script.read_text(encoding="utf-8")
-        for line in text.splitlines():
-            stripped = line.strip()
-            if re.search(r"\btmux\b", stripped) and not stripped.startswith("#"):
-                assert "-S " in stripped or "socket" in stripped.lower(), (
-                    f"{script.name}: tmux invocation without a private socket: {stripped!r}"
-                )
+        invocations = [
+            line.strip()
+            for line in text.splitlines()
+            if not line.lstrip().startswith("#")
+            and re.search(r"(?:^|[;&|!(])\s*!?\s*tmux\s", line)
+        ]
+        assert invocations, f"{script.name} contains no tmux invocation"
+        assert all("-S " in line or '(-S ' in line for line in invocations), (
+            f"{script.name} has container tmux calls without -S: {invocations}"
+        )
+
+    supervisor = SCRIPTS_DIR / "console-supervisor.sh"
+    if supervisor.exists():
+        text = supervisor.read_text(encoding="utf-8")
+        assert "tmux split-window" in text
+        host_tmux_lines = [
+            line.strip()
+            for line in text.splitlines()
+            if re.search(r"\btmux (?:split-window|list-panes|select-pane)\b", line)
+            and not line.lstrip().startswith("#")
+        ]
+        assert host_tmux_lines
+        assert all(" -S " not in line for line in host_tmux_lines), (
+            f"host pane management must use the current host tmux server: {host_tmux_lines}"
+        )
+        assert 'docker exec "$CONTAINER" tmux -S' in text, (
+            "container session probes must cross the boundary via docker exec and the private socket"
+        )
 
 
 def test_lifecycle_jsonl_path_is_under_runtime():
