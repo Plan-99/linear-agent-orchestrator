@@ -192,12 +192,19 @@ def test_wait_interactive_default_waits_for_exit_and_keeps_timeout(tmp_path):
     config = interactive_config(tmp_path, "/bin/true {prompt_path} {result_path}", timeout=1)
     runner = ShellRunner(config)
     result_path = tmp_path / "result.json"
+    submitted = []
 
-    # A result file alone no longer ends an interactive run.
+    # A result file triggers one notification but does not end the run, even
+    # though the poller continues to see the same file until timeout.
     result_path.write_text(COMPLETED_RESULT, encoding="utf-8")
     started = time.monotonic()
-    assert runner._wait_interactive(FakeProcess(), result_path) == "timeout"
+    assert runner._wait_interactive(
+        FakeProcess(),
+        result_path,
+        on_result_submitted=lambda: submitted.append("submitted"),
+    ) == "timeout"
     assert time.monotonic() - started < 5
+    assert submitted == ["submitted"]
 
     # Process exit is the normal completion path even after a result exists.
     assert runner._wait_interactive(FakeProcess(exits_after_polls=1), result_path) == "exited"
@@ -316,9 +323,15 @@ def test_wait_interactive_autoclose_detects_result(tmp_path):
     )
     runner = ShellRunner(config)
     result_path = tmp_path / "result.json"
+    submitted = []
 
     result_path.write_text(COMPLETED_RESULT, encoding="utf-8")
-    assert runner._wait_interactive(FakeProcess(), result_path) == "result"
+    assert runner._wait_interactive(
+        FakeProcess(),
+        result_path,
+        on_result_submitted=lambda: submitted.append("submitted"),
+    ) == "result"
+    assert submitted == ["submitted"]
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
@@ -385,13 +398,19 @@ def test_interactive_run_waits_for_tui_exit_after_result_by_default(tmp_path, mo
     backend.chmod(backend.stat().st_mode | stat.S_IEXEC)
 
     config = interactive_config(tmp_path, f"{backend} {{prompt_path}} {{result_path}}", timeout=30)
+    submitted_at = []
     started = time.monotonic()
-    result = ShellRunner(config).run(make_issue())
+    result = ShellRunner(config).run(
+        make_issue(),
+        on_result_submitted=lambda: submitted_at.append(time.monotonic()),
+    )
     elapsed = time.monotonic() - started
 
     assert result.exit_code == 0
     assert not result.timed_out
     assert result.completed_semantically
+    assert len(submitted_at) == 1
+    assert submitted_at[0] < started + elapsed - 1
     assert "fake-tui operator exit" in result.stdout
     assert elapsed >= 3, f"default interactive mode should wait for TUI exit ({elapsed:.1f}s)"
 

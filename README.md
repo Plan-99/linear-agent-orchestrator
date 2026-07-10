@@ -327,9 +327,12 @@ bind mount에 동일하게 적용됩니다.
 tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 콘솔 pane에서 직접
 타이핑해 에이전트와 대화할 수 있습니다(`supports_direct_input`이 자동으로 true).
 
-- 완료 판정(기본): 에이전트가 `{result_path}`에 구조화 결과를 써도 세션을 닫지
-  않습니다. operator가 TUI에서 exit하여 프로세스가 종료된 뒤 orchestrator가
-  `result.json`을 로드/검증합니다. `RUNNER_TIMEOUT_SECONDS`는 대화형 모드에서
+- 완료 판정(기본): 에이전트가 `{result_path}`에 유효한 구조화 결과를 쓰면 이슈를
+  `LINEAR_ATTENTION_STATE_NAME`(기본 `In Review`)으로 전환하지만 세션은 닫지
+  않습니다. 전환은 run당 한 번만 best-effort로 시도되며, 실패해도 대화는 계속됩니다.
+  operator가 TUI에서 exit하여 프로세스가 종료된 뒤 orchestrator가 `result.json`을
+  다시 로드/검증하고, Done 게이트를 통과하면 Done으로 전환합니다.
+  `RUNNER_TIMEOUT_SECONDS`는 대화형 모드에서
   **idle timeout**으로 동작합니다 — 콘솔 출력 활동이 이어지는 동안 마감이 계속
   연장되고, 활동 없이 해당 시간이 지나면 종료됩니다. 활동과 무관한 hard cap은
   `RUNNER_MAX_LIFETIME_SECONDS`(기본 21600초 = 6시간)입니다.

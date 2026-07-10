@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .config import AppConfig, LinearConfig, RunnerConfig, validate_project_workspace
 from .console_schema import CONSOLE_SCHEMA_VERSION, redact_text
@@ -348,7 +348,11 @@ class ShellRunner:
         self._remove_worktree(base, worktree)
         return workspace.branch, None
 
-    def run(self, issue: LinearIssue) -> RunnerResult:
+    def run(
+        self,
+        issue: LinearIssue,
+        on_result_submitted: Callable[[], None] | None = None,
+    ) -> RunnerResult:
         workspace = self._prepare_workspace(issue)
         paths = self.materialize(issue, project_dir=workspace.project_dir)
         command = render_command_template(
@@ -420,7 +424,12 @@ class ShellRunner:
         try:
             try:
                 if self.config.interactive and console is not None:
-                    outcome = self._wait_interactive(process, paths.result_path, activity_path=console.log_path)
+                    outcome = self._wait_interactive(
+                        process,
+                        paths.result_path,
+                        activity_path=console.log_path,
+                        on_result_submitted=on_result_submitted,
+                    )
                     if outcome == "timeout":
                         raise subprocess.TimeoutExpired(exec_command, self.config.timeout_seconds)
                     if outcome == "result":
@@ -526,6 +535,7 @@ class ShellRunner:
         process: subprocess.Popen,
         result_path: Path,
         activity_path: Path | None = None,
+        on_result_submitted: Callable[[], None] | None = None,
     ) -> str:
         """Wait for an interactive run to finish.
 
@@ -534,22 +544,29 @@ class ShellRunner:
         ``activity_path`` (the run's console output log) pushes the deadline
         back, so the session survives as long as the backend keeps producing
         output or the operator keeps the conversation going. max_lifetime_seconds
-        caps the run regardless of activity. If ``interactive_autoclose`` is
-        true, also returns "result" when a parseable structured result appears,
-        which restores the legacy result-driven teardown behavior.
+        caps the run regardless of activity. A parseable structured result
+        invokes ``on_result_submitted`` at most once without ending the default
+        interactive session. If ``interactive_autoclose`` is true, also returns
+        "result" after that notification, restoring the legacy result-driven
+        teardown behavior.
         """
 
         now = time.monotonic()
         hard_deadline = now + self.config.max_lifetime_seconds
         idle_deadline = now + self.config.timeout_seconds
         last_activity = self._activity_signature(activity_path)
+        result_submitted = False
         while True:
-            if process.poll() is not None:
-                return "exited"
-            if self.config.interactive_autoclose:
+            if not result_submitted:
                 structured, _error = load_structured_result(result_path)
                 if structured is not None:
-                    return "result"
+                    result_submitted = True
+                    if on_result_submitted is not None:
+                        on_result_submitted()
+                    if self.config.interactive_autoclose:
+                        return "result"
+            if process.poll() is not None:
+                return "exited"
             now = time.monotonic()
             activity = self._activity_signature(activity_path)
             if activity != last_activity:
@@ -994,7 +1011,14 @@ def process_issue_once(
 
     try:
         with LeaseRenewer(state.path, issue.id, owner_id, config.lease_ttl_seconds, config.lease_renewal_interval_seconds):
-            result = runner.run(issue)
+            if config.runner.interactive:
+
+                def on_result_submitted() -> None:
+                    _transition_to_attention_best_effort(issue=issue, linear=linear, states=states)
+
+                result = runner.run(issue, on_result_submitted=on_result_submitted)
+            else:
+                result = runner.run(issue)
     except (OSError, RunnerError, subprocess.SubprocessError) as exc:
         summary = _exception_summary(exc)
         state.fail_claim(issue.id, owner_id, error=summary, execution_key=exec_key)

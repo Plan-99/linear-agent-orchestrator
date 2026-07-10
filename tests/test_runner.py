@@ -371,6 +371,100 @@ def test_process_success_comments_and_moves_done(tmp_path):
     assert claim.status == "completed"
 
 
+class SubmittedInteractiveRunner:
+    def __init__(self, tmp_path, linear):
+        self.tmp_path = tmp_path
+        self.linear = linear
+        self.state_updates_after_submission = None
+
+    def preflight_workspace(self):
+        return []
+
+    def run(self, issue, on_result_submitted=None):
+        assert on_result_submitted is not None
+        on_result_submitted()
+        # Capture the state while the simulated TUI session is still active,
+        # before returning lets process_issue_once enter finalization.
+        self.state_updates_after_submission = [update["state_id"] for update in self.linear.state_updates]
+        paths = RunnerPaths(*(self.tmp_path,) * 7)
+        return RunnerResult(
+            issue_id=issue.id,
+            issue_identifier=issue.identifier,
+            command=("interactive",),
+            paths=paths,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            timeout_seconds=5,
+            structured_result=StructuredResult(
+                1,
+                "completed",
+                "done",
+                (ValidationEvidence("check", "true", 0, "ok"),),
+            ),
+        )
+
+
+def interactive_app_config(tmp_path):
+    return AppConfig(
+        linear=LinearConfig(team_id="DEV", project_name="TEST"),
+        runner=RunnerConfig(
+            command_template="/bin/true {prompt_path} {result_path}",
+            work_dir=str(tmp_path / "work"),
+            artifacts_dir=str(tmp_path / "artifacts"),
+            interactive=True,
+            interactive_console=True,
+        ),
+    )
+
+
+def test_interactive_submission_moves_to_review_before_exit_finalizes_done(tmp_path):
+    config = interactive_app_config(tmp_path)
+    fake = FakeLinear()
+    runner = SubmittedInteractiveRunner(tmp_path, fake)
+
+    with StateStore(tmp_path / "state.sqlite3") as store:
+        result = process_issue_once(
+            issue=make_issue(identifier="DEV-INTERACTIVE"),
+            config=config,
+            state=store,
+            linear=fake,
+            runner=runner,
+            owner_id="owner-1",
+        )
+
+    assert runner.state_updates_after_submission == ["state-started", "state-review"]
+    assert [update["state_id"] for update in fake.state_updates] == [
+        "state-started",
+        "state-review",
+        "state-done",
+    ]
+    assert result.status == "completed"
+    assert result.done_transitioned is True
+
+
+def test_interactive_review_transition_failure_does_not_fail_run(tmp_path, caplog):
+    config = interactive_app_config(tmp_path)
+    fake = FlakyLinear(fail_attention=1)
+    runner = SubmittedInteractiveRunner(tmp_path, fake)
+
+    with StateStore(tmp_path / "state.sqlite3") as store:
+        result = process_issue_once(
+            issue=make_issue(identifier="DEV-INTERACTIVE-FLAKY"),
+            config=config,
+            state=store,
+            linear=fake,
+            runner=runner,
+            owner_id="owner-1",
+        )
+
+    assert result.status == "completed"
+    assert result.done_transitioned is True
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-done"]
+    assert any(record.message == "attention_transition_failed" for record in caplog.records)
+
+
 def test_process_renews_lease_during_long_runner_and_blocks_reclaim(tmp_path):
     command = result_command('import time; time.sleep(1.25); print("done")')
     config = app_config_with_lease(tmp_path, command, ttl=1, renewal=0.1, timeout=3)
