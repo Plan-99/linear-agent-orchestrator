@@ -184,6 +184,67 @@ def test_branch_collision_gets_unique_suffix(tmp_path):
     assert result.worktree_branch == f"lao/DEV-1-{key8}-2"
 
 
+def test_agent_self_commit_keeps_branch(tmp_path):
+    """Regression: an agent that ran `git commit` itself left a clean worktree,
+    and the orchestrator deleted the branch as "no changes" — destroying the
+    committed work (observed live on DEV-26)."""
+
+    repo = make_repo(tmp_path)
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / "lao-agent-runner"
+    git_bin = subprocess.run(["which", "git"], text=True, capture_output=True).stdout.strip()
+    wrapper.write_text(
+        "#!/bin/bash\n"
+        "echo 'agent work' > \"$AGENT_PROJECT_DIR/self-committed.txt\"\n"
+        f"{git_bin} -C \"$AGENT_PROJECT_DIR\" add -A\n"
+        f"{git_bin} -C \"$AGENT_PROJECT_DIR\" -c user.name=agent -c user.email=a@a commit -q -m 'agent: self commit'\n"
+        f"printf '%s' '{COMPLETED_RESULT}' > \"$2\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    config = make_config(tmp_path, repo, wrapper)
+    issue = make_issue()
+
+    result = ShellRunner(config).run(issue)
+
+    assert result.completed_semantically
+    key8 = execution_key(issue, config)[:8]
+    assert result.worktree_branch == f"lao/DEV-1-{key8}", "self-committed work must keep its branch"
+    show = git(repo, "show", "--stat", result.worktree_branch)
+    assert "self-committed.txt" in show.stdout
+    assert "agent: self commit" in show.stdout
+    assert not (Path(config.work_dir) / "worktrees" / "DEV-1").exists()
+    # Base repo untouched either way.
+    assert git(repo, "status", "--porcelain").stdout.strip() == ""
+
+
+def test_failed_run_with_self_commit_keeps_branch_for_inspection(tmp_path):
+    repo = make_repo(tmp_path)
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / "lao-agent-runner"
+    git_bin = subprocess.run(["which", "git"], text=True, capture_output=True).stdout.strip()
+    wrapper.write_text(
+        "#!/bin/bash\n"
+        "echo 'partial' > \"$AGENT_PROJECT_DIR/partial.txt\"\n"
+        f"{git_bin} -C \"$AGENT_PROJECT_DIR\" add -A\n"
+        f"{git_bin} -C \"$AGENT_PROJECT_DIR\" -c user.name=agent -c user.email=a@a commit -q -m 'agent: partial'\n"
+        f"printf '%s' '{FAILED_RESULT}' > \"$2\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    config = make_config(tmp_path, repo, wrapper)
+
+    result = ShellRunner(config).run(make_issue())
+
+    assert not result.completed_semantically
+    assert result.worktree_branch is None
+    assert result.worktree_note and "branch" in result.worktree_note
+    branches = git(repo, "branch", "--list", "lao/DEV-1*").stdout
+    assert "lao/DEV-1" in branches, "committed partial work must survive for inspection"
+
+
 def test_preflight_allows_dirty_base_repo_when_isolated(tmp_path):
     repo = make_repo(tmp_path)
     wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)

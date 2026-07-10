@@ -189,6 +189,9 @@ class _WorkspaceContext:
     project_dir: str
     worktree_path: Path | None = None
     branch: str | None = None
+    # HEAD the worktree branched from; lets finish detect commits the agent
+    # made itself inside the worktree (a clean tree does not mean "no work").
+    base_commit: str | None = None
 
 
 class ShellRunner:
@@ -271,7 +274,13 @@ class ShellRunner:
             raise RunnerError(
                 f"Failed to create isolated worktree for {issue.identifier}: {(err or out).strip()[:300]}"
             )
-        return _WorkspaceContext(project_dir=str(worktree), worktree_path=worktree, branch=branch)
+        base_commit = self._git(worktree, "rev-parse", "HEAD")[1].strip() or None
+        return _WorkspaceContext(
+            project_dir=str(worktree),
+            worktree_path=worktree,
+            branch=branch,
+            base_commit=base_commit,
+        )
 
     def _finish_workspace(
         self,
@@ -290,6 +299,12 @@ class ShellRunner:
         if code != 0:
             return None, f"Could not inspect isolated worktree {worktree}: {(err or out).strip()[:300]}"
         dirty = bool(out.strip())
+        # Agents sometimes run `git commit` inside the worktree themselves, so
+        # a clean tree does NOT mean "no work" — deleting the branch then would
+        # destroy committed changes (observed live on DEV-26). Compare the
+        # branch tip against the HEAD it was created from.
+        tip = self._git(worktree, "rev-parse", "HEAD")[1].strip()
+        agent_committed = bool(workspace.base_commit and tip and tip != workspace.base_commit)
         if not completed:
             if dirty:
                 # Keep partial changes for post-mortem; the next run of this
@@ -298,9 +313,18 @@ class ShellRunner:
                     f"Run did not complete semantically; isolated worktree kept for inspection at "
                     f"{worktree} (branch `{workspace.branch}`)"
                 )
+            if agent_committed:
+                self._remove_worktree(base, worktree)
+                return None, (
+                    f"Run did not complete semantically but the agent committed work; "
+                    f"branch `{workspace.branch}` kept for inspection."
+                )
             self._remove_worktree(base, worktree, delete_branch=workspace.branch)
             return None, None
         if not dirty:
+            if agent_committed:
+                self._remove_worktree(base, worktree)
+                return workspace.branch, "Agent committed directly inside the worktree; branch kept as the run result."
             self._remove_worktree(base, worktree, delete_branch=workspace.branch)
             return None, "Run completed without file changes; no branch was kept."
         self._git(worktree, "add", "-A")
