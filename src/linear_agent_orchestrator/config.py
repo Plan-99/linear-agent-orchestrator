@@ -76,10 +76,14 @@ class RunnerConfig:
     # repository therefore stays clean and no longer blocks the next run.
     worktree_isolation: bool = True
     # Interactive conversation mode: host the backend's interactive TUI in the
-    # per-run console instead of the one-shot exec path. Run completion is then
-    # detected from the structured result file (or TUI exit); the Done gate is
-    # unchanged. Requires the interactive console.
+    # per-run console instead of the one-shot exec path. By default the run ends
+    # only when the TUI exits (or timeout fires); the structured result is loaded
+    # afterward and the Done gate is unchanged. Requires the interactive console.
     interactive: bool = False
+    # Legacy interactive behavior: close the TUI as soon as a valid structured
+    # result appears. Default false leaves the operator in control of when the
+    # TUI exits after reviewing final output or wrapping up the conversation.
+    interactive_autoclose: bool = False
     # Interactive console (model-neutral tmux/PTY host). Default off keeps the
     # execution path byte-identical. The tmux socket lives under an ephemeral,
     # container-private path (never a bind mount, never the host tmux socket);
@@ -299,6 +303,7 @@ def load_config(
             backend=_get_str(source, "AGENT_BACKEND", "omx").casefold(),
             worktree_isolation=_get_bool(source, "AGENT_WORKTREE_ISOLATION", True),
             interactive=_get_bool(source, "AGENT_INTERACTIVE", False),
+            interactive_autoclose=_get_bool(source, "AGENT_INTERACTIVE_AUTOCLOSE", False),
             interactive_console=_get_bool(source, "AGENT_CONSOLE", False),
             console_log_dir=_get_str(source, "AGENT_CONSOLE_LOG_DIR", "/workspace/logs/console"),
             console_socket_dir=_get_str(source, "AGENT_CONSOLE_SOCKET_DIR", "/tmp/lao-console"),

@@ -372,12 +372,14 @@ class ShellRunner:
                     if outcome == "timeout":
                         raise subprocess.TimeoutExpired(exec_command, self.config.timeout_seconds)
                     if outcome == "result":
-                        # The agent submitted its structured result; the still-
-                        # running TUI session is reaped deliberately, so the
-                        # transport exit code is the orchestrator's (0), not the
-                        # killed TUI's. The Done gate still requires the result
-                        # itself to prove completion.
-                        self._teardown_console(console)
+                        # Legacy opt-in behavior: the agent submitted its
+                        # structured result; the still-running TUI session is
+                        # reaped deliberately, so the transport exit code is the
+                        # orchestrator's (0), not the killed TUI's. The default
+                        # interactive path no longer reaches this branch; it
+                        # waits for the operator/backend to exit the TUI, then
+                        # loads and validates the same result file below.
+                        self._teardown_console(console, reason="teardown")
                         try:
                             os.killpg(process.pid, signal.SIGKILL)
                         except ProcessLookupError:
@@ -436,7 +438,7 @@ class ShellRunner:
                 # Tear the private server down (and SIGKILL the recorded backend
                 # PID, verified via /proc) before the group kill.
                 if console is not None:
-                    self._teardown_console(console)
+                    self._teardown_console(console, reason="timeout")
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -464,18 +466,20 @@ class ShellRunner:
     def _wait_interactive(self, process: subprocess.Popen, result_path: Path) -> str:
         """Wait for an interactive run to finish.
 
-        Returns "result" when a parseable structured result appears (the
-        conversation's work is submitted), "exited" when the TUI process ends
-        first, and "timeout" when neither happens within timeout_seconds.
+        Returns "exited" when the TUI process ends and "timeout" when it does
+        not end within timeout_seconds. If ``interactive_autoclose`` is true,
+        also returns "result" when a parseable structured result appears, which
+        restores the legacy result-driven teardown behavior.
         """
 
         deadline = time.monotonic() + self.config.timeout_seconds
         while True:
             if process.poll() is not None:
                 return "exited"
-            structured, _error = load_structured_result(result_path)
-            if structured is not None:
-                return "result"
+            if self.config.interactive_autoclose:
+                structured, _error = load_structured_result(result_path)
+                if structured is not None:
+                    return "result"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return "timeout"
@@ -558,7 +562,7 @@ class ShellRunner:
             return ""
         return _strip_ansi(raw.decode("utf-8", errors="replace"))
 
-    def _teardown_console(self, console: _ConsoleContext) -> None:
+    def _teardown_console(self, console: _ConsoleContext, *, reason: str = "timeout") -> None:
         """Kill the escaped private tmux server and the recorded backend subtree.
 
         killpg on this runner's own group does not reach a daemonized tmux
@@ -567,7 +571,7 @@ class ShellRunner:
 
         1. Drop a ``terminated`` marker so the pty host suppresses its own
            terminal ``session_ended`` event — the runner owns the single
-           terminal event (``session_killed``) on the timeout path.
+           terminal event (``session_killed``) on timeout/autoclose teardown.
         2. SIGKILL the backend's process group, but only after confirming the
            recorded PID still refers to the same process (matching /proc start
            time), so a recycled PID can never be killed by mistake. SIGKILL
@@ -578,7 +582,7 @@ class ShellRunner:
         """
 
         try:
-            console.terminated_path.write_text("timeout", encoding="utf-8")
+            console.terminated_path.write_text(reason, encoding="utf-8")
         except OSError:
             pass
 
@@ -595,7 +599,7 @@ class ShellRunner:
 
         if backend_pid is not None:
             self._verify_pid_dead(backend_pid)
-        self._append_console_event(console, "session_killed", {"reason": "timeout"})
+        self._append_console_event(console, "session_killed", {"reason": reason})
 
     def _kill_process_group(self, pid: int) -> None:
         try:

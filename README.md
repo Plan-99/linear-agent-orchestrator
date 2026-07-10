@@ -297,9 +297,12 @@ bind mount에 동일하게 적용됩니다.
 tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 콘솔 pane에서 직접
 타이핑해 에이전트와 대화할 수 있습니다(`supports_direct_input`이 자동으로 true).
 
-- 완료 판정: 에이전트가 `{result_path}`에 구조화 결과를 쓰면 orchestrator가 이를
-  감지해 세션을 정리하고, TUI를 조작자가 직접 종료해도 동일하게 처리됩니다.
-  timeout도 그대로 적용됩니다.
+- 완료 판정(기본): 에이전트가 `{result_path}`에 구조화 결과를 써도 세션을 닫지
+  않습니다. operator가 TUI에서 exit하여 프로세스가 종료된 뒤 orchestrator가
+  `result.json`을 로드/검증합니다. `RUNNER_TIMEOUT_SECONDS`는 operator가 exit하지
+  않는 경우의 backstop으로 그대로 적용됩니다.
+- 이전 자동 종료 동작이 필요하면 `AGENT_INTERACTIVE_AUTOCLOSE=true`를 설정하세요.
+  이때는 유효한 구조화 결과가 감지되는 즉시 orchestrator가 TUI 세션을 정리합니다.
 - **Done 게이트는 불변입니다** — 대화 여부와 무관하게 유효한 validation 증거가 있는
   `completed` 결과만 Done으로 전환됩니다.
 - `AGENT_CONSOLE`이 필요하며, 사람이 지켜보는 세션이므로 `MAX_PARALLEL_RUNS=1`

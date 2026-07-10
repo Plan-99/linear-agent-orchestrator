@@ -1,4 +1,4 @@
-"""Interactive conversation mode: config gating, adapter argv, result-driven completion."""
+"""Interactive conversation mode: config gating, adapter argv, operator-exit completion."""
 
 from pathlib import Path
 import os
@@ -69,8 +69,12 @@ def test_agent_interactive_parses_and_requires_console():
 
 
 def test_interactive_defaults_off():
-    cfg = load_config({}, env_files=[])
+    cfg = load_config({"APP_ENV": "test"}, env_files=[])
     assert cfg.runner.interactive is False
+    assert cfg.runner.interactive_autoclose is False
+
+    autoclose = load_config({"AGENT_INTERACTIVE_AUTOCLOSE": "true"}, env_files=[])
+    assert autoclose.runner.interactive_autoclose is True
 
 
 def test_interactive_console_declares_direct_input(tmp_path):
@@ -167,7 +171,7 @@ class FakeProcess:
         return None
 
 
-def interactive_config(tmp_path, command, *, timeout=6):
+def interactive_config(tmp_path, command, *, timeout=6, autoclose=False):
     return RunnerConfig(
         command_template=command,
         timeout_seconds=timeout,
@@ -176,32 +180,49 @@ def interactive_config(tmp_path, command, *, timeout=6):
         allowed_env=("PATH", "HOME", "LAO_PTY_ENTRY"),
         interactive_console=True,
         interactive=True,
+        interactive_autoclose=autoclose,
         console_log_dir=str(tmp_path / "logs"),
         console_socket_dir=tempfile.mkdtemp(prefix="li"),
     )
 
 
-def test_wait_interactive_detects_result_then_exit_then_timeout(tmp_path):
+def test_wait_interactive_default_waits_for_exit_and_keeps_timeout(tmp_path):
     config = interactive_config(tmp_path, "/bin/true {prompt_path} {result_path}", timeout=1)
     runner = ShellRunner(config)
     result_path = tmp_path / "result.json"
 
-    # Result file appears -> "result".
+    # A result file alone no longer ends an interactive run.
     result_path.write_text(COMPLETED_RESULT, encoding="utf-8")
-    assert runner._wait_interactive(FakeProcess(), result_path) == "result"
+    started = time.monotonic()
+    assert runner._wait_interactive(FakeProcess(), result_path) == "timeout"
+    assert time.monotonic() - started < 5
 
-    # Process exit wins when there is no result.
-    result_path.unlink()
+    # Process exit is the normal completion path even after a result exists.
     assert runner._wait_interactive(FakeProcess(exits_after_polls=1), result_path) == "exited"
 
     # Neither -> timeout after timeout_seconds.
+    result_path.unlink()
     started = time.monotonic()
     assert runner._wait_interactive(FakeProcess(), result_path) == "timeout"
     assert time.monotonic() - started < 5
 
 
+def test_wait_interactive_autoclose_detects_result(tmp_path):
+    config = interactive_config(
+        tmp_path,
+        "/bin/true {prompt_path} {result_path}",
+        timeout=1,
+        autoclose=True,
+    )
+    runner = ShellRunner(config)
+    result_path = tmp_path / "result.json"
+
+    result_path.write_text(COMPLETED_RESULT, encoding="utf-8")
+    assert runner._wait_interactive(FakeProcess(), result_path) == "result"
+
+
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
-def test_interactive_run_completes_when_result_is_submitted(tmp_path, monkeypatch):
+def test_interactive_run_waits_for_tui_exit_after_result_by_default(tmp_path, monkeypatch):
     bin_dir = tmp_path / "console-bin"
     bin_dir.mkdir()
     for name, src in (("lao-pty-host", PTY_HOST), ("lao-pty-entry", PTY_ENTRY)):
@@ -212,7 +233,7 @@ def test_interactive_run_completes_when_result_is_submitted(tmp_path, monkeypatc
     # A "TUI" that, like real interactive backends, refuses to run unless its
     # stdout is a terminal (regression: tee-captured stdout broke codex with
     # "stdout is not a terminal"), writes its structured result, then keeps
-    # running forever; only the orchestrator's result-detection ends this run.
+    # talking before the operator/backend exits the TUI.
     backend = tmp_path / "fake-tui"
     backend.write_text(
         "#!/usr/bin/env bash\n"
@@ -220,7 +241,9 @@ def test_interactive_run_completes_when_result_is_submitted(tmp_path, monkeypatc
         "echo 'fake-tui banner'\n"
         "sleep 1\n"
         f"printf '%s' '{COMPLETED_RESULT}' > \"$2\"\n"
-        "sleep 120\n",
+        "echo 'fake-tui result submitted'\n"
+        "sleep 2\n"
+        "echo 'fake-tui operator exit'\n",
         encoding="utf-8",
     )
     backend.chmod(backend.stat().st_mode | stat.S_IEXEC)
@@ -233,4 +256,43 @@ def test_interactive_run_completes_when_result_is_submitted(tmp_path, monkeypatc
     assert result.exit_code == 0
     assert not result.timed_out
     assert result.completed_semantically
-    assert elapsed < 25, f"result-driven teardown should not wait for the TUI ({elapsed:.1f}s)"
+    assert "fake-tui operator exit" in result.stdout
+    assert elapsed >= 3, f"default interactive mode should wait for TUI exit ({elapsed:.1f}s)"
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+def test_interactive_run_autoclose_tears_down_when_result_is_submitted(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "console-bin"
+    bin_dir.mkdir()
+    for name, src in (("lao-pty-host", PTY_HOST), ("lao-pty-entry", PTY_ENTRY)):
+        (bin_dir / name).symlink_to(src)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("LAO_PTY_ENTRY", str(bin_dir / "lao-pty-entry"))
+
+    backend = tmp_path / "fake-tui"
+    backend.write_text(
+        "#!/usr/bin/env bash\n"
+        "[ -t 1 ] || { echo 'fake-tui: stdout is not a terminal' >&2; exit 91; }\n"
+        "echo 'fake-tui banner'\n"
+        "sleep 1\n"
+        f"printf '%s' '{COMPLETED_RESULT}' > \"$2\"\n"
+        "echo 'fake-tui result submitted'\n"
+        "sleep 120\n",
+        encoding="utf-8",
+    )
+    backend.chmod(backend.stat().st_mode | stat.S_IEXEC)
+
+    config = interactive_config(
+        tmp_path,
+        f"{backend} {{prompt_path}} {{result_path}}",
+        timeout=30,
+        autoclose=True,
+    )
+    started = time.monotonic()
+    result = ShellRunner(config).run(make_issue())
+    elapsed = time.monotonic() - started
+
+    assert result.exit_code == 0
+    assert not result.timed_out
+    assert result.completed_semantically
+    assert elapsed < 25, f"autoclose should not wait for the TUI ({elapsed:.1f}s)"

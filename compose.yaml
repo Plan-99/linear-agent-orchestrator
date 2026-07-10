@@ -46,6 +46,8 @@ services:
       AGENT_WORKTREE_ISOLATION: ${AGENT_WORKTREE_ISOLATION:-true}
       # Interactive TUI conversation mode (requires the tmux console).
       AGENT_INTERACTIVE: ${AGENT_INTERACTIVE:-false}
+      # Legacy behavior: close the interactive TUI as soon as result.json is valid.
+      AGENT_INTERACTIVE_AUTOCLOSE: ${AGENT_INTERACTIVE_AUTOCLOSE:-false}
       # Concurrent issue workers in one daemon; >1 requires worktree isolation.
       MAX_PARALLEL_RUNS: ${MAX_PARALLEL_RUNS:-1}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
