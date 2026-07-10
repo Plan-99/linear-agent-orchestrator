@@ -355,16 +355,44 @@ class ShellRunner:
         exec_command: list[str] = list(command)
         if console is not None:
             exec_command = [*console.wrapper_argv, *command]
+        # Interactive runs can outlive result submission for as long as the
+        # operator keeps the TUI open, and _wait_interactive only polls — with
+        # PIPE nobody would drain stdout, so a wrapper writing more than the
+        # pipe buffer (e.g. the pty host's final output tail) deadlocks and the
+        # run never finishes. Back the output with files instead and read them
+        # after exit.
+        interactive_wait = self.config.interactive and console is not None
+        stdout_path = stderr_path = None
+        stdout_handle = stderr_handle = None
+        if interactive_wait:
+            stdout_path = paths.issue_dir / "runner-stdout.log"
+            stderr_path = paths.issue_dir / "runner-stderr.log"
+            stdout_handle = stdout_path.open("wb")
+            stderr_handle = stderr_path.open("wb")
         process = subprocess.Popen(  # noqa: S603 - command is explicitly tokenized without shell=True
             exec_command,
             cwd=paths.work_dir,
             env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            text=stdout_handle is None,
+            stdout=stdout_handle if stdout_handle is not None else subprocess.PIPE,
+            stderr=stderr_handle if stderr_handle is not None else subprocess.PIPE,
             shell=False,
             start_new_session=True,
         )
+
+        def finish_output(timeout: float | None = None) -> tuple[str, str]:
+            """communicate() for PIPE mode; wait + read back files otherwise."""
+
+            if stdout_handle is None:
+                return process.communicate(timeout=timeout)
+            process.wait(timeout=timeout)
+            stdout_handle.flush()
+            stderr_handle.flush()
+            return (
+                stdout_path.read_text(encoding="utf-8", errors="replace"),
+                stderr_path.read_text(encoding="utf-8", errors="replace"),
+            )
+
         try:
             try:
                 if self.config.interactive and console is not None:
@@ -384,7 +412,7 @@ class ShellRunner:
                             os.killpg(process.pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
-                        stdout, stderr = process.communicate()
+                        stdout, stderr = finish_output()
                         stdout = self._console_stdout(console, stdout)
                         structured_result, result_error = load_structured_result(paths.result_path)
                         result = RunnerResult(
@@ -406,7 +434,7 @@ class ShellRunner:
                         return result
                     # outcome == "exited": the operator or backend ended the
                     # TUI itself; fall through to the one-shot handling below.
-                stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
+                stdout, stderr = finish_output(timeout=self.config.timeout_seconds)
                 if console is not None:
                     stdout = self._console_stdout(console, stdout)
                 structured_result, result_error = load_structured_result(paths.result_path)
@@ -443,7 +471,7 @@ class ShellRunner:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                stdout, stderr = process.communicate()
+                stdout, stderr = finish_output()
                 if console is not None:
                     stdout = self._console_stdout(console, stdout)
                 _, note = self._finish_workspace(workspace, issue, completed=False)
@@ -460,6 +488,12 @@ class ShellRunner:
                     worktree_note=note,
                 )
         finally:
+            for handle in (stdout_handle, stderr_handle):
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
             if console is not None:
                 self._cleanup_console(console)
 

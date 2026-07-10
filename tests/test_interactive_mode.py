@@ -222,6 +222,42 @@ def test_wait_interactive_autoclose_detects_result(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+def test_interactive_run_with_large_output_does_not_deadlock(tmp_path, monkeypatch):
+    """Regression: the pty host's final output tail (up to 100KB) exceeded the
+    OS pipe buffer while _wait_interactive only polled, deadlocking the run
+    until timeout (observed live on DEV-24 with a real claude TUI)."""
+
+    bin_dir = tmp_path / "console-bin"
+    bin_dir.mkdir()
+    for name, src in (("lao-pty-host", PTY_HOST), ("lao-pty-entry", PTY_ENTRY)):
+        (bin_dir / name).symlink_to(src)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("LAO_PTY_ENTRY", str(bin_dir / "lao-pty-entry"))
+
+    backend = tmp_path / "fake-tui"
+    backend.write_text(
+        "#!/usr/bin/env bash\n"
+        "[ -t 1 ] || { echo 'not a terminal' >&2; exit 91; }\n"
+        # Well past the pty host's 100KB stdout tail and the ~64KB pipe buffer.
+        "for i in $(seq 1 4000); do echo \"line $i: 0123456789012345678901234567890123456789\"; done\n"
+        f"printf '%s' '{COMPLETED_RESULT}' > \"$2\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    backend.chmod(backend.stat().st_mode | stat.S_IEXEC)
+
+    config = interactive_config(tmp_path, f"{backend} {{prompt_path}} {{result_path}}", timeout=25)
+    started = time.monotonic()
+    result = ShellRunner(config).run(make_issue())
+    elapsed = time.monotonic() - started
+
+    assert not result.timed_out, "large output must not deadlock the interactive wait"
+    assert result.exit_code == 0
+    assert result.completed_semantically
+    assert elapsed < 20, f"run should end promptly after TUI exit ({elapsed:.1f}s)"
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 def test_interactive_run_waits_for_tui_exit_after_result_by_default(tmp_path, monkeypatch):
     bin_dir = tmp_path / "console-bin"
     bin_dir.mkdir()
