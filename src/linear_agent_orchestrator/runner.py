@@ -1,0 +1,1612 @@
+"""Generic shell runner and single-issue processing orchestration.
+
+G004 implements safe local runner execution and mocked-testable Linear reporting.
+It intentionally does not run live end-to-end Linear validation.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import hashlib
+import json
+import logging
+import os
+import re
+import signal
+import shlex
+import shutil
+import subprocess
+import threading
+from typing import Any, Mapping, Protocol
+
+from .config import AppConfig, LinearConfig, RunnerConfig, validate_project_workspace
+from .issue_schema import clarification_comment, validate_issue_body
+from .linear_client import LinearComment, LinearIssue, WorkflowRole, WorkflowState
+from .state import StateStore
+
+_PLACEHOLDERS = {
+    "prompt_path",
+    "context_path",
+    "artifacts_dir",
+    "result_path",
+    "issue_id",
+    "issue_identifier",
+}
+_SAFE_PATH_PART_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+LOGGER = logging.getLogger(__name__)
+
+
+class RunnerError(ValueError):
+    """Raised for unsafe or invalid runner configuration."""
+
+
+@dataclass(frozen=True)
+class RunnerPaths:
+    issue_dir: Path
+    inputs_dir: Path
+    work_dir: Path
+    artifacts_dir: Path
+    prompt_path: Path
+    context_path: Path
+    result_path: Path
+
+
+@dataclass(frozen=True)
+class ValidationEvidence:
+    description: str
+    command: str
+    exit_code: int
+    evidence: str
+
+
+@dataclass(frozen=True)
+class StructuredResult:
+    version: int
+    status: str
+    summary: str
+    validation: tuple[ValidationEvidence, ...]
+    artifacts: tuple[str, ...] = ()
+    files_changed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunnerResult:
+    issue_id: str
+    issue_identifier: str
+    command: tuple[str, ...]
+    paths: RunnerPaths
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    timeout_seconds: int
+    structured_result: StructuredResult | None = None
+    result_error: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.exit_code == 0 and not self.timed_out
+
+    @property
+    def completed_semantically(self) -> bool:
+        """Return true only for transport success plus explicit validated completion."""
+
+        result = self.structured_result
+        return bool(
+            self.succeeded
+            and result is not None
+            and result.status == "completed"
+            and result.validation
+            and all(item.exit_code == 0 and item.evidence.strip() for item in result.validation)
+        )
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    issue_id: str
+    issue_identifier: str
+    status: str
+    claimed: bool
+    executed: bool
+    done_transitioned: bool
+    comment_ids: tuple[str | None, ...]
+    runner_result: RunnerResult | None = None
+    message: str | None = None
+    issue_url: str | None = None
+
+
+class LinearReporter(Protocol):
+    def create_comment(self, issue_id: str, body: str) -> str | None: ...
+
+    def list_issue_comments(self, issue_id: str, *, first: int = 50) -> tuple[LinearComment, ...]: ...
+
+    def update_issue_state(self, issue_id: str, state_id: str) -> bool: ...
+
+    def resolve_workflow_states(self, config: LinearConfig) -> dict[WorkflowRole, WorkflowState]: ...
+
+
+class ShellRunner:
+    """Materialize prompt/context files and execute a no-shell command template."""
+
+    def __init__(self, config: RunnerConfig) -> None:
+        if not config.command_template:
+            raise RunnerError("RUNNER_COMMAND_TEMPLATE is required")
+        self.config = config
+        self.command_template = config.command_template
+
+    def preflight_workspace(self) -> list[str]:
+        """Recheck the fixed repository immediately before an agent execution."""
+
+        try:
+            tokens = shlex.split(self.command_template, posix=True)
+        except ValueError as exc:
+            raise RunnerError(f"Invalid runner command template: {exc}") from exc
+        if not tokens or Path(tokens[0]).name != "lao-agent-runner":
+            return []
+        return validate_project_workspace(self.config.project_dir)
+
+    def run(self, issue: LinearIssue) -> RunnerResult:
+        paths = self.materialize(issue)
+        command = render_command_template(
+            self.command_template,
+            {
+                "prompt_path": str(paths.prompt_path),
+                "context_path": str(paths.context_path),
+                "artifacts_dir": str(paths.artifacts_dir),
+                "result_path": str(paths.result_path),
+                "issue_id": issue.id,
+                "issue_identifier": issue.identifier,
+            },
+        )
+        env = build_allowlisted_env(self.config.allowed_env)
+        process = subprocess.Popen(  # noqa: S603 - command is explicitly tokenized without shell=True
+            command,
+            cwd=paths.work_dir,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
+            structured_result, result_error = load_structured_result(paths.result_path)
+            return RunnerResult(
+                issue_id=issue.id,
+                issue_identifier=issue.identifier,
+                command=tuple(command),
+                paths=paths,
+                exit_code=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=False,
+                timeout_seconds=self.config.timeout_seconds,
+                structured_result=structured_result,
+                result_error=result_error,
+            )
+        except subprocess.TimeoutExpired:
+            # The backend may have spawned agents, test runners, or language
+            # servers. Killing only the direct process would let descendants
+            # continue mutating the trusted workspace after timeout. Each run
+            # owns a fresh session/process group, so terminate the entire group.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            return RunnerResult(
+                issue_id=issue.id,
+                issue_identifier=issue.identifier,
+                command=tuple(command),
+                paths=paths,
+                exit_code=None,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=True,
+                timeout_seconds=self.config.timeout_seconds,
+            )
+
+    def materialize(self, issue: LinearIssue) -> RunnerPaths:
+        safe_name = sanitize_path_part(issue.identifier or issue.id)
+        issue_dir = Path(self.config.work_dir) / safe_name
+        inputs_dir = issue_dir / "inputs"
+        work_dir = issue_dir / "work"
+        artifacts_dir = Path(self.config.artifacts_dir) / safe_name
+        if issue_dir.exists() or issue_dir.is_symlink():
+            _remove_issue_dir(issue_dir)
+        inputs_dir.mkdir(parents=True, exist_ok=False)
+        work_dir.mkdir(parents=True, exist_ok=False)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        prompt_path = inputs_dir / "prompt.md"
+        context_path = inputs_dir / "context.json"
+        result_path = artifacts_dir / "result.json"
+        if result_path.exists() or result_path.is_symlink():
+            result_path.unlink()
+        prompt_path.write_text(
+            render_prompt(issue, project_dir=self.config.project_dir, result_path=result_path),
+            encoding="utf-8",
+        )
+        context_path.write_text(
+            json.dumps(
+                render_context(issue, project_dir=self.config.project_dir, result_path=result_path),
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        prompt_path.chmod(0o444)
+        context_path.chmod(0o444)
+        inputs_dir.chmod(0o555)
+        return RunnerPaths(issue_dir, inputs_dir, work_dir, artifacts_dir, prompt_path, context_path, result_path)
+
+
+def process_issue_once(
+    *,
+    issue: LinearIssue,
+    config: AppConfig,
+    state: StateStore,
+    linear: LinearReporter,
+    runner: ShellRunner,
+    owner_id: str,
+    move_in_progress: bool = True,
+) -> ProcessResult:
+    """Process one already-polled issue using local state, Linear reporting, and runner."""
+
+    if not issue.schema.valid:
+        return _process_schema_invalid_issue(
+            issue=issue,
+            config=config,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+        )
+
+    exec_key = execution_key(issue, config.runner)
+    claim = state.acquire_claim(
+        issue.id,
+        owner_id,
+        lease_ttl_seconds=config.lease_ttl_seconds,
+        execution_key=exec_key,
+        allow_failed_retry=True,
+    )
+    if not claim.acquired:
+        return ProcessResult(
+            issue.id,
+            issue.identifier,
+            "not_claimed",
+            False,
+            False,
+            False,
+            (),
+            message=_claim_skip_message(claim.claim, exec_key),
+            issue_url=issue.url,
+        )
+    try:
+        states = linear.resolve_workflow_states(config.linear)
+    except Exception as exc:  # noqa: BLE001 - retryable Linear state lookup failure must not lose local active work
+        return _in_progress_transition_pending_result(issue=issue, exc=exc)
+    comments: list[str | None] = []
+    pending = state.get_finalization(issue.id, exec_key)
+    if pending:
+        result = _runner_result_from_state(pending["result"])
+        return _finalize_success(
+            issue=issue,
+            result=result,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+            states=states,
+            comments=comments,
+            execution_key=exec_key,
+            pending=pending,
+        )
+    if state.has_execution(issue.id, exec_key):
+        return _fail_in_doubt_execution(
+            issue=issue,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+            execution_key=exec_key,
+            comments=comments,
+            message=_in_doubt_execution_message(exec_key),
+        )
+    workspace_errors = runner.preflight_workspace()
+    if workspace_errors:
+        return _workspace_blocked_result(
+            issue=issue,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+            execution_key=exec_key,
+            errors=workspace_errors,
+        )
+    state.upsert_active_work(issue.id, exec_key, issue=_issue_to_state(issue), owner_id=owner_id)
+    if move_in_progress:
+        try:
+            in_progress_state = states[WorkflowRole.IN_PROGRESS]
+            linear.update_issue_state(issue.id, in_progress_state.id)
+            state.upsert_active_work(
+                issue.id,
+                exec_key,
+                issue=_issue_to_state_with_workflow(issue, state_id=in_progress_state.id, state_name=in_progress_state.name),
+                owner_id=owner_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - retryable Linear transition failure must not start runner
+            return _in_progress_transition_pending_result(issue=issue, exc=exc)
+    if not state.has_comment(issue.id, "started"):
+        try:
+            comment_id = ensure_linear_comment(state, linear, issue.id, "started", start_comment(issue), owner_id=owner_id)
+            comments.append(comment_id)
+        except Exception as exc:  # noqa: BLE001 - non-critical comment failure must not block execution
+            LOGGER.warning(
+                "start_comment_failed",
+                extra={
+                    "issue_id": issue.id,
+                    "issue_identifier": issue.identifier,
+                    "error": _exception_summary(exc),
+                },
+            )
+
+    if not state.record_execution_once(issue.id, exec_key, owner_id=owner_id):
+        pending = state.get_finalization(issue.id, exec_key)
+        if pending:
+            result = _runner_result_from_state(pending["result"])
+            return _finalize_success(
+                issue=issue,
+                result=result,
+                state=state,
+                linear=linear,
+                owner_id=owner_id,
+                states=states,
+                comments=comments,
+                execution_key=exec_key,
+                pending=pending,
+            )
+        return _fail_in_doubt_execution(
+            issue=issue,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+            execution_key=exec_key,
+            comments=comments,
+            message=_in_doubt_execution_message(exec_key),
+        )
+
+    try:
+        with LeaseRenewer(state.path, issue.id, owner_id, config.lease_ttl_seconds, config.lease_renewal_interval_seconds):
+            result = runner.run(issue)
+    except (OSError, RunnerError, subprocess.SubprocessError) as exc:
+        summary = _exception_summary(exc)
+        state.fail_claim(issue.id, owner_id, error=summary, execution_key=exec_key)
+        if not state.has_comment(issue.id, f"failure:{exec_key}"):
+            try:
+                comment_id = ensure_linear_comment(
+                    state,
+                    linear,
+                    issue.id,
+                    f"failure:{exec_key}",
+                    exception_failure_comment(issue, exc),
+                    owner_id=owner_id,
+                )
+                comments.append(comment_id)
+            except Exception:  # noqa: BLE001 - comment failure must not hide local failure
+                comments.append(None)
+        return ProcessResult(
+            issue.id,
+            issue.identifier,
+            "failed",
+            True,
+            False,
+            False,
+            tuple(comments),
+            message=summary,
+            issue_url=issue.url,
+        )
+
+    if result.completed_semantically:
+        state.upsert_finalization(
+            issue.id,
+            exec_key,
+            result=_runner_result_to_state(result),
+            issue=_issue_to_state(issue),
+            owner_id=owner_id,
+        )
+        pending = state.get_finalization(issue.id, exec_key)
+        return _finalize_success(
+            issue=issue,
+            result=result,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+            states=states,
+            comments=comments,
+            execution_key=exec_key,
+            pending=pending,
+        )
+
+    failure_message = _failure_summary(result)
+    state.fail_claim(issue.id, owner_id, error=failure_message, execution_key=exec_key)
+    if not state.has_comment(issue.id, f"failure:{exec_key}"):
+        try:
+            comment_id = ensure_linear_comment(
+                state,
+                linear,
+                issue.id,
+                f"failure:{exec_key}",
+                failure_comment(result),
+                owner_id=owner_id,
+            )
+            comments.append(comment_id)
+        except Exception as exc:  # noqa: BLE001 - comment failure must not hide local failure
+            comments.append(None)
+            return ProcessResult(
+                issue.id,
+                issue.identifier,
+                "failed",
+                True,
+                True,
+                False,
+                tuple(comments),
+                result,
+                message=_exception_summary(exc),
+                issue_url=issue.url,
+            )
+    return ProcessResult(
+        issue.id,
+        issue.identifier,
+        "failed",
+        True,
+        True,
+        False,
+        tuple(comments),
+        result,
+        message=failure_message,
+        issue_url=issue.url,
+    )
+
+
+def _workspace_blocked_result(
+    *,
+    issue: LinearIssue,
+    state: StateStore,
+    linear: LinearReporter,
+    owner_id: str,
+    execution_key: str,
+    errors: list[str],
+) -> ProcessResult:
+    message = "; ".join(errors)
+    comments: list[str | None] = []
+    comment_key = f"workspace-preflight:{execution_key}"
+    if not state.has_comment(issue.id, comment_key):
+        try:
+            comments.append(
+                ensure_linear_comment(
+                    state,
+                    linear,
+                    issue.id,
+                    comment_key,
+                    workspace_preflight_comment(issue, errors),
+                    owner_id=owner_id,
+                )
+            )
+        except Exception:  # noqa: BLE001 - local release still prevents execution
+            comments.append(None)
+    state.release_claim(issue.id, owner_id)
+    return ProcessResult(
+        issue.id,
+        issue.identifier,
+        "workspace_blocked",
+        True,
+        False,
+        False,
+        tuple(comments),
+        message=message,
+        issue_url=issue.url,
+    )
+
+
+def _fail_in_doubt_execution(
+    *,
+    issue: LinearIssue,
+    state: StateStore,
+    linear: LinearReporter,
+    owner_id: str,
+    execution_key: str,
+    comments: list[str | None],
+    message: str,
+) -> ProcessResult:
+    state.fail_claim(issue.id, owner_id, error=message, execution_key=execution_key)
+    comment_key = f"failure:{execution_key}"
+    if not state.has_comment(issue.id, comment_key):
+        try:
+            comment_id = ensure_linear_comment(
+                state,
+                linear,
+                issue.id,
+                comment_key,
+                in_doubt_failure_comment(issue, message),
+                owner_id=owner_id,
+            )
+            comments.append(comment_id)
+        except Exception as exc:  # noqa: BLE001 - local fail-closed state is authoritative
+            comments.append(None)
+            message = f"{message}; failure comment error: {_exception_summary(exc)}"
+    return ProcessResult(
+        issue.id,
+        issue.identifier,
+        "failed_in_doubt",
+        True,
+        False,
+        False,
+        tuple(comments),
+        message=message,
+        issue_url=issue.url,
+    )
+
+
+def _in_progress_transition_pending_result(*, issue: LinearIssue, exc: BaseException) -> ProcessResult:
+    summary = _exception_summary(exc)
+    message = (
+        f"In Progress transition pending for {issue.identifier}: {summary}. "
+        "Runner was not started; execution intent was not recorded. "
+        "The active claim and execution identity were kept so the daemon can retry safely."
+    )
+    LOGGER.warning(
+        "in_progress_transition_pending",
+        extra={
+            "issue_id": issue.id,
+            "issue_identifier": issue.identifier,
+            "error": summary,
+        },
+    )
+    return ProcessResult(
+        issue.id,
+        issue.identifier,
+        "in_progress_transition_pending",
+        True,
+        False,
+        False,
+        (),
+        message=message,
+        issue_url=issue.url,
+    )
+
+
+def _in_doubt_execution_message(execution_key: str) -> str:
+    return (
+        "Fail-closed recovery: execution intent already exists for "
+        f"execution_key={execution_key} but no successful finalization row exists. "
+        "The runner was not invoked again to avoid duplicating external side effects; "
+        "edit the Linear issue or change the runner command to create a new execution key and retry."
+    )
+
+
+def _config_drift_message(stored_key: str, current_key: str) -> str:
+    return (
+        "Fail-closed active-work recovery: stored execution_key="
+        f"{stored_key} does not match current execution_key={current_key}. "
+        "The runner was not invoked with a different current command/config under the stored active work record; "
+        "a later fresh Todo poll with the current key may retry."
+    )
+
+
+def _process_schema_invalid_issue(
+    *,
+    issue: LinearIssue,
+    config: AppConfig,
+    state: StateStore,
+    linear: LinearReporter,
+    owner_id: str,
+) -> ProcessResult:
+    """Create/reconcile malformed-issue clarification under a short owned lease.
+
+    Malformed issues are intentionally non-terminal: the same Linear issue may be
+    edited into a valid schema later. The lease only serializes clarification
+    comment creation across overlapping daemons and is released after the local
+    attempt so valid future updates remain processable.
+    """
+
+    comment_key = "schema-missing"
+    invalid_key = f"schema:{comment_key}"
+    claim = state.acquire_claim(
+        issue.id,
+        owner_id,
+        lease_ttl_seconds=config.lease_ttl_seconds,
+        execution_key=invalid_key,
+    )
+    if not claim.acquired:
+        return ProcessResult(
+            issue.id,
+            issue.identifier,
+            "not_claimed",
+            False,
+            False,
+            False,
+            (),
+            message=claim.claim.status,
+            issue_url=issue.url,
+        )
+
+    comments: list[str | None] = []
+    message: str | None = None
+    try:
+        if not state.has_comment(issue.id, comment_key):
+            try:
+                comment_id = ensure_linear_comment(
+                    state,
+                    linear,
+                    issue.id,
+                    comment_key,
+                    clarification_comment(issue.identifier, issue.schema),
+                    owner_id=owner_id,
+                )
+                comments.append(comment_id)
+            except Exception as exc:  # noqa: BLE001 - malformed issue must fail open
+                comments.append(None)
+                message = _exception_summary(exc)
+    finally:
+        state.release_claim(issue.id, owner_id)
+
+    return ProcessResult(
+        issue.id,
+        issue.identifier,
+        "schema_invalid",
+        True,
+        False,
+        False,
+        tuple(comments),
+        message=message,
+        issue_url=issue.url,
+    )
+
+
+def process_next_issue_once(
+    *,
+    config: AppConfig,
+    state: StateStore,
+    linear,
+    runner: ShellRunner,
+    owner_id: str,
+    first: int = 10,
+) -> ProcessResult:
+    """Recover pending finalizations, then poll Todo issues and process one candidate."""
+
+    pending = process_pending_finalization_once(config=config, state=state, linear=linear, owner_id=owner_id)
+    if pending is not None:
+        return pending
+
+    active = process_active_work_once(config=config, state=state, linear=linear, runner=runner, owner_id=owner_id)
+    if active is not None:
+        return active
+
+    issues = linear.iter_todo_issues(config.linear, first=first)
+    skipped_invalid = 0
+    skipped_claimed = 0
+    skipped_claimed_reasons: dict[str, int] = {}
+    last_invalid: ProcessResult | None = None
+    for issue in issues:
+        result = process_issue_once(
+            issue=issue,
+            config=config,
+            state=state,
+            linear=linear,
+            runner=runner,
+            owner_id=owner_id,
+        )
+        if result.status == "schema_invalid":
+            skipped_invalid += 1
+            last_invalid = result
+            continue
+        if result.status == "not_claimed":
+            skipped_claimed += 1
+            reason = result.message or "claimed"
+            skipped_claimed_reasons[reason] = skipped_claimed_reasons.get(reason, 0) + 1
+            continue
+        return result
+    if skipped_invalid and not skipped_claimed:
+        assert last_invalid is not None
+        return ProcessResult(
+            last_invalid.issue_id,
+            last_invalid.issue_identifier,
+            "no_executable_candidate",
+            False,
+            False,
+            False,
+            last_invalid.comment_ids,
+            message=f"Skipped {skipped_invalid} schema-invalid issue(s); no valid executable candidate found",
+            issue_url=last_invalid.issue_url,
+        )
+    claimed_detail = "; ".join(f"{reason}={count}" for reason, count in sorted(skipped_claimed_reasons.items()))
+    claimed_summary = f"; skipped_claimed_reasons={claimed_detail}" if claimed_detail else ""
+    return ProcessResult(
+        "",
+        "",
+        "no_candidate",
+        False,
+        False,
+        False,
+        (),
+        message=f"No processable Todo issue found; skipped_invalid={skipped_invalid}; skipped_claimed={skipped_claimed}{claimed_summary}",
+    )
+
+
+def process_active_work_once(
+    *,
+    config: AppConfig,
+    state: StateStore,
+    linear: LinearReporter,
+    runner: ShellRunner,
+    owner_id: str,
+) -> ProcessResult | None:
+    """Resume one locally persisted active work item that may no longer be Todo."""
+
+    for work in state.list_active_work():
+        issue = _issue_from_work(work)
+        stored_key = work["execution_key"]
+        current_key = execution_key(issue, config.runner)
+        if stored_key != current_key:
+            claim = state.acquire_claim(
+                issue.id,
+                owner_id,
+                lease_ttl_seconds=config.lease_ttl_seconds,
+                execution_key=stored_key,
+            )
+            if not claim.acquired:
+                return ProcessResult(
+                    issue.id,
+                    issue.identifier,
+                    "not_claimed",
+                    False,
+                    False,
+                    False,
+                    (),
+                    message=_claim_skip_message(claim.claim, stored_key),
+                    issue_url=issue.url,
+                )
+            return _fail_in_doubt_execution(
+                issue=issue,
+                state=state,
+                linear=linear,
+                owner_id=owner_id,
+                execution_key=stored_key,
+                comments=[],
+                message=_config_drift_message(stored_key, current_key),
+            )
+        return process_issue_once(
+            issue=issue,
+            config=config,
+            state=state,
+            linear=linear,
+            runner=runner,
+            owner_id=owner_id,
+            move_in_progress=_active_work_needs_in_progress_transition(issue, config),
+        )
+    return None
+
+
+def _active_work_needs_in_progress_transition(issue: LinearIssue, config: AppConfig) -> bool:
+    """Retry the In Progress transition unless persisted issue metadata says it already happened."""
+
+    return issue.state_name != config.linear.in_progress_state_name
+
+
+def process_pending_finalization_once(
+    *,
+    config: AppConfig,
+    state: StateStore,
+    linear: LinearReporter,
+    owner_id: str,
+) -> ProcessResult | None:
+    """Finalize one persisted successful runner result without relying on Todo polling."""
+
+    for pending in state.list_pending_finalizations():
+        issue = _issue_from_finalization(pending)
+        claim = state.acquire_claim(
+            issue.id,
+            owner_id,
+            lease_ttl_seconds=config.lease_ttl_seconds,
+            execution_key=pending["execution_key"],
+        )
+        if not claim.acquired:
+            continue
+        result = _runner_result_from_state(pending["result"])
+        states = linear.resolve_workflow_states(config.linear)
+        return _finalize_success(
+            issue=issue,
+            result=result,
+            state=state,
+            linear=linear,
+            owner_id=owner_id,
+            states=states,
+            comments=[],
+            execution_key=pending["execution_key"],
+            pending=state.get_finalization(issue.id, pending["execution_key"]) or pending,
+        )
+    return None
+
+
+class LeaseRenewer:
+    """Renew an active claim on a separate SQLite connection while a runner runs."""
+
+    def __init__(
+        self,
+        db_path: Path,
+        issue_id: str,
+        owner_id: str,
+        lease_ttl_seconds: int,
+        interval_seconds: int,
+    ) -> None:
+        self.db_path = db_path
+        self.issue_id = issue_id
+        self.owner_id = owner_id
+        self.lease_ttl_seconds = lease_ttl_seconds
+        self.interval_seconds = max(0.01, float(interval_seconds))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "LeaseRenewer":
+        self._thread = threading.Thread(target=self._run, name=f"lease-renewer-{self.issue_id}", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=max(1.0, self.interval_seconds + 0.5))
+
+    def _run(self) -> None:
+        with StateStore(self.db_path) as store:
+            while not self._stop.wait(self.interval_seconds):
+                if store.renew_claim(self.issue_id, self.owner_id, lease_ttl_seconds=self.lease_ttl_seconds) is None:
+                    return
+
+
+COMMENT_MARKER_NAMESPACE = "linear-agent-orchestrator/comment/v1"
+
+
+def comment_marker(issue_id: str, comment_key: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(COMMENT_MARKER_NAMESPACE.encode())
+    digest.update(b"\0")
+    digest.update(issue_id.encode())
+    digest.update(b"\0")
+    digest.update(comment_key.encode())
+    return f"<!-- lao-comment:{digest.hexdigest()[:32]} -->"
+
+
+def body_with_comment_marker(issue_id: str, comment_key: str, body: str) -> str:
+    marker = comment_marker(issue_id, comment_key)
+    return body if marker in body else f"{body.rstrip()}\n\n{marker}"
+
+
+def ensure_linear_comment(
+    state: StateStore,
+    linear: LinearReporter,
+    issue_id: str,
+    comment_key: str,
+    body: str,
+    *,
+    owner_id: str | None = None,
+) -> str:
+    """Durably ensure exactly one owned Linear comment exists for a stable key."""
+
+    existing_id = state.ensure_comment_intent(issue_id, comment_key, owner_id=owner_id).comment_id
+    if existing_id:
+        return existing_id
+    marker = comment_marker(issue_id, comment_key)
+    found = _find_comment_by_marker(linear, issue_id, marker)
+    if found is not None:
+        state.mark_comment_sent(issue_id, comment_key, found.id, owner_id=owner_id)
+        return found.id
+    marked_body = body_with_comment_marker(issue_id, comment_key, body)
+    created_id = linear.create_comment(issue_id, marked_body)
+    if created_id:
+        state.mark_comment_sent(issue_id, comment_key, created_id, owner_id=owner_id)
+        return created_id
+    # Defensive fallback for transports that return no ID despite success.
+    found = _find_comment_by_marker(linear, issue_id, marker)
+    if found is not None:
+        state.mark_comment_sent(issue_id, comment_key, found.id, owner_id=owner_id)
+        return found.id
+    raise RuntimeError("Linear commentCreate returned no comment id and marker reconciliation found no comment")
+
+
+def _find_comment_by_marker(linear: LinearReporter, issue_id: str, marker: str) -> LinearComment | None:
+    for comment in linear.list_issue_comments(issue_id):
+        if marker in comment.body:
+            return comment
+    return None
+
+
+def _claim_skip_message(claim, execution_key: str) -> str:
+    if claim.status == "failed" and claim.execution_key == execution_key:
+        return "failed_same_execution_key"
+    if claim.status == "completed":
+        return "completed"
+    if claim.status in {"claimed", "renewed"}:
+        return f"active_lease:{claim.status}"
+    return claim.status
+
+
+def _finalize_success(
+    *,
+    issue: LinearIssue,
+    result: RunnerResult,
+    state: StateStore,
+    linear: LinearReporter,
+    owner_id: str,
+    states: dict[WorkflowRole, WorkflowState],
+    comments: list[str | None],
+    execution_key: str,
+    pending: dict[str, Any] | None,
+) -> ProcessResult:
+    if not result.completed_semantically:
+        message = _failure_summary(result)
+        state.fail_claim(issue.id, owner_id, error=message, execution_key=execution_key)
+        comment_key = f"failure:{execution_key}"
+        if not state.has_comment(issue.id, comment_key):
+            try:
+                comments.append(
+                    ensure_linear_comment(
+                        state,
+                        linear,
+                        issue.id,
+                        comment_key,
+                        failure_comment(result),
+                        owner_id=owner_id,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - fail-closed local state is authoritative
+                comments.append(None)
+        return ProcessResult(
+            issue.id,
+            issue.identifier,
+            "failed",
+            True,
+            False,
+            False,
+            tuple(comments),
+            result,
+            message=message,
+            issue_url=issue.url,
+        )
+    pending = pending or state.get_finalization(issue.id, execution_key)
+    comment_key = f"result:{execution_key}"
+    if not pending or pending.get("result_comment_id") is None:
+        try:
+            comment_id = _ensure_result_comment(
+                state=state,
+                linear=linear,
+                issue_id=issue.id,
+                execution_key=execution_key,
+                comment_key=comment_key,
+                body=result_comment(result),
+                owner_id=owner_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep local pending state for replay
+            return ProcessResult(
+                issue.id,
+                issue.identifier,
+                "finalization_pending",
+                True,
+                True,
+                False,
+                tuple(comments),
+                result,
+                message=_exception_summary(exc),
+                issue_url=issue.url,
+            )
+        comments.append(comment_id)
+        pending = state.get_finalization(issue.id, execution_key) or pending
+
+    refreshed = state.get_finalization(issue.id, execution_key) or pending
+    if refreshed is None:
+        raise RuntimeError(f"finalization state missing for issue {issue.id} and execution {execution_key}")
+    if not refreshed.get("done_transitioned"):
+        try:
+            linear.update_issue_state(issue.id, states[WorkflowRole.DONE].id)
+        except Exception as exc:  # noqa: BLE001 - replay should retry Done without rerunning
+            return ProcessResult(
+                issue.id,
+                issue.identifier,
+                "finalization_pending",
+                True,
+                True,
+                False,
+                tuple(comments),
+                result,
+                message=_exception_summary(exc),
+                issue_url=issue.url,
+            )
+        state.mark_finalization_done(issue.id, execution_key, owner_id=owner_id)
+
+    completed = state.complete_claim(issue.id, owner_id, execution_key=execution_key)
+    if completed is None:
+        return ProcessResult(
+            issue.id,
+            issue.identifier,
+            "finalization_pending",
+            True,
+            True,
+            True,
+            tuple(comments),
+            result,
+            message="claim completion pending",
+            issue_url=issue.url,
+        )
+    return ProcessResult(
+        issue.id,
+        issue.identifier,
+        "completed",
+        True,
+        True,
+        True,
+        tuple(comments),
+        result,
+        issue_url=issue.url,
+    )
+
+
+def _ensure_result_comment(
+    *,
+    state: StateStore,
+    linear: LinearReporter,
+    issue_id: str,
+    execution_key: str,
+    comment_key: str,
+    body: str,
+    owner_id: str | None,
+) -> str:
+    existing_id = state.ensure_comment_intent(issue_id, comment_key, owner_id=owner_id).comment_id
+    if existing_id:
+        state.record_result_comment_finalization(issue_id, execution_key, comment_key, existing_id, owner_id=owner_id)
+        return existing_id
+    marker = comment_marker(issue_id, comment_key)
+    found = _find_comment_by_marker(linear, issue_id, marker)
+    if found is not None:
+        state.record_result_comment_finalization(issue_id, execution_key, comment_key, found.id, owner_id=owner_id)
+        return found.id
+    created_id = linear.create_comment(issue_id, body_with_comment_marker(issue_id, comment_key, body))
+    if created_id:
+        state.record_result_comment_finalization(issue_id, execution_key, comment_key, created_id, owner_id=owner_id)
+        return created_id
+    found = _find_comment_by_marker(linear, issue_id, marker)
+    if found is not None:
+        state.record_result_comment_finalization(issue_id, execution_key, comment_key, found.id, owner_id=owner_id)
+        return found.id
+    raise RuntimeError("Linear commentCreate returned no comment id and marker reconciliation found no result comment")
+
+
+def load_structured_result(result_path: Path) -> tuple[StructuredResult | None, str | None]:
+    """Load and validate the backend-neutral result file without following symlinks."""
+
+    try:
+        if result_path.is_symlink():
+            return None, "structured result path must not be a symlink"
+        if not result_path.is_file():
+            return None, "structured result file was not produced"
+        if result_path.stat().st_size > 1024 * 1024:
+            return None, "structured result file exceeds 1 MiB"
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, f"structured result could not be read: {_sanitize_error_message(str(exc))}"
+    try:
+        return _parse_structured_result_payload(payload), None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def _parse_structured_result_payload(payload: object) -> StructuredResult:
+    if not isinstance(payload, dict):
+        raise ValueError("structured result must be a JSON object")
+    version = payload.get("version")
+    if type(version) is not int or version != 1:
+        raise ValueError("structured result version must be integer 1")
+    status = _required_result_string(payload, "status")
+    allowed_statuses = {"completed", "failed", "blocked", "needs_clarification"}
+    if status not in allowed_statuses:
+        raise ValueError(f"structured result status must be one of {', '.join(sorted(allowed_statuses))}")
+    summary = _required_result_string(payload, "summary")
+    raw_validation = payload.get("validation")
+    if not isinstance(raw_validation, list):
+        raise ValueError("structured result validation must be a JSON array")
+    validation: list[ValidationEvidence] = []
+    for index, item in enumerate(raw_validation):
+        if not isinstance(item, dict):
+            raise ValueError(f"structured result validation[{index}] must be a JSON object")
+        exit_code = item.get("exit_code")
+        if type(exit_code) is not int:
+            raise ValueError(f"structured result validation[{index}].exit_code must be an integer")
+        validation.append(
+            ValidationEvidence(
+                description=_required_result_string(item, "description", prefix=f"validation[{index}]."),
+                command=_required_result_string(item, "command", prefix=f"validation[{index}]."),
+                exit_code=exit_code,
+                evidence=_required_result_string(item, "evidence", prefix=f"validation[{index}]."),
+            )
+        )
+    artifacts = _result_relative_paths(payload, "artifacts")
+    files_changed = _result_relative_paths(payload, "files_changed")
+    return StructuredResult(version, status, summary, tuple(validation), artifacts, files_changed)
+
+
+def _required_result_string(payload: Mapping[str, Any], key: str, *, prefix: str = "") -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"structured result {prefix}{key} must be a nonempty string")
+    return value.strip()
+
+
+def _result_relative_paths(payload: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    values = payload.get(key, [])
+    if not isinstance(values, list):
+        raise ValueError(f"structured result {key} must be a JSON array")
+    normalized: list[str] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"structured result {key}[{index}] must be a nonempty string")
+        candidate = Path(value)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"structured result {key}[{index}] must be a relative path without '..'")
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _structured_result_to_state(result: StructuredResult | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {
+        "version": result.version,
+        "status": result.status,
+        "summary": result.summary,
+        "validation": [
+            {
+                "description": item.description,
+                "command": item.command,
+                "exit_code": item.exit_code,
+                "evidence": item.evidence,
+            }
+            for item in result.validation
+        ],
+        "artifacts": list(result.artifacts),
+        "files_changed": list(result.files_changed),
+    }
+
+
+def _structured_result_from_state(data: object) -> tuple[StructuredResult | None, str | None]:
+    if data is None:
+        return None, None
+    try:
+        return _parse_structured_result_payload(data), None
+    except ValueError as exc:
+        return None, f"persisted structured result is invalid: {exc}"
+
+
+def _runner_result_to_state(result: RunnerResult) -> dict[str, Any]:
+    return {
+        "issue_id": result.issue_id,
+        "issue_identifier": result.issue_identifier,
+        "command": list(result.command),
+        "paths": {
+            "issue_dir": str(result.paths.issue_dir),
+            "inputs_dir": str(result.paths.inputs_dir),
+            "work_dir": str(result.paths.work_dir),
+            "artifacts_dir": str(result.paths.artifacts_dir),
+            "prompt_path": str(result.paths.prompt_path),
+            "context_path": str(result.paths.context_path),
+            "result_path": str(result.paths.result_path),
+        },
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "timed_out": result.timed_out,
+        "timeout_seconds": result.timeout_seconds,
+        "structured_result": _structured_result_to_state(result.structured_result),
+        "result_error": result.result_error,
+    }
+
+
+def _runner_result_from_state(data: dict[str, Any]) -> RunnerResult:
+    paths = data["paths"]
+    structured_result, persisted_result_error = _structured_result_from_state(data.get("structured_result"))
+    return RunnerResult(
+        issue_id=data["issue_id"],
+        issue_identifier=data["issue_identifier"],
+        command=tuple(data.get("command", ())),
+        paths=RunnerPaths(
+            issue_dir=Path(paths["issue_dir"]),
+            inputs_dir=Path(paths["inputs_dir"]),
+            work_dir=Path(paths["work_dir"]),
+            artifacts_dir=Path(paths["artifacts_dir"]),
+            prompt_path=Path(paths["prompt_path"]),
+            context_path=Path(paths["context_path"]),
+            result_path=Path(paths.get("result_path") or Path(paths["artifacts_dir"]) / "result.json"),
+        ),
+        exit_code=data["exit_code"],
+        stdout=data.get("stdout", ""),
+        stderr=data.get("stderr", ""),
+        timed_out=bool(data["timed_out"]),
+        timeout_seconds=int(data["timeout_seconds"]),
+        structured_result=structured_result,
+        result_error=data.get("result_error") or persisted_result_error,
+    )
+
+
+def _issue_to_state(issue: LinearIssue) -> dict[str, Any]:
+    return {
+        "id": issue.id,
+        "identifier": issue.identifier,
+        "title": issue.title,
+        "description": issue.description,
+        "url": issue.url,
+        "updated_at": issue.updated_at,
+        "state_id": issue.state_id,
+        "state_name": issue.state_name,
+        "project_id": issue.project_id,
+        "project_name": issue.project_name,
+        "assignee_id": issue.assignee_id,
+        "assignee_name": issue.assignee_name,
+    }
+
+
+def _issue_to_state_with_workflow(issue: LinearIssue, *, state_id: str | None, state_name: str | None) -> dict[str, Any]:
+    data = _issue_to_state(issue)
+    data["state_id"] = state_id
+    data["state_name"] = state_name
+    return data
+
+
+def _issue_from_finalization(pending: dict[str, Any]) -> LinearIssue:
+    metadata = pending.get("issue") or {}
+    result = pending["result"]
+    description = metadata.get("description") or VALID_RECOVERY_ISSUE_BODY
+    return LinearIssue(
+        id=metadata.get("id") or pending["issue_id"],
+        identifier=metadata.get("identifier") or result.get("issue_identifier") or pending["issue_id"],
+        title=metadata.get("title") or "Pending runner finalization",
+        description=description,
+        url=metadata.get("url"),
+        updated_at=metadata.get("updated_at") or "recovered",
+        state_id=metadata.get("state_id"),
+        state_name=metadata.get("state_name") or "In Progress",
+        project_id=metadata.get("project_id"),
+        project_name=metadata.get("project_name"),
+        schema=validate_issue_body(description),
+        assignee_id=metadata.get("assignee_id"),
+        assignee_name=metadata.get("assignee_name"),
+    )
+
+
+def _issue_from_work(work: dict[str, Any]) -> LinearIssue:
+    metadata = work.get("issue") or {}
+    description = metadata.get("description") or VALID_RECOVERY_ISSUE_BODY
+    return LinearIssue(
+        id=metadata.get("id") or work["issue_id"],
+        identifier=metadata.get("identifier") or work["issue_id"],
+        title=metadata.get("title") or "Active runner work",
+        description=description,
+        url=metadata.get("url"),
+        updated_at=metadata.get("updated_at") or "recovered",
+        state_id=metadata.get("state_id"),
+        state_name=metadata.get("state_name") or "In Progress",
+        project_id=metadata.get("project_id"),
+        project_name=metadata.get("project_name"),
+        schema=validate_issue_body(description),
+        assignee_id=metadata.get("assignee_id"),
+        assignee_name=metadata.get("assignee_name"),
+    )
+
+
+VALID_RECOVERY_ISSUE_BODY = """## Task
+Recover a previously successful runner finalization.
+
+## Acceptance Criteria
+- Evidence comment and Done transition are retried without rerunning.
+
+## Validation
+- Local finalization state completes.
+"""
+
+
+def render_command_template(template: str, values: dict[str, str]) -> list[str]:
+    """Render a strict no-shell command template.
+
+    The template is tokenized before placeholder replacement. A placeholder token
+    must be exactly `{name}`; embedding placeholders in larger shell fragments is
+    rejected to prevent issue metadata from altering tokenization or control flow.
+    """
+
+    try:
+        tokens = shlex.split(template, posix=True)
+    except ValueError as exc:
+        raise RunnerError(f"Invalid runner command template: {exc}") from exc
+    if not tokens:
+        raise RunnerError("RUNNER_COMMAND_TEMPLATE must not be empty")
+    rendered: list[str] = []
+    for token in tokens:
+        placeholders = re.findall(r"{([^{}]+)}", token)
+        unknown = set(placeholders) - _PLACEHOLDERS
+        if unknown:
+            raise RunnerError(f"Unknown runner command placeholder(s): {', '.join(sorted(unknown))}")
+        if placeholders:
+            if len(placeholders) != 1 or token != "{" + placeholders[0] + "}":
+                raise RunnerError(f"Unsafe embedded runner placeholder token: {token!r}")
+            rendered.append(values[placeholders[0]])
+        else:
+            rendered.append(token)
+    return rendered
+
+
+def build_allowlisted_env(allowed_env: tuple[str, ...]) -> dict[str, str]:
+    return {key: os.environ[key] for key in allowed_env if key in os.environ}
+
+
+def _remove_issue_dir(issue_dir: Path) -> None:
+    """Remove only the per-issue runner directory, even after read-only inputs.
+
+    ``materialize`` intentionally leaves prompt/context files and their parent
+    inputs directory read-only for the subprocess. A later run for the same
+    issue identifier must still be able to replace that per-issue directory, so
+    restore owner write permissions under that boundary before removal.
+    """
+
+    if issue_dir.is_symlink():
+        issue_dir.unlink()
+        return
+    for root, dirs, files in os.walk(issue_dir, topdown=False, followlinks=False):
+        root_path = Path(root)
+        for name in files:
+            _restore_owner_write(root_path / name, is_dir=False)
+        for name in dirs:
+            _restore_owner_write(root_path / name, is_dir=True)
+        _restore_owner_write(root_path, is_dir=True)
+    shutil.rmtree(issue_dir)
+
+
+def _restore_owner_write(path: Path, *, is_dir: bool) -> None:
+    try:
+        if path.is_symlink():
+            return
+        mode = path.stat().st_mode
+        path.chmod(mode | (0o700 if is_dir else 0o600))
+    except FileNotFoundError:
+        return
+
+
+def render_prompt(
+    issue: LinearIssue,
+    *,
+    project_dir: str = "/workspace/project",
+    result_path: Path | str = "/workspace/artifacts/result.json",
+) -> str:
+    return "\n".join(
+        [
+            f"# Linear Issue {issue.identifier}",
+            "",
+            f"Title: {issue.title}",
+            f"URL: {issue.url or ''}",
+            "",
+            "## Trusted Workspace",
+            f"The only trusted repository is mounted at `{project_dir}`. Work only inside that repository.",
+            "If the issue mentions another absolute repository path, treat it as referring to this configured workspace.",
+            "Do not access other host paths, push changes, create or merge pull requests, or use a Docker socket.",
+            "",
+            "## Task",
+            issue.schema.parsed.get("Task"),
+            "",
+            "## Acceptance Criteria",
+            issue.schema.parsed.get("Acceptance Criteria"),
+            "",
+            "## Validation",
+            issue.schema.parsed.get("Validation"),
+            "",
+            "## Required Structured Result",
+            f"Before finishing, write a JSON result to `{result_path}` with this exact contract:",
+            "```json",
+            '{"version":1,"status":"completed|failed|blocked|needs_clarification","summary":"outcome",'
+            '"validation":[{"description":"check","command":"command","exit_code":0,"evidence":"output"}],'
+            '"artifacts":["relative/path"],"files_changed":["relative/path"]}',
+            "```",
+            "Linear moves to Done only for status `completed` with nonempty validation evidence and all exit codes equal to 0.",
+            "Transport exit code 0 without this file is a failure.",
+            "",
+        ]
+    )
+
+
+def render_context(
+    issue: LinearIssue,
+    *,
+    project_dir: str = "/workspace/project",
+    result_path: Path | str = "/workspace/artifacts/result.json",
+) -> dict[str, object]:
+    return {
+        "issue": {
+            "id": issue.id,
+            "identifier": issue.identifier,
+            "title": issue.title,
+            "url": issue.url,
+            "updated_at": issue.updated_at,
+            "state": {"id": issue.state_id, "name": issue.state_name},
+            "project": {"id": issue.project_id, "name": issue.project_name},
+            "assignee": {"id": issue.assignee_id, "name": issue.assignee_name},
+        },
+        "workspace": {"project_dir": project_dir, "trusted_repository_count": 1},
+        "result_contract": {"version": 1, "path": str(result_path)},
+        "sections": {
+            "task": issue.schema.parsed.get("Task"),
+            "acceptance_criteria": issue.schema.parsed.get("Acceptance Criteria"),
+            "validation": issue.schema.parsed.get("Validation"),
+        },
+    }
+
+
+def execution_key(issue: LinearIssue, runner_config: RunnerConfig) -> str:
+    digest = hashlib.sha256()
+    digest.update(issue.id.encode())
+    digest.update(b"\0")
+    digest.update(issue.updated_at.encode())
+    digest.update(b"\0")
+    digest.update(issue.description.encode())
+    digest.update(b"\0")
+    digest.update((runner_config.command_template or "").encode())
+    digest.update(b"\0")
+    digest.update(runner_config.project_dir.encode())
+    digest.update(b"\0")
+    digest.update(runner_config.backend.encode())
+    return digest.hexdigest()
+
+
+def start_comment(issue: LinearIssue) -> str:
+    return f"Started processing `{issue.identifier}` with the generic shell runner."
+
+
+def result_comment(result: RunnerResult) -> str:
+    return _result_body("Runner completed successfully", result)
+
+
+def workspace_preflight_comment(issue: LinearIssue, errors: list[str]) -> str:
+    details = "\n".join(f"- {redact_sensitive_text(error)}" for error in errors)
+    return "\n".join(
+        [
+            "Agent workspace preflight blocked execution",
+            "",
+            f"Issue: `{issue.identifier}`",
+            details,
+            "",
+            "The runner was not invoked and the issue was not moved to Done.",
+            "Clean or repair the configured trusted repository; the same execution can then be retried.",
+        ]
+    )
+
+
+def failure_comment(result: RunnerResult) -> str:
+    if result.timed_out:
+        title = "Runner timed out"
+    elif result.succeeded:
+        title = "Runner did not report semantic completion"
+    else:
+        title = "Runner failed"
+    return _result_body(title, result)
+
+
+def in_doubt_failure_comment(issue: LinearIssue, message: str) -> str:
+    return "\n".join(
+        [
+            "Runner recovery failed closed because prior execution state is in doubt",
+            "",
+            f"Issue: `{issue.identifier}`",
+            f"Error: `{_sanitize_error_message(message)}`",
+            "",
+            "The runner was not invoked and the issue was not moved to Done.",
+            "Edit the Linear issue or change the runner command to create a new execution key and retry.",
+        ]
+    )
+
+
+def _result_body(title: str, result: RunnerResult) -> str:
+    lines = [
+        title,
+        "",
+        f"Issue: `{result.issue_identifier}`",
+        f"Exit code: `{result.exit_code}`",
+        f"Timed out: `{result.timed_out}`",
+        f"Artifacts: `{result.paths.artifacts_dir}`",
+        f"Structured result: `{result.paths.result_path}`",
+    ]
+    stdout = _truncate(redact_sensitive_text(result.stdout.strip()))
+    stderr = _truncate(redact_sensitive_text(result.stderr.strip()))
+    if stdout:
+        lines.extend(["", "Stdout:", "```", stdout, "```"])
+    if stderr:
+        lines.extend(["", "Stderr:", "```", stderr, "```"])
+    if result.result_error:
+        lines.extend(["", f"Result contract error: `{_sanitize_error_message(result.result_error)}`"])
+    if result.structured_result is not None:
+        lines.extend(
+            [
+                "",
+                f"Semantic status: `{result.structured_result.status}`",
+                f"Summary: {redact_sensitive_text(result.structured_result.summary)}",
+                "Validation:",
+            ]
+        )
+        lines.extend(
+            f"- `{item.command}` -> `{item.exit_code}`: {redact_sensitive_text(item.evidence)}"
+            for item in result.structured_result.validation
+        )
+    return "\n".join(lines)
+
+
+def exception_failure_comment(issue: LinearIssue, exc: BaseException) -> str:
+    return "\n".join(
+        [
+            "Runner setup or execution failed before a successful result was produced",
+            "",
+            f"Issue: `{issue.identifier}`",
+            f"Error type: `{type(exc).__name__}`",
+            f"Error: `{_sanitize_error_message(str(exc))}`",
+            "",
+            "The issue was not moved to Done.",
+        ]
+    )
+
+
+def _exception_summary(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {_sanitize_error_message(str(exc))}"
+
+
+def _sanitize_error_message(message: str, limit: int = 500) -> str:
+    sanitized = redact_sensitive_text(message).replace("`", "'").replace("\n", " ").replace("\r", " ")
+    return _truncate(sanitized, limit)
+
+
+def redact_sensitive_text(value: str) -> str:
+    if not value:
+        return value
+    redacted = value
+    sensitive_names = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|API_KEY)", re.IGNORECASE)
+    for key, secret in os.environ.items():
+        if sensitive_names.search(key) and secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = re.sub(
+        r"(?i)([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*\\s*[=:]\\s*)([^\\s`'\";]+)",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    return redacted
+
+
+def _failure_summary(result: RunnerResult) -> str:
+    if result.timed_out:
+        return f"runner timed out after {result.timeout_seconds}s"
+    if result.succeeded:
+        return result.result_error or _semantic_failure_reason(result.structured_result)
+    return f"runner exited with code {result.exit_code}"
+
+
+def _semantic_failure_reason(result: StructuredResult | None) -> str:
+    if result is None:
+        return "runner did not report semantic completion"
+    if result.status != "completed":
+        return f"structured result status was {result.status!r}"
+    if not result.validation:
+        return "structured result completed without validation evidence"
+    failed = [item for item in result.validation if item.exit_code != 0 or not item.evidence.strip()]
+    if failed:
+        return "structured result validation did not pass"
+    return "runner did not report semantic completion"
+
+
+def _truncate(value: str, limit: int = 4000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n... <truncated>"
+
+
+def sanitize_path_part(value: str) -> str:
+    sanitized = _SAFE_PATH_PART_RE.sub("-", value).strip(".-")
+    return sanitized or "issue"

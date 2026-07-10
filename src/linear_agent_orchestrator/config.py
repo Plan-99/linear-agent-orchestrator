@@ -1,0 +1,395 @@
+"""Configuration loading for the Linear Agent Orchestrator.
+
+This module intentionally avoids runtime third-party dependencies. Values are
+loaded from process environment with optional .env files for local development;
+secret values are never required to be committed to source.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Mapping, MutableMapping
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+
+
+DEFAULT_POLL_INTERVAL_SECONDS = 60
+DEFAULT_LEASE_TTL_SECONDS = 900
+DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS = 120
+DEFAULT_RUNNER_TIMEOUT_SECONDS = 3600
+DEFAULT_BACKOFF_INITIAL_SECONDS = 5
+DEFAULT_BACKOFF_MAX_SECONDS = 300
+DEFAULT_BACKOFF_MAX_ATTEMPTS = 5
+_RUNNER_PLACEHOLDERS = {
+    "prompt_path",
+    "context_path",
+    "artifacts_dir",
+    "result_path",
+    "issue_id",
+    "issue_identifier",
+}
+
+
+@dataclass(frozen=True)
+class BackoffConfig:
+    """Retry/backoff defaults for transient Linear or runner infrastructure errors."""
+
+    initial_seconds: int = DEFAULT_BACKOFF_INITIAL_SECONDS
+    max_seconds: int = DEFAULT_BACKOFF_MAX_SECONDS
+    max_attempts: int = DEFAULT_BACKOFF_MAX_ATTEMPTS
+
+
+@dataclass(frozen=True)
+class LinearConfig:
+    """Linear API and queue targeting configuration."""
+
+    api_key: str | None = None
+    team_id: str | None = None
+    project_name: str | None = None
+    project_id: str | None = None
+    queue_state_name: str = "Todo"
+    in_progress_state_name: str = "In Progress"
+    done_state_name: str = "Done"
+    assignee_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RunnerConfig:
+    """Generic shell runner configuration placeholders for later stories."""
+
+    command_template: str | None = None
+    timeout_seconds: int = DEFAULT_RUNNER_TIMEOUT_SECONDS
+    work_dir: str = "/workspace/work"
+    artifacts_dir: str = "/workspace/artifacts"
+    allowed_env: tuple[str, ...] = field(default_factory=tuple)
+    project_dir: str = "/workspace/project"
+    backend: str = "omx"
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Complete application configuration for startup checks."""
+
+    environment: str = "local"
+    log_level: str = "INFO"
+    log_format: str = "json"
+    state_db_path: str = "/workspace/data/state.sqlite3"
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS
+    lease_renewal_interval_seconds: int = DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS
+    backoff: BackoffConfig = field(default_factory=BackoffConfig)
+    linear: LinearConfig = field(default_factory=LinearConfig)
+    runner: RunnerConfig = field(default_factory=RunnerConfig)
+
+    def validate_startup(self, require_secrets: bool = True) -> list[str]:
+        """Return human-readable startup validation errors.
+
+        G001 validates wiring only. Later stories will validate Linear connectivity,
+        project existence, and runner execution semantics.
+        """
+
+        errors: list[str] = []
+        if self.poll_interval_seconds <= 0:
+            errors.append("poll_interval_seconds must be positive")
+        if self.lease_ttl_seconds <= 0:
+            errors.append("lease_ttl_seconds must be positive")
+        if self.lease_renewal_interval_seconds <= 0:
+            errors.append("lease_renewal_interval_seconds must be positive")
+        if self.lease_renewal_interval_seconds >= self.lease_ttl_seconds:
+            errors.append("lease_renewal_interval_seconds must be less than lease_ttl_seconds")
+        if self.runner.timeout_seconds <= 0:
+            errors.append("runner_timeout_seconds must be positive")
+        if self.backoff.initial_seconds <= 0:
+            errors.append("backoff.initial_seconds must be positive")
+        if self.backoff.max_seconds < self.backoff.initial_seconds:
+            errors.append("backoff.max_seconds must be >= backoff.initial_seconds")
+        if self.backoff.max_attempts <= 0:
+            errors.append("backoff.max_attempts must be positive")
+        if require_secrets:
+            if not self.linear.api_key:
+                errors.append("LINEAR_API_KEY is required")
+            if not self.linear.team_id:
+                errors.append("LINEAR_TEAM_ID is required")
+            if not (self.linear.project_name or self.linear.project_id):
+                errors.append("LINEAR_PROJECT_NAME or LINEAR_PROJECT_ID is required")
+            if not self.runner.command_template:
+                errors.append("RUNNER_COMMAND_TEMPLATE is required")
+        if self.runner.command_template:
+            try:
+                rendered = validate_runner_command_template(self.runner.command_template)
+                if shutil.which(rendered[0]) is None:
+                    errors.append(f"Runner executable not found on PATH: {rendered[0]}")
+                elif Path(rendered[0]).name == "lao-agent-runner":
+                    errors.extend(validate_agent_runtime(self.runner, require_auth=require_secrets))
+            except ValueError as exc:
+                errors.append(str(exc))
+        return errors
+
+    def redacted_dict(self) -> dict[str, object]:
+        """Return a serialization-safe dict with secrets redacted."""
+
+        data = asdict(self)
+        if self.linear.api_key:
+            data["linear"]["api_key"] = "***REDACTED***"  # type: ignore[index]
+        return data
+
+
+def validate_runner_command_template(template: str) -> list[str]:
+    """Validate runner template tokenization/placeholders without executing it."""
+
+    dummy_values = {
+        "prompt_path": "/tmp/lao-startup/prompt.md",
+        "context_path": "/tmp/lao-startup/context.json",
+        "artifacts_dir": "/tmp/lao-startup/artifacts",
+        "result_path": "/tmp/lao-startup/artifacts/result.json",
+        "issue_id": "issue-startup-check",
+        "issue_identifier": "DEV-STARTUP",
+    }
+    try:
+        tokens = shlex.split(template, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Invalid runner command template: {exc}") from exc
+    if not tokens:
+        raise ValueError("RUNNER_COMMAND_TEMPLATE must not be empty")
+    rendered: list[str] = []
+    for token in tokens:
+        placeholders = re.findall(r"{([^{}]+)}", token)
+        unknown = set(placeholders) - _RUNNER_PLACEHOLDERS
+        if unknown:
+            raise ValueError(f"Unknown runner command placeholder(s): {', '.join(sorted(unknown))}")
+        if placeholders:
+            if len(placeholders) != 1 or token != "{" + placeholders[0] + "}":
+                raise ValueError(f"Unsafe embedded runner placeholder token: {token!r}")
+            rendered.append(dummy_values[placeholders[0]])
+        else:
+            rendered.append(token)
+    return rendered
+
+
+def load_dotenv_file(path: Path) -> dict[str, str]:
+    """Parse a small dotenv file without expanding variables or shelling out.
+
+    Supports `KEY=value`, optional `export KEY=value`, comments, blank lines,
+    and shell-like quoting via `shlex.split`. Missing files are ignored.
+    """
+
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            raise ValueError(f"Invalid dotenv line {line_number} in {path}: missing '='")
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Invalid dotenv line {line_number} in {path}: empty key")
+        try:
+            parsed = shlex.split(raw_value, comments=False, posix=True)
+        except ValueError as exc:
+            raise ValueError(f"Invalid dotenv line {line_number} in {path}: {exc}") from exc
+        values[key] = parsed[0] if parsed else ""
+    return values
+
+
+def merged_environment(
+    env: Mapping[str, str] | None = None,
+    env_files: list[Path] | None = None,
+) -> dict[str, str]:
+    """Merge dotenv files then non-empty environment values with env precedence."""
+
+    merged: dict[str, str] = {}
+    for env_file in env_files or []:
+        merged.update(load_dotenv_file(env_file))
+    for key, value in dict(env or os.environ).items():
+        if value != "":
+            merged[key] = value
+    return merged
+
+
+def load_config(
+    env: Mapping[str, str] | None = None,
+    env_files: list[Path] | None = None,
+) -> AppConfig:
+    """Load application configuration from environment and optional dotenv files."""
+
+    source = merged_environment(env=env, env_files=env_files)
+
+    return AppConfig(
+        environment=_get_str(source, "APP_ENV", "local"),
+        log_level=_get_str(source, "LOG_LEVEL", "INFO").upper(),
+        log_format=_get_str(source, "LOG_FORMAT", "json"),
+        state_db_path=_get_str(source, "STATE_DB_PATH", "/workspace/data/state.sqlite3"),
+        poll_interval_seconds=_get_int(source, "POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL_SECONDS),
+        lease_ttl_seconds=_get_int(source, "LEASE_TTL_SECONDS", DEFAULT_LEASE_TTL_SECONDS),
+        lease_renewal_interval_seconds=_get_int(
+            source,
+            "LEASE_RENEWAL_INTERVAL_SECONDS",
+            DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS,
+        ),
+        backoff=BackoffConfig(
+            initial_seconds=_get_int(source, "BACKOFF_INITIAL_SECONDS", DEFAULT_BACKOFF_INITIAL_SECONDS),
+            max_seconds=_get_int(source, "BACKOFF_MAX_SECONDS", DEFAULT_BACKOFF_MAX_SECONDS),
+            max_attempts=_get_int(source, "BACKOFF_MAX_ATTEMPTS", DEFAULT_BACKOFF_MAX_ATTEMPTS),
+        ),
+        linear=LinearConfig(
+            api_key=_get_optional_str(source, "LINEAR_API_KEY"),
+            team_id=_get_optional_str(source, "LINEAR_TEAM_ID"),
+            project_name=_get_optional_str(source, "LINEAR_PROJECT_NAME"),
+            project_id=_get_optional_str(source, "LINEAR_PROJECT_ID"),
+            queue_state_name=_get_str(source, "LINEAR_QUEUE_STATE_NAME", "Todo"),
+            in_progress_state_name=_get_str(source, "LINEAR_IN_PROGRESS_STATE_NAME", "In Progress"),
+            done_state_name=_get_str(source, "LINEAR_DONE_STATE_NAME", "Done"),
+            assignee_id=_get_optional_str(source, "LINEAR_ASSIGNEE_ID"),
+        ),
+        runner=RunnerConfig(
+            command_template=_get_optional_str(source, "RUNNER_COMMAND_TEMPLATE"),
+            timeout_seconds=_get_int(source, "RUNNER_TIMEOUT_SECONDS", DEFAULT_RUNNER_TIMEOUT_SECONDS),
+            work_dir=_get_str(source, "RUNNER_WORK_DIR", "/workspace/work"),
+            artifacts_dir=_get_str(source, "RUNNER_ARTIFACTS_DIR", "/workspace/artifacts"),
+            allowed_env=_get_csv_tuple(source, "RUNNER_ALLOWED_ENV"),
+            project_dir=_get_str(source, "AGENT_PROJECT_DIR", "/workspace/project"),
+            backend=_get_str(source, "AGENT_BACKEND", "omx").casefold(),
+        ),
+    )
+
+
+def apply_env_file_to_process(path: Path, environ: MutableMapping[str, str] | None = None) -> None:
+    """Load env file values into a process-like mapping without overriding keys."""
+
+    target = environ if environ is not None else os.environ
+    for key, value in load_dotenv_file(path).items():
+        target.setdefault(key, value)
+
+
+def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[str]:
+    """Validate the fixed-workspace agent backend before any issue is claimed."""
+
+    errors: list[str] = []
+    if runner.backend not in {"omx", "codex", "claude"}:
+        return [f"Unsupported AGENT_BACKEND: {runner.backend!r}"]
+
+    project_dir = Path(runner.project_dir)
+    errors.extend(validate_project_workspace(project_dir))
+
+    missing_tools = [tool for tool in ("rg", "ps") if shutil.which(tool) is None]
+    if missing_tools:
+        errors.append(f"Missing required worker tooling: {', '.join(missing_tools)}")
+    backend_tools = ("omx", "codex") if runner.backend == "omx" else (runner.backend,)
+    for tool in backend_tools:
+        if shutil.which(tool) is None:
+            errors.append(f"Agent backend CLI not found on PATH: {tool}")
+
+    if runner.backend == "omx" and shutil.which("omx") is not None:
+        omx_list = _run_preflight_command(("omx", "list", "--json"))
+        if omx_list[0] != 0:
+            errors.append(f"OMX setup check failed: {_preflight_output(omx_list)}")
+        else:
+            try:
+                catalog = json.loads(omx_list[1])
+                skills = catalog.get("skills") if isinstance(catalog, dict) else None
+                analyze_active = any(
+                    isinstance(skill, dict) and skill.get("name") == "analyze" and skill.get("status") == "active"
+                    for skill in (skills or [])
+                )
+                if not analyze_active:
+                    errors.append("OMX setup is missing the active analyze skill")
+            except json.JSONDecodeError:
+                errors.append("OMX setup check returned invalid JSON")
+
+    if require_auth and runner.backend in {"omx", "codex"} and shutil.which("codex") is not None:
+        auth_check = _run_preflight_command(("codex", "login", "status"))
+        if auth_check[0] != 0:
+            errors.append(f"Codex authentication check failed: {_preflight_output(auth_check)}")
+    if require_auth and runner.backend == "claude" and shutil.which("claude") is not None:
+        auth_check = _run_preflight_command(("claude", "auth", "status", "--json"))
+        if auth_check[0] != 0:
+            errors.append(f"Claude authentication check failed: {_preflight_output(auth_check)}")
+        else:
+            try:
+                auth_status = json.loads(auth_check[1])
+                if not isinstance(auth_status, dict) or auth_status.get("loggedIn") is not True:
+                    errors.append("Claude authentication check reported loggedIn=false")
+            except json.JSONDecodeError:
+                errors.append("Claude authentication check returned invalid JSON")
+    return errors
+
+
+def validate_project_workspace(project_dir: str | Path) -> list[str]:
+    """Validate the trusted repository path and require a clean git worktree."""
+
+    path = Path(project_dir)
+    errors: list[str] = []
+    if not path.is_absolute():
+        errors.append("AGENT_PROJECT_DIR must be an absolute path")
+    if not path.is_dir():
+        errors.append(f"Agent project directory does not exist: {path}")
+        return errors
+    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+        errors.append(f"Agent project directory is not readable and writable: {path}")
+    if shutil.which("git") is None:
+        errors.append("Missing required worker tooling: git")
+        return errors
+    git_check = _run_preflight_command(("git", "-C", str(path), "rev-parse", "--is-inside-work-tree"))
+    if git_check[0] != 0 or git_check[1].strip() != "true":
+        errors.append(f"Agent project directory is not a git worktree: {path}")
+        return errors
+    git_status = _run_preflight_command(("git", "-C", str(path), "status", "--porcelain"))
+    if git_status[0] != 0:
+        errors.append(f"Could not inspect agent project git status: {_preflight_output(git_status)}")
+    elif git_status[1].strip():
+        errors.append(f"Agent project git worktree is dirty: {path}")
+    return errors
+
+
+def _run_preflight_command(command: tuple[str, ...]) -> tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _preflight_output(result: tuple[int, str, str]) -> str:
+    value = (result[2] or result[1]).strip().replace("\n", " ")
+    return value[:300] or f"exit code {result[0]}"
+
+
+def _get_optional_str(source: Mapping[str, str], key: str) -> str | None:
+    value = source.get(key)
+    return value if value else None
+
+
+def _get_str(source: Mapping[str, str], key: str, default: str) -> str:
+    return source.get(key) or default
+
+
+def _get_int(source: Mapping[str, str], key: str, default: int) -> int:
+    raw = source.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer, got {raw!r}") from exc
+
+
+def _get_csv_tuple(source: Mapping[str, str], key: str) -> tuple[str, ...]:
+    raw = source.get(key, "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())

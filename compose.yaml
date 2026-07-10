@@ -1,0 +1,92 @@
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LAO_UID: ${LAO_UID:-1000}
+        LAO_GID: ${LAO_GID:-1000}
+    image: linear-agent-orchestrator:local
+    # Non-root: run as the host user so bind-mounted files are host-owned.
+    user: "${LAO_UID:-1000}:${LAO_GID:-1000}"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    working_dir: /workspace/project
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      STATE_DB_PATH: ${STATE_DB_PATH:-/workspace/data/state.sqlite3}
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_TEAM_ID: ${LINEAR_TEAM_ID:-}
+      # Only issues assigned to this user are polled; empty means the API
+      # viewer (the user owning LINEAR_API_KEY).
+      LINEAR_ASSIGNEE_ID: ${LINEAR_ASSIGNEE_ID:-}
+      LINEAR_PROJECT_NAME: ${LINEAR_PROJECT_NAME:-}
+      LINEAR_PROJECT_ID: ${LINEAR_PROJECT_ID:-}
+      LINEAR_QUEUE_STATE_NAME: ${LINEAR_QUEUE_STATE_NAME:-Todo}
+      LINEAR_IN_PROGRESS_STATE_NAME: ${LINEAR_IN_PROGRESS_STATE_NAME:-In Progress}
+      LINEAR_DONE_STATE_NAME: ${LINEAR_DONE_STATE_NAME:-Done}
+      RUNNER_COMMAND_TEMPLATE: ${RUNNER_COMMAND_TEMPLATE:-}
+      RUNNER_WORK_DIR: ${RUNNER_WORK_DIR:-/workspace/work}
+      RUNNER_ARTIFACTS_DIR: ${RUNNER_ARTIFACTS_DIR:-/workspace/artifacts}
+      RUNNER_ALLOWED_ENV: ${RUNNER_ALLOWED_ENV:-}
+      AGENT_BACKEND: ${AGENT_BACKEND:-omx}
+      AGENT_MODEL: ${AGENT_MODEL:-}
+      AGENT_PROJECT_DIR: ${AGENT_PROJECT_DIR:-/workspace/project}
+      AGENT_SANDBOX: ${AGENT_SANDBOX:-workspace-write}
+      AGENT_PERMISSION_MODE: ${AGENT_PERMISSION_MODE:-acceptEdits}
+      # Docker is the security boundary; agent CLIs bypass permissions inside.
+      AGENT_BYPASS_PERMISSIONS: ${AGENT_BYPASS_PERMISSIONS:-true}
+      HOME: /home/agent
+      CODEX_HOME: /home/agent/.codex
+    volumes:
+      # Orchestrator-local runtime state (never issue-controlled paths).
+      - ${LAO_RUNTIME_DIR:-./.runtime}/data:/workspace/data
+      - ${LAO_RUNTIME_DIR:-./.runtime}/work:/workspace/work
+      - ${LAO_RUNTIME_DIR:-./.runtime}/artifacts:/workspace/artifacts
+      # Dedicated persistent agent home with credential copies; never the live
+      # host CLI homes. Seeded by scripts/bootstrap.sh.
+      - ${LAO_RUNTIME_DIR:-./.runtime}/agent-home:/home/agent
+      # Exactly one fixed, trusted repository per daemon. No Docker socket.
+      - ${LAO_PROJECT_DIR:-.}:/workspace/project
+    command: ["startup-check", "--allow-missing-secrets"]
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LAO_UID: ${LAO_UID:-1000}
+        LAO_GID: ${LAO_GID:-1000}
+    image: linear-agent-orchestrator:local
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      APP_ENV: test
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
+      STATE_DB_PATH: /tmp/lao-tests/state.sqlite3
+      LINEAR_API_KEY: ""
+      LINEAR_TEAM_ID: ""
+      LINEAR_ASSIGNEE_ID: ""
+      LINEAR_PROJECT_NAME: ""
+      LINEAR_PROJECT_ID: ""
+      LINEAR_QUEUE_STATE_NAME: Todo
+      LINEAR_IN_PROGRESS_STATE_NAME: In Progress
+      LINEAR_DONE_STATE_NAME: Done
+      RUNNER_COMMAND_TEMPLATE: ""
+      RUNNER_WORK_DIR: /tmp/lao-tests/work
+      RUNNER_ARTIFACTS_DIR: /tmp/lao-tests/artifacts
+      RUNNER_ALLOWED_ENV: ""
+    command: ["pytest", "-q"]
+    entrypoint: []

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local OMX orchestration/session state
+.omx/
+
+# Project-local runtime state and artifacts. Directory skeleton is kept so the
+# project can be deployed from this folder without external absolute paths.
+data/
+artifacts/
+work/
+logs/
+.runtime/*
+!.runtime/data/
+!.runtime/work/
+!.runtime/artifacts/
+!.runtime/logs/
+.runtime/data/*
+.runtime/work/*
+.runtime/artifacts/*
+.runtime/logs/*
+.runtime/agent-home/*
+!.runtime/data/.gitkeep
+!.runtime/work/.gitkeep
+!.runtime/artifacts/.gitkeep
+!.runtime/logs/.gitkeep
+
+# Secrets and local-only env files
+.env
+.env.*
+!.env.example
+.docker-secrets/
