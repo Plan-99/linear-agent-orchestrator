@@ -34,6 +34,7 @@ def workflow_response():
                         {"id": "state-todo", "name": "Todo", "type": "unstarted"},
                         {"id": "state-started", "name": "In Progress", "type": "started"},
                         {"id": "state-done", "name": "Done", "type": "completed"},
+                        {"id": "state-review", "name": "In Review", "type": "started"},
                     ]
                 }
             }
@@ -105,9 +106,21 @@ def test_resolves_and_caches_team_workflow_state_ids():
     assert first[WorkflowRole.QUEUE].id == "state-todo"
     assert first[WorkflowRole.IN_PROGRESS].id == "state-started"
     assert first[WorkflowRole.DONE].id == "state-done"
+    assert first[WorkflowRole.ATTENTION].id == "state-review"
     assert second[WorkflowRole.QUEUE].id == "state-todo"
     assert len(transport.calls) == 1
     assert "states" in transport.calls[0]["query"]
+
+
+def test_missing_attention_workflow_state_fails_required_state_resolution():
+    response = workflow_response()
+    response["data"]["team"]["states"]["nodes"] = [
+        state for state in response["data"]["team"]["states"]["nodes"] if state["name"] != "In Review"
+    ]
+    client = LinearClient(MockTransport([response]))
+
+    with pytest.raises(LinearGraphQLError, match="attention/In Review workflow state named 'In Review'"):
+        client.resolve_workflow_states(LinearConfig(team_id="DEV", project_name="TEST"))
 
 
 def test_poll_todo_issues_filters_project_state_and_viewer_assignee_orders_by_updated_at():

@@ -45,15 +45,18 @@ class FakeLinear:
     def __init__(self):
         self.comments = []
         self.state_updates = []
+        self.events = []
         self.states = {
             WorkflowRole.QUEUE: WorkflowState("state-todo", "Todo", "unstarted"),
             WorkflowRole.IN_PROGRESS: WorkflowState("state-started", "In Progress", "started"),
             WorkflowRole.DONE: WorkflowState("state-done", "Done", "completed"),
+            WorkflowRole.ATTENTION: WorkflowState("state-review", "In Review", "started"),
         }
 
     def create_comment(self, issue_id, body):
         comment_id = f"comment-{len(self.comments) + 1}"
         self.comments.append({"id": comment_id, "issue_id": issue_id, "body": body})
+        self.events.append(("comment", body))
         return comment_id
 
     def list_issue_comments(self, issue_id, *, first=50):
@@ -61,6 +64,7 @@ class FakeLinear:
 
     def update_issue_state(self, issue_id, state_id):
         self.state_updates.append({"issue_id": issue_id, "state_id": state_id})
+        self.events.append(("state", state_id))
         return True
 
     def resolve_workflow_states(self, config):
@@ -68,13 +72,14 @@ class FakeLinear:
 
 
 class FlakyLinear(FakeLinear):
-    def __init__(self, *, fail_start_comments=0, fail_result_comments=0, fail_failure_comments=0, fail_schema_comments=0, fail_done=0):
+    def __init__(self, *, fail_start_comments=0, fail_result_comments=0, fail_failure_comments=0, fail_schema_comments=0, fail_done=0, fail_attention=0):
         super().__init__()
         self.fail_start_comments = fail_start_comments
         self.fail_result_comments = fail_result_comments
         self.fail_failure_comments = fail_failure_comments
         self.fail_schema_comments = fail_schema_comments
         self.fail_done = fail_done
+        self.fail_attention = fail_attention
 
     def create_comment(self, issue_id, body):
         if "Started processing" in body and self.fail_start_comments:
@@ -92,6 +97,9 @@ class FlakyLinear(FakeLinear):
         return super().create_comment(issue_id, body)
 
     def update_issue_state(self, issue_id, state_id):
+        if state_id == self.states[WorkflowRole.ATTENTION].id and self.fail_attention:
+            self.fail_attention -= 1
+            raise RuntimeError("transient attention failure")
         if state_id == self.states[WorkflowRole.DONE].id and self.fail_done:
             self.fail_done -= 1
             raise RuntimeError("transient done failure")
@@ -433,6 +441,47 @@ def test_process_done_failure_retries_done_without_duplicate_result_comment_or_r
     assert [update["state_id"] for update in retry.state_updates] == ["state-done"]
 
 
+def test_replayed_nonsemantic_finalization_comments_and_moves_attention_without_rerun(tmp_path):
+    config = app_config(tmp_path, f"{sys.executable} -c 'print(\"missing result\")'")
+    issue = make_issue(identifier="DEV-FAILED-REPLAY")
+    exec_key = execution_key(issue, config.runner)
+    failed_result = ShellRunner(config.runner).run(issue)
+    no_run = CountingRunner()
+    fake = FakeLinear()
+
+    with StateStore(tmp_path / "state.sqlite3") as store:
+        store.acquire_claim(
+            issue.id,
+            "owner-1",
+            lease_ttl_seconds=config.lease_ttl_seconds,
+            execution_key=exec_key,
+        )
+        store.upsert_finalization(
+            issue.id,
+            exec_key,
+            result=_runner_result_to_state(failed_result),
+            issue=issue_state(issue),
+            owner_id="owner-1",
+        )
+        result = process_issue_once(
+            issue=issue,
+            config=config,
+            state=store,
+            linear=fake,
+            runner=no_run,
+            owner_id="owner-1",
+        )
+        claim = store.get_claim(issue.id)
+
+    assert result.status == "failed"
+    assert result.executed is False
+    assert result.done_transitioned is False
+    assert no_run.calls == 0
+    assert claim.status == "failed"
+    assert any("Runner did not report semantic completion" in comment["body"] for comment in fake.comments)
+    assert [update["state_id"] for update in fake.state_updates] == ["state-review"]
+
+
 def test_process_next_issue_once_recovers_pending_finalization_without_todo_or_rerun(tmp_path):
     counter = tmp_path / "counter.txt"
     command = result_command('p=pathlib.Path(sys.argv[2]); p.write_text(str(int(p.read_text() or 0)+1) if p.exists() else "1"); print("done")', str(counter))
@@ -472,7 +521,7 @@ def test_process_runner_failure_comments_without_done(tmp_path):
 
     assert result.status == "failed"
     assert result.done_transitioned is False
-    assert [update["state_id"] for update in fake.state_updates] == ["state-started"]
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-review"]
     assert any("Runner failed" in comment["body"] for comment in fake.comments)
     assert claim.status == "failed"
     assert "code 7" in claim.last_error
@@ -488,8 +537,14 @@ def test_process_timeout_comments_without_done(tmp_path):
 
     assert result.status == "failed"
     assert result.runner_result.timed_out is True
-    assert [update["state_id"] for update in fake.state_updates] == ["state-started"]
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-review"]
     assert any("Runner timed out" in comment["body"] for comment in fake.comments)
+    timeout_comment_index = next(
+        index
+        for index, event in enumerate(fake.events)
+        if event[0] == "comment" and "Runner timed out" in event[1]
+    )
+    assert timeout_comment_index < fake.events.index(("state", "state-review"))
     assert "timed out" in claim.last_error
 
 
@@ -510,8 +565,43 @@ def test_nonzero_runner_failure_comment_failure_returns_failed_without_done_or_r
     assert not any("Runner failed" in comment["body"] for comment in fake.comments)
     assert "transient failure comment failure" in result.message
     assert claim.status == "failed"
-    assert [update["state_id"] for update in fake.state_updates] == ["state-started"]
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-review"]
     assert not any(update["state_id"] == "state-done" for update in fake.state_updates)
+
+
+def test_attention_transition_failure_preserves_failure_result_comment_and_local_state(tmp_path, caplog):
+    command = f"{sys.executable} -c 'import sys; raise SystemExit(7)'"
+    config = app_config(tmp_path, command)
+    fake = FlakyLinear(fail_attention=1)
+    issue = make_issue(identifier="DEV-ATTENTION-FAIL")
+
+    with StateStore(tmp_path / "state.sqlite3") as store:
+        with caplog.at_level("WARNING", logger="linear_agent_orchestrator.runner"):
+            result = process_issue_once(
+                issue=issue,
+                config=config,
+                state=store,
+                linear=fake,
+                runner=ShellRunner(config.runner),
+                owner_id="owner-1",
+            )
+        claim = store.get_claim(issue.id)
+
+    assert result.status == "failed"
+    assert result.executed is True
+    assert result.done_transitioned is False
+    assert result.message == "runner exited with code 7"
+    assert result.comment_ids[-1] is not None
+    assert claim.status == "failed"
+    assert claim.last_error == "runner exited with code 7"
+    assert any("Runner failed" in comment["body"] for comment in fake.comments)
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started"]
+    assert any(
+        record.message == "attention_transition_failed"
+        and record.issue_id == issue.id
+        and "transient attention failure" in record.error
+        for record in caplog.records
+    )
 
 
 def test_process_schema_missing_comments_without_claim_or_execution(tmp_path):
@@ -662,7 +752,7 @@ def test_start_comment_failure_and_interruption_recover_from_active_work_without
     assert not counter.exists()
     assert claim.status == "failed"
     assert "execution intent already exists" in recovered.message
-    assert recovery_linear.state_updates == []
+    assert [update["state_id"] for update in recovery_linear.state_updates] == ["state-review"]
 
 
 class CrashOnSecondActiveWorkStore(StateStore):
@@ -929,7 +1019,7 @@ def test_process_runner_materialization_exception_fails_and_comments_without_don
     assert result.claimed is True
     assert result.executed is False
     assert result.done_transitioned is False
-    assert [update["state_id"] for update in fake.state_updates] == ["state-started"]
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-review"]
     assert claim.status == "failed"
     assert "PermissionError" in claim.last_error
     assert any("Runner setup or execution failed" in comment["body"] for comment in fake.comments)
@@ -1109,7 +1199,7 @@ def test_pre_recorded_execution_without_finalization_fails_closed_without_rerun(
     assert claim.status == "failed"
     assert claim.execution_key == exec_key
     assert "execution intent already exists" in result.message
-    assert fake.state_updates == []
+    assert [update["state_id"] for update in fake.state_updates] == ["state-review"]
     assert any("prior execution state is in doubt" in comment["body"] for comment in fake.comments)
 
 
@@ -1354,6 +1444,14 @@ def test_non_completed_or_unvalidated_result_never_moves_done(tmp_path, payload_
     assert result.done_transitioned is False
     assert claim.status == "failed"
     assert not any(update["state_id"] == "state-done" for update in fake.state_updates)
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-review"]
+    failure_comment_index = next(
+        index
+        for index, event in enumerate(fake.events)
+        if event[0] == "comment" and "Runner did not report semantic completion" in event[1]
+    )
+    attention_transition_index = fake.events.index(("state", "state-review"))
+    assert failure_comment_index < attention_transition_index
 
 
 def test_nonzero_exit_with_valid_completed_result_never_moves_done(tmp_path):
@@ -1374,6 +1472,7 @@ def test_completed_and_validated_result_moves_done(tmp_path):
     assert result.done_transitioned is True
     assert claim.status == "completed"
     assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-done"]
+    assert not any(update["state_id"] == "state-review" for update in fake.state_updates)
 
 
 def test_completed_semantically_rejects_blank_validation_evidence(tmp_path):

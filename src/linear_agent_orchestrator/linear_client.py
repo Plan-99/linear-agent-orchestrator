@@ -187,6 +187,7 @@ class WorkflowRole(str, Enum):
     QUEUE = "queue"
     IN_PROGRESS = "in_progress"
     DONE = "done"
+    ATTENTION = "attention"
 
 
 class WorkflowStateCache:
@@ -205,6 +206,7 @@ class WorkflowStateCache:
             WorkflowRole.QUEUE: _lookup_state(states, config.queue_state_name, "queue/Todo"),
             WorkflowRole.IN_PROGRESS: _lookup_state(states, config.in_progress_state_name, "In Progress"),
             WorkflowRole.DONE: _lookup_state(states, config.done_state_name, "Done"),
+            WorkflowRole.ATTENTION: _lookup_state(states, config.attention_state_name, "attention/In Review"),
         }
 
     def clear(self) -> None:

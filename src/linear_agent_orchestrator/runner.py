@@ -899,6 +899,7 @@ def process_issue_once(
             issue=issue,
             state=state,
             linear=linear,
+            linear_config=config.linear,
             owner_id=owner_id,
             execution_key=exec_key,
             comments=comments,
@@ -960,6 +961,7 @@ def process_issue_once(
             issue=issue,
             state=state,
             linear=linear,
+            linear_config=config.linear,
             owner_id=owner_id,
             execution_key=exec_key,
             comments=comments,
@@ -985,6 +987,7 @@ def process_issue_once(
                 comments.append(comment_id)
             except Exception:  # noqa: BLE001 - comment failure must not hide local failure
                 comments.append(None)
+        _transition_to_attention_best_effort(issue=issue, linear=linear, states=states)
         return ProcessResult(
             issue.id,
             issue.identifier,
@@ -1033,6 +1036,7 @@ def process_issue_once(
             comments.append(comment_id)
         except Exception as exc:  # noqa: BLE001 - comment failure must not hide local failure
             comments.append(None)
+            _transition_to_attention_best_effort(issue=issue, linear=linear, states=states)
             return ProcessResult(
                 issue.id,
                 issue.identifier,
@@ -1045,6 +1049,7 @@ def process_issue_once(
                 message=_exception_summary(exc),
                 issue_url=issue.url,
             )
+    _transition_to_attention_best_effort(issue=issue, linear=linear, states=states)
     return ProcessResult(
         issue.id,
         issue.identifier,
@@ -1099,11 +1104,39 @@ def _workspace_blocked_result(
     )
 
 
+def _transition_to_attention_best_effort(
+    *,
+    issue: LinearIssue,
+    linear: LinearReporter,
+    states: dict[WorkflowRole, WorkflowState] | None = None,
+    config: LinearConfig | None = None,
+) -> None:
+    """Move a failed run to the human-review queue without changing its result."""
+
+    try:
+        if states is None:
+            if config is None:
+                raise ValueError("Linear config is required when workflow states are not pre-resolved")
+            states = linear.resolve_workflow_states(config)
+        resolved = states
+        linear.update_issue_state(issue.id, resolved[WorkflowRole.ATTENTION].id)
+    except Exception as exc:  # noqa: BLE001 - local failure/comment state remains authoritative
+        LOGGER.warning(
+            "attention_transition_failed",
+            extra={
+                "issue_id": issue.id,
+                "issue_identifier": issue.identifier,
+                "error": _exception_summary(exc),
+            },
+        )
+
+
 def _fail_in_doubt_execution(
     *,
     issue: LinearIssue,
     state: StateStore,
     linear: LinearReporter,
+    linear_config: LinearConfig,
     owner_id: str,
     execution_key: str,
     comments: list[str | None],
@@ -1125,6 +1158,7 @@ def _fail_in_doubt_execution(
         except Exception as exc:  # noqa: BLE001 - local fail-closed state is authoritative
             comments.append(None)
             message = f"{message}; failure comment error: {_exception_summary(exc)}"
+    _transition_to_attention_best_effort(issue=issue, linear=linear, config=linear_config)
     return ProcessResult(
         issue.id,
         issue.identifier,
@@ -1356,6 +1390,7 @@ def process_active_work_once(
                 issue=issue,
                 state=state,
                 linear=linear,
+                linear_config=config.linear,
                 owner_id=owner_id,
                 execution_key=stored_key,
                 comments=[],
@@ -1550,6 +1585,7 @@ def _finalize_success(
                 )
             except Exception:  # noqa: BLE001 - fail-closed local state is authoritative
                 comments.append(None)
+        _transition_to_attention_best_effort(issue=issue, linear=linear, states=states)
         return ProcessResult(
             issue.id,
             issue.identifier,

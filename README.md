@@ -211,6 +211,30 @@ daemon의 순서는 다음과 같습니다.
 validation exit code, backend timeout/실패는 모두 Done 전환을 막습니다. 실패 원인은 Linear
 댓글에 기록되며 secret은 기록하지 않습니다.
 
+## 사람 개입 단일 리뷰 큐 운영
+
+실패, timeout, fail-in-doubt 실행은 failure 댓글이 기록된 뒤
+`LINEAR_ATTENTION_STATE_NAME` 상태(기본값 `In Review`)로 이동합니다. 상태 전환은
+best-effort이므로 Linear 전환 API 오류가 로컬 실패 기록이나 failure 댓글을 되돌리지
+않습니다. workspace preflight 실패와 schema-invalid 이슈는 자동 재시도/수정 대기 의미를
+유지하기 위해 Todo에 남습니다.
+
+성공과 실패를 모두 같은 사람 검토 큐에 모으려면 `.env`에서 Done 역할도 같은 상태로
+매핑합니다. Done 역할과 성공 finalization 게이트 자체는 바뀌지 않습니다.
+
+```dotenv
+LINEAR_ATTENTION_STATE_NAME="In Review"
+LINEAR_DONE_STATE_NAME="In Review"
+```
+
+알림은 orchestrator가 아니라 **Linear 네이티브 Slack 연동**으로 구성합니다. Linear의
+Slack integration에서 대상 workspace/channel을 연결하고, 이 팀의 이슈가 `In Review`에
+진입할 때 해당 채널로 알리도록 notification rule을 설정하세요.
+
+재작업 시에는 `In Review` 이슈를 Todo로 되돌리지 않습니다. execution key 특성상 이슈나
+runner 설정을 수정하지 않은 재큐잉은 안전 복구가 불가능한 fail-in-doubt만 남깁니다.
+리뷰에서 발견된 후속 작업은 원래 이슈를 재큐잉하지 말고 **새 Linear 이슈**로 엽니다.
+
 ## 안전한 로컬 명령
 
 ```bash

@@ -28,6 +28,7 @@ class FakePollingLinear:
             WorkflowRole.QUEUE: WorkflowState("state-todo", "Todo", "unstarted"),
             WorkflowRole.IN_PROGRESS: WorkflowState("state-started", "In Progress", "started"),
             WorkflowRole.DONE: WorkflowState("state-done", "Done", "completed"),
+            WorkflowRole.ATTENTION: WorkflowState("state-review", "In Review", "started"),
         }
 
     def iter_todo_issues(self, config, first=10):
@@ -274,7 +275,7 @@ def test_daemon_runner_exception_returns_failed_status_without_crashing(tmp_path
     assert result.iterations == 1
     assert result.last_status == "failed"
     assert claim.status == "failed"
-    assert [update["state_id"] for update in fake.state_updates] == ["state-started"]
+    assert [update["state_id"] for update in fake.state_updates] == ["state-started", "state-review"]
     assert any("Runner setup or execution failed" in comment["body"] for comment in fake.comments)
 
 

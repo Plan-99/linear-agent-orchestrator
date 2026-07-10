@@ -25,6 +25,13 @@ def test_config_defaults_include_first_story_constants():
     assert config.backoff.initial_seconds == DEFAULT_BACKOFF_INITIAL_SECONDS == 5
     assert config.backoff.max_seconds == DEFAULT_BACKOFF_MAX_SECONDS == 300
     assert config.backoff.max_attempts == DEFAULT_BACKOFF_MAX_ATTEMPTS == 5
+    assert config.linear.attention_state_name == "In Review"
+
+
+def test_config_loads_attention_state_name_from_env():
+    config = load_config(env={"LINEAR_ATTENTION_STATE_NAME": "Needs Human"})
+
+    assert config.linear.attention_state_name == "Needs Human"
 
 
 def test_config_loads_required_linear_and_runner_values_from_env_without_leaking_secret():

@@ -60,6 +60,7 @@ class ThreadSafeFakeLinear:
             WorkflowRole.QUEUE: WorkflowState("state-todo", "Todo", "unstarted"),
             WorkflowRole.IN_PROGRESS: WorkflowState("state-started", "In Progress", "started"),
             WorkflowRole.DONE: WorkflowState("state-done", "Done", "completed"),
+            WorkflowRole.ATTENTION: WorkflowState("state-review", "In Review", "started"),
         }
 
     def iter_todo_issues(self, config, first=10):

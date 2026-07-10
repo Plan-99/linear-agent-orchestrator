@@ -56,6 +56,7 @@ class LinearConfig:
     queue_state_name: str = "Todo"
     in_progress_state_name: str = "In Progress"
     done_state_name: str = "Done"
+    attention_state_name: str = "In Review"
     assignee_id: str | None = None
 
 
@@ -299,6 +300,7 @@ def load_config(
             queue_state_name=_get_str(source, "LINEAR_QUEUE_STATE_NAME", "Todo"),
             in_progress_state_name=_get_str(source, "LINEAR_IN_PROGRESS_STATE_NAME", "In Progress"),
             done_state_name=_get_str(source, "LINEAR_DONE_STATE_NAME", "Done"),
+            attention_state_name=_get_str(source, "LINEAR_ATTENTION_STATE_NAME", "In Review"),
             assignee_id=_get_optional_str(source, "LINEAR_ASSIGNEE_ID"),
         ),
         runner=RunnerConfig(
