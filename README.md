@@ -66,7 +66,10 @@ LAO_PROJECT_DIR=/absolute/host/path/to/target-repository
 
 RUNNER_COMMAND_TEMPLATE='/usr/local/bin/lao-agent-runner {prompt_path} {result_path}'
 AGENT_BACKEND=omx
-AGENT_MODEL=gpt-5.5
+AGENT_MODEL=gpt-5.6-sol
+# Reasoning effort (비우면 backend 기본값).
+# omx/codex: minimal|low|medium|high|xhigh, claude: low|medium|high|xhigh|max
+AGENT_EFFORT=high
 AGENT_BYPASS_PERMISSIONS=true
 ```
 
@@ -144,15 +147,18 @@ docker logs -f --tail 100 "$CONTAINER"
 ```dotenv
 # OMX
 AGENT_BACKEND=omx
-AGENT_MODEL=gpt-5.5
+AGENT_MODEL=gpt-5.6-sol
+AGENT_EFFORT=high          # minimal|low|medium|high|xhigh
 
 # Codex CLI
 # AGENT_BACKEND=codex
-# AGENT_MODEL=gpt-5.5
+# AGENT_MODEL=gpt-5.6-sol
+# AGENT_EFFORT=high        # minimal|low|medium|high|xhigh
 
 # Claude Code
 # AGENT_BACKEND=claude
-# AGENT_MODEL=<claude-model-name>
+# AGENT_MODEL=claude-fable-5
+# AGENT_EFFORT=high        # low|medium|high|xhigh|max
 ```
 
 내장 wrapper는 prompt를 stdin으로 전달하고 두 번째 인자에 orchestrator가 소유한
