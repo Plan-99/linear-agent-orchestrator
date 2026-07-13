@@ -28,7 +28,7 @@ Linear 이슈를 에이전트(Codex/OMX/Claude Code)에게 자동으로 전달�
 ## 2. 설치
 
 ```bash
-git clone <이 저장소>
+git clone https://github.com/Plan-99/linear-agent-orchestrator.git
 cd linear-agent-orchestrator
 ./scripts/bootstrap.sh
 ```
