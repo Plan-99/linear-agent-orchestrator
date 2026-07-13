@@ -1,7 +1,8 @@
 # Linear Agent Orchestrator
 
 Linear의 지정 프로젝트를 polling하고, **지정된 담당자에게 할당된 Todo 이슈만**
-Codex, OMX, 또는 Claude Code에 전달하는 단일-worker orchestrator입니다.
+Codex, OMX, 또는 Claude Code에 전달하는 polling orchestrator입니다.
+기본은 단일 worker 직렬 처리이며 `MAX_PARALLEL_RUNS`로 병렬 확장할 수 있습니다.
 
 - webhook과 Linear native agent session을 사용하지 않습니다.
 - 한 daemon은 하나의 고정된 Git 저장소만 `/workspace/project`에 마운트합니다.

@@ -1,7 +1,8 @@
 # Canonical Linear TEST Issue Template
 
-Use this template for issues the polling daemon may execute in the configured TEST project.
-G001 only documents the schema; later stories enforce it before execution.
+Use this template for issues the polling daemon may execute in the configured project.
+The daemon enforces this schema before execution: issues missing a required
+section are never executed and receive a clarification comment instead.
 
 ```markdown
 ## Task
@@ -27,4 +28,4 @@ Required sections:
 - `Acceptance Criteria`
 - `Validation`
 
-If a candidate issue is missing any required section, the daemon must not execute it and should add a clarification comment in a later story.
+If a candidate issue is missing any required section, the daemon does not execute it, leaves it in Todo, and adds a clarification comment.

@@ -14,11 +14,19 @@ All notable changes to this project will be documented in this file.
 - Added `MAX_PARALLEL_RUNS` parallel worker pool support with distinct claim owners, staggered polling, and parallel-run coverage.
 - Added `AGENT_INTERACTIVE` conversation mode for backend TUIs hosted in run consoles with structured-result completion.
 - Added DEV-18/DEV-19 artifacts: git-history CHANGELOG drafting and package metadata smoke tests.
+- Added `AGENT_EFFORT` reasoning-effort passthrough (omx/codex: `-c model_reasoning_effort=...`, claude: `--effort ...`).
+- Added DEV-21/DEV-22 self-hosted parallel-worker artifacts: module architecture doc and CONTRIBUTING draft.
 
 ### Changed
 - Hardened the tmux agent console and PTY/bootstrap/supervisor scripts with updated runner integration, documentation, and test coverage.
 - Changed daemon idle polling so Ctrl-C exits promptly while in-flight runs finish.
+- Interactive runs now end when the operator exits the TUI instead of on structured-result detection; submitting a valid result moves the issue to the attention state while the session stays open, and the Done gate is evaluated after exit (two-phase success path, DEV-23/DEV-27).
+- `RUNNER_TIMEOUT_SECONDS` now acts as an activity-based idle timeout for interactive runs (console output extends the deadline), bounded by the `RUNNER_MAX_LIFETIME_SECONDS` hard cap (DEV-25).
+- Failed, timed-out, and fail-in-doubt runs are now routed to the configured attention state (`LINEAR_ATTENTION_STATE_NAME`, default `In Review`) after the failure comment, forming a single human review queue.
 
 ### Fixed
 - Fixed fresh SQLite startup `database is locked` races with earlier busy timeouts, duplicate-column-tolerant migrations, and serialized factories.
 - Fixed tmux new-window targeting from daemon pane IDs for per-run window console creation.
+- Fixed interactive TUI backends receiving a pipe instead of the real pane PTY.
+- Fixed interactive runs deadlocking on an undrained stdout pipe once output exceeded the pipe buffer (DEV-24 regression coverage).
+- Fixed successful-run finalization deleting the local branch when the agent had committed inside its worktree (DEV-26).

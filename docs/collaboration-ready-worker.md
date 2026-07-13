@@ -7,9 +7,11 @@ before processing a real issue.
 
 ## Scope for the next live test
 
-The daemon remains a polling-only, serial worker for one explicitly configured
-Linear team, project, assignee, and repository. One fixed repository per daemon
-is sufficient while the daemon executes at most one issue at a time.
+The daemon remains a polling-only worker for one explicitly configured Linear
+team, project, assignee, and repository. It executes one issue at a time by
+default; `MAX_PARALLEL_RUNS` may raise the number of concurrent issue workers
+inside the same daemon, which requires per-run git worktree isolation so every
+run works on its own checkout of the single fixed repository.
 
 The worker must:
 
@@ -94,8 +96,8 @@ Required fields and semantics:
   `needs_clarification`.
 - `summary` is a non-empty human-readable outcome.
 - `validation` is a non-empty array when `status` is `completed`.
-- every completed validation entry has a non-empty description, a numeric
-  `exit_code` equal to zero, and non-empty evidence;
+- every completed validation entry has a non-empty description, a non-empty
+  `command`, a numeric `exit_code` equal to zero, and non-empty evidence;
 - artifact and changed-file paths are relative to their declared roots and must
   not escape those roots.
 
@@ -127,19 +129,32 @@ Before claiming live work, preflight must verify that:
   merely present as files;
 - work and artifact directories are writable;
 - the configured Linear assignee can be resolved; and
-- the repository state is safe for the configured serial workflow.
+- the repository state is safe for the configured workflow.
 
-If a clean-tree guard is enabled, an absent repository or a dirty work tree must
-block execution rather than silently bypass the check. Because one repository is
-reused across sequential issues, operators must integrate or discard the prior
-issue's changes before another issue can safely run.
+With worktree isolation enabled (the default), every run branches from `HEAD`
+into a dedicated git worktree; a semantically successful run is committed to a
+local `lao/<issue>-<key>` branch (never pushed) and the base checkout stays
+clean, so operators integrate or discard those branches at their own pace. In
+the legacy fixed-directory mode, an absent repository or a dirty work tree must
+block execution rather than silently bypass the check, and operators must
+integrate or discard the prior issue's changes before another issue can safely
+run.
 
 ## Failure and retry behavior
 
 Missing or invalid structured results, backend failures, preflight failures, and
-validation failures must not move the issue to Done. They should record a
-failure comment and retain enough local state for deterministic diagnosis and a
-deliberate retry after the issue or runner configuration changes.
+validation failures must not move the issue to Done. They record a failure
+comment, retain enough local state for deterministic diagnosis and a deliberate
+retry after the issue or runner configuration changes, and then move the issue
+to the configured attention state (`LINEAR_ATTENTION_STATE_NAME`, default
+`In Review`) as a best-effort, non-terminal transition so failures land in a
+single human review queue.
+
+Interactive runs use a two-phase success path: submitting a valid structured
+result moves the issue to the attention state while the TUI session stays open,
+and the Done gate is evaluated only after the operator exits the TUI. Neither
+transition weakens the "no automatic terminal transition other than Done"
+invariant because the attention state is not terminal.
 
 Local SQLite claims coordinate only processes that share the same database.
 Assignee filtering prevents different developers' daemons from taking each
@@ -149,15 +164,17 @@ test.
 
 ## Deferred hardening
 
-The following are intentionally deferred until after the next live test:
+The following are intentionally deferred:
 
-- issue-level worktrees and concurrent issue execution;
 - a separate agent service that cannot observe the orchestrator's Linear
   environment through the container process namespace;
 - restricted outbound network policy;
-- cross-machine claim arbitration for the same Linear assignee;
-- streaming long-running backend output; and
+- cross-machine claim arbitration for the same Linear assignee; and
 - automatic source-control or pull-request operations.
+
+Issue-level worktrees, concurrent issue execution (`MAX_PARALLEL_RUNS`), and
+live observation of backend output through the agent console have since been
+implemented and are no longer deferred.
 
 These deferrals do not weaken the invariants above. In particular, Docker socket
 mounts and automatic push/PR/merge behavior remain out of scope.
@@ -180,7 +197,9 @@ Complete all checks without performing a destructive live Linear mutation:
 6. Confirm the polling request includes the resolved assignee and excludes
    unassigned or differently assigned issues.
 7. Confirm the agent-console contract: emitted events validate against the v1
-   schema in [agent-console.md](agent-console.md); the console is off by default;
+   schema in [agent-console.md](agent-console.md); the console defaults to
+   `auto` (enabled only inside a host tmux, headless otherwise) while the
+   container-side Python default stays off;
    `supports_direct_input` is false for one-shot omx/codex/claude; the log root
    resolves under the host `.runtime/logs/console` mount while the tmux socket
    stays container-private; and no secret appears in `lifecycle.jsonl`.
