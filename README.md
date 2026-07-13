@@ -11,7 +11,10 @@ Codex, OMX, 또는 Claude Code에 전달하는 polling orchestrator입니다.
 - agent가 구조화된 검증 결과를 제출한 경우에만 Linear 이슈를 Done으로 바꿉니다.
 - push, PR 생성/merge, 이슈 삭제는 자동화하지 않습니다.
 
-상세 안전 계약은 [collaboration-ready worker contract](docs/collaboration-ready-worker.md)를
+**팀원 온보딩은 [docs/onboarding.md](docs/onboarding.md)를 보세요** — 설치부터
+이슈 작성 규칙, 리뷰/머지 사이클, 하지 말 것까지 처음 쓰는 사람 기준으로
+정리되어 있습니다. 상세 안전 계약은
+[collaboration-ready worker contract](docs/collaboration-ready-worker.md)를
 참고하세요.
 
 ## 권장 실행 구조
