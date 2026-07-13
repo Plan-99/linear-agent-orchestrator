@@ -147,7 +147,38 @@ Task / Acceptance Criteria / Validation 3섹션이 미리 채워져 나옵니다
 - **머지를 건너뛰고 후속 이슈를 올리면 새 run은 이전 작업이 없는 HEAD에서
   시작합니다.** 이어지는 작업이라면 반드시 먼저 머지하세요.
 
-## 9. 하지 말 것
+## 9. Slack 알림 설정 (권장)
+
+리뷰가 필요한 이슈(In Review 진입)만 자기 Slack DM으로 받는 구성입니다.
+알림은 orchestrator가 아니라 **Linear 네이티브 Slack 연동**으로 처리합니다.
+
+전제: 실패/timeout run과 interactive run의 result 제출은 기본 설정으로 이미
+In Review로 이동합니다. 성공(Done)까지 같은 리뷰 큐로 모으려면 `.env`에서
+Done 역할도 같은 상태로 매핑하세요(게이트 검증은 그대로 유지됩니다).
+
+```dotenv
+LINEAR_ATTENTION_STATE_NAME="In Review"
+LINEAR_DONE_STATE_NAME="In Review"
+```
+
+설정은 두 계층입니다.
+
+1. **워크스페이스 연동 (관리자 1회)** — Linear Settings → Integrations →
+   Slack 연결. 이미 되어 있다면 건너뜁니다.
+2. **개인 설정 (각자 1회, 약 1분)**:
+   - Linear 개인 설정에서 **자기 Slack 계정 연결** (Notifications 또는
+     Connected accounts; 뷰 구독 중 authorize 프롬프트가 뜨기도 합니다).
+     DM 대상은 자기 계정을 연결한 사람에게만 보입니다.
+   - `Status = In Review` + `Assignee = 자기 자신` 필터로 **자기 전용 커스텀
+     뷰**를 만듭니다. 뷰 구독은 뷰의 고정 필터 기준으로 발송되므로 뷰 하나를
+     팀이 공유할 수 없고, 사람마다 자기 뷰가 필요합니다.
+   - 뷰 메뉴(⋯) → Slack 알림 구독 → **자기 개인 DM** 선택.
+
+개인 알림 채널(개인 설정 → Notifications → Slack)을 켜는 방법도 있지만,
+In Review만 골라 받을 수 없어 daemon이 바꾸는 모든 상태 전환마다 DM이
+옵니다. 뷰 구독 방식을 권장합니다.
+
+## 10. 하지 말 것
 
 | 금지 | 이유 |
 |---|---|
@@ -157,7 +188,7 @@ Task / Acceptance Criteria / Validation 3섹션이 미리 채워져 나옵니다
 | `.runtime/data`의 SQLite 임의 삭제 | 복구/중복 방지 기록이 사라집니다. 의도적 reset일 때만. |
 | daemon을 tmux/session manager 밖에서 방치 실행 | 터미널이 닫히면 컨테이너도 SIGTERM을 받습니다. |
 
-## 10. 자주 겪는 문제
+## 11. 자주 겪는 문제
 
 - **이슈를 안 집어감** — 순서대로 확인: ① 프로젝트/팀이 `.env`와 일치?
   ② 자신에게 할당 + Todo 상태? ③ 3섹션이 전부 채워짐? (clarification
