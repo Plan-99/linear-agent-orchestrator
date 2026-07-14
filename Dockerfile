@@ -18,7 +18,11 @@ ARG LAO_GID=1000
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    # The container never has remote git credentials. Without this, git (e.g.
+    # git-lfs downloads during worktree checkout) prompts on the container TTY
+    # and hangs the run until the 120s git timeout kills it.
+    GIT_TERMINAL_PROMPT=0
 
 # Baseline tools agent backends rely on (git, ps, curl, jq, rg). tmux hosts the
 # optional per-run interactive console (AGENT_CONSOLE); it is inert when the

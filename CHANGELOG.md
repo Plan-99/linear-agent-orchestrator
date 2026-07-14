@@ -25,7 +25,7 @@ All notable changes to this project will be documented in this file.
 - Failed, timed-out, and fail-in-doubt runs are now routed to the configured attention state (`LINEAR_ATTENTION_STATE_NAME`, default `In Review`) after the failure comment, forming a single human review queue.
 
 ### Fixed
-- Fixed isolated worktree creation failing on Git LFS target repositories: the runtime image now ships `git-lfs` with a system-level filter install (the repo's `post-checkout` hook aborted `git worktree add` when the binary was missing) and sets `lfs.skipdownloaderrors` so checkouts keep pointer files instead of failing when LFS objects are absent and no remote credentials exist (GitHub #1).
+- Fixed isolated worktree creation failing on Git LFS target repositories: the runtime image now ships `git-lfs` with a system-level filter install (the repo's `post-checkout` hook aborted `git worktree add` when the binary was missing) and sets `lfs.skipdownloaderrors` so checkouts keep pointer files instead of failing when LFS objects are absent and no remote credentials exist, and sets `GIT_TERMINAL_PROMPT=0` so LFS download attempts fail fast instead of prompting for credentials on the container TTY and hanging until the git timeout (GitHub #1).
 - Fixed fresh SQLite startup `database is locked` races with earlier busy timeouts, duplicate-column-tolerant migrations, and serialized factories.
 - Fixed tmux new-window targeting from daemon pane IDs for per-run window console creation.
 - Fixed interactive TUI backends receiving a pipe instead of the real pane PTY.
