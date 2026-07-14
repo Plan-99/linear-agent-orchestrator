@@ -22,17 +22,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Baseline tools agent backends rely on (git, ps, curl, jq, rg). tmux hosts the
 # optional per-run interactive console (AGENT_CONSOLE); it is inert when the
-# feature is disabled.
+# feature is disabled. git-lfs is required because target repositories may use
+# LFS: their post-checkout hook aborts `git worktree add` when git-lfs is
+# missing, and without the smudge filter LFS files check out as pointer text.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
        ca-certificates \
        curl \
        git \
+       git-lfs \
        jq \
        procps \
        ripgrep \
        tmux \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install --system --skip-repo \
+    # The container has no LFS remote credentials; keep pointer files instead
+    # of failing checkout when objects are absent from the local LFS store.
+    && git config --system lfs.skipdownloaderrors true
 
 WORKDIR /app
 
