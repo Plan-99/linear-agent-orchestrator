@@ -38,28 +38,21 @@ read_env_value() {
 # AGENT_CONSOLE_LOG_DIR (=/workspace/logs/console). Resolution order:
 #   1. process AGENT_CONSOLE_HOST_LOG_DIR (explicit host override)
 #   2. dotenv AGENT_CONSOLE_HOST_LOG_DIR
-#   3. process/dotenv <LAO_RUNTIME_DIR>/logs/console (relative -> repo_root)
-#   4. <repo_root>/.runtime/logs/console
+#   3. <repo_root>/.runtime/logs/console
 # Compose reads project .env automatically, while these host scripts do not.
-# Reading the same keys safely here keeps the watched host path identical to the
-# bind mount even when operators configure paths only in .env.
+# Reading the explicit host override safely here keeps the watched host path
+# identical to the bind mount when operators configure it only in .env.
+# LAO_RUNTIME_DIR is deliberately ignored: scripts/compose.sh owns it as
+# internal path-translation plumbing, so it is not a user-facing path override.
 resolve_host_console_log_dir() {
   local repo_root="${1:-}" env_file="${2:-${1:-}/.env}"
   local host_override="${AGENT_CONSOLE_HOST_LOG_DIR:-}"
-  local runtime="${LAO_RUNTIME_DIR:-}"
   if [[ -z "$host_override" ]]; then
     host_override="$(read_env_value AGENT_CONSOLE_HOST_LOG_DIR "$env_file" 2>/dev/null || true)"
   fi
   if [[ -n "$host_override" ]]; then
     case "$host_override" in /*) : ;; *) host_override="$repo_root/$host_override" ;; esac
     printf '%s\n' "$host_override"; return
-  fi
-  if [[ -z "$runtime" ]]; then
-    runtime="$(read_env_value LAO_RUNTIME_DIR "$env_file" 2>/dev/null || true)"
-  fi
-  if [[ -n "$runtime" ]]; then
-    case "$runtime" in /*) : ;; *) runtime="$repo_root/$runtime" ;; esac
-    printf '%s\n' "$runtime/logs/console"; return
   fi
   printf '%s\n' "$repo_root/.runtime/logs/console"
 }

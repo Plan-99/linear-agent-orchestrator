@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import linear_agent_orchestrator.cli as cli
 from linear_agent_orchestrator.cli import linear_assignee_preflight_errors, main
 from linear_agent_orchestrator.config import AppConfig, LinearConfig
@@ -104,7 +106,84 @@ def test_linear_assignee_preflight_empty_assignee_id_fails_closed():
     assert errors == ["Linear assignee preflight returned an empty assignee ID"]
 
 
-def test_cli_daemon_exit_after_startup_is_safe_placeholder():
-    exit_code = main(["daemon", "--allow-missing-secrets", "--exit-after-startup"])
+def test_cli_daemon_exit_after_startup_is_safe_placeholder(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+
+    exit_code = main(
+        [
+            "daemon",
+            "--allow-missing-secrets",
+            "--exit-after-startup",
+            "--db-path",
+            str(db_path),
+        ]
+    )
 
     assert exit_code == 0
+    assert db_path.exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["daemon", "--allow-missing-secrets", "--exit-after-startup"],
+        ["state-init"],
+        ["process-once"],
+    ],
+)
+def test_stateful_commands_require_explicit_database_path(argv, monkeypatch, capsys):
+    monkeypatch.delenv("STATE_DB_PATH", raising=False)
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("missing database path must fail before state or network access")
+
+    monkeypatch.setattr(cli, "StateStore", unexpected_call)
+    monkeypatch.setattr(cli.LinearClient, "from_config", unexpected_call)
+    monkeypatch.setattr(cli, "linear_assignee_preflight_errors", unexpected_call)
+
+    exit_code = main(argv)
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"{argv[0]}: state database path is required; pass --db-path PATH, "
+        "set STATE_DB_PATH, or run via ./scripts/compose.sh\n"
+    )
+
+
+def test_state_init_db_path_flag_overrides_environment(tmp_path, monkeypatch, capsys):
+    environment_db = tmp_path / "from-environment.sqlite3"
+    flag_db = tmp_path / "from-flag.sqlite3"
+    monkeypatch.setenv("STATE_DB_PATH", str(environment_db))
+
+    exit_code = main(["state-init", "--db-path", str(flag_db), "--json"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["db_path"] == str(flag_db)
+    assert flag_db.exists()
+    assert not environment_db.exists()
+
+
+def test_state_init_uses_environment_database_path(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "from-environment.sqlite3"
+    monkeypatch.setenv("STATE_DB_PATH", str(db_path))
+
+    exit_code = main(["state-init", "--json"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["db_path"] == str(db_path)
+    assert db_path.exists()
+
+
+def test_state_init_uses_env_file_database_path(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "from-env-file.sqlite3"
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"STATE_DB_PATH={db_path}\n", encoding="utf-8")
+    monkeypatch.delenv("STATE_DB_PATH", raising=False)
+
+    exit_code = main(["--env-file", str(env_file), "state-init", "--json"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["db_path"] == str(db_path)
+    assert db_path.exists()

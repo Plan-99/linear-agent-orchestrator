@@ -19,7 +19,7 @@ Canonical constants/helpers/validator: `src/linear_agent_orchestrator/console_sc
 | `AGENT_CONSOLE_OPEN_TARGET` | `window` | Where the supervisor opens each run: `window` (daemon keeps window 0, each run gets its own `lao:<run_id>` window so team-mode backends can split panes inside it) or `split` (sibling pane in the daemon's window). |
 | `AGENT_CONSOLE_FOCUS` | `true` | Switch the tmux client to the newly opened run window/pane. `false` keeps the operator where they are. |
 | `AGENT_CONSOLE_LAYOUT` | `main-vertical` | Split mode only: window layout re-applied when a run pane opens, keeping the daemon (first pane) as the main pane. One of `main-vertical` \| `main-horizontal` \| `tiled` \| `even-vertical` \| `even-horizontal` \| `none`. |
-| `AGENT_CONSOLE_HOST_LOG_DIR` | `${LAO_RUNTIME_DIR}/logs/console` | The **host console directory itself**, bind-mounted at `/workspace/logs/console`; override for host scripts. |
+| `AGENT_CONSOLE_HOST_LOG_DIR` | `<LAO checkout>/.runtime/logs/console` | Supported **log-only** override for the host console directory bind-mounted at `/workspace/logs/console`. |
 
 The inner private tmux server enables `mouse on` plus a 50k-line scrollback, so
 an attached client can wheel-scroll into copy-mode and click between inner
@@ -34,11 +34,13 @@ read-only.
 - Default is **`auto`**: `scripts/daemon.sh` enables the console when it runs
   inside a host tmux and falls back to the normal headless path otherwise;
   `true`/`false` force the choice.
-- Compose bind-mounts the host console directory
-  `${AGENT_CONSOLE_HOST_LOG_DIR:-${LAO_RUNTIME_DIR:-./.runtime}/logs/console}`
-  at `/workspace/logs/console` — the exact directory the host resolver watches.
-  It is durable and host-owned under the checkout's `.runtime/logs/console`.
-  `scripts/bootstrap.sh` creates `.runtime/logs`.
+- `scripts/compose.sh` pins internal `LAO_RUNTIME_DIR` to the orchestrator
+  checkout's `.runtime`; it is dev-container path-translation plumbing, not a
+  supported `.env` override. Compose mounts an explicit
+  `AGENT_CONSOLE_HOST_LOG_DIR`, or otherwise
+  `<LAO checkout>/.runtime/logs/console`, at `/workspace/logs/console` — the
+  exact directory the host resolver watches. `scripts/bootstrap.sh` creates
+  `.runtime/logs`.
 
 The contract module provides env parsers (`console_enabled`,
 `direct_input_enabled`, `resolve_console_log_dir`) plus event/path helpers;

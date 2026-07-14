@@ -51,7 +51,7 @@ usage: console-attach.sh [options]
   --container <name>    Container to docker-exec into (default: $AGENT_CONSOLE_CONTAINER
                         | $LAO_DAEMON_CONTAINER_NAME | lao-daemon)
   --log-dir <dir>       Host console log root (default: $AGENT_CONSOLE_HOST_LOG_DIR
-                        | <LAO_RUNTIME_DIR>/logs/console | <repo>/.runtime/logs/console)
+                        | <repo>/.runtime/logs/console)
   --print-cmd           Print the docker/tmux attach argv and exit (no attach).
   --list                List live runs and exit.
   -h, --help            Show this help.

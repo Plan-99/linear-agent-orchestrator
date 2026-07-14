@@ -114,7 +114,7 @@ class AppConfig:
     environment: str = "local"
     log_level: str = "INFO"
     log_format: str = "json"
-    state_db_path: str = "/workspace/data/state.sqlite3"
+    state_db_path: str | None = None
     # Number of concurrent issue workers inside this one daemon. Each worker
     # polls with its own Linear client/state connection and a distinct claim
     # owner id; SQLite claims prevent two workers from taking the same issue.
@@ -260,7 +260,7 @@ def merged_environment(
     merged: dict[str, str] = {}
     for env_file in env_files or []:
         merged.update(load_dotenv_file(env_file))
-    for key, value in dict(env or os.environ).items():
+    for key, value in dict(os.environ if env is None else env).items():
         if value != "":
             merged[key] = value
     return merged
@@ -278,7 +278,7 @@ def load_config(
         environment=_get_str(source, "APP_ENV", "local"),
         log_level=_get_str(source, "LOG_LEVEL", "INFO").upper(),
         log_format=_get_str(source, "LOG_FORMAT", "json"),
-        state_db_path=_get_str(source, "STATE_DB_PATH", "/workspace/data/state.sqlite3"),
+        state_db_path=_get_optional_str(source, "STATE_DB_PATH"),
         max_parallel_runs=_get_int(source, "MAX_PARALLEL_RUNS", 1),
         poll_interval_seconds=_get_int(source, "POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL_SECONDS),
         lease_ttl_seconds=_get_int(source, "LEASE_TTL_SECONDS", DEFAULT_LEASE_TTL_SECONDS),

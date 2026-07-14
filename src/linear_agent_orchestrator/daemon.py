@@ -247,4 +247,6 @@ def _poll_loop(
 def build_live_daemon_components(config: AppConfig) -> tuple[StateStore, LinearClient, ShellRunner]:
     """Construct production daemon components from config."""
 
+    if not config.state_db_path:
+        raise ValueError("STATE_DB_PATH is required to build live daemon components")
     return StateStore(config.state_db_path), LinearClient.from_config(config.linear), ShellRunner(config.runner)

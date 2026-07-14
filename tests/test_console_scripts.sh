@@ -66,19 +66,25 @@ printf 'AGENT_CONSOLE=false\n' > "$_ev"
 check "read_env_value plain" "false" "$(read_env_value AGENT_CONSOLE "$_ev")"
 check "hostlog default" "/repo/.runtime/logs/console" \
   "$(unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; resolve_host_console_log_dir /repo)"
-check "hostlog runtime-abs" "/data/rt/logs/console" \
+check "hostlog ignores process runtime-abs" "/repo/.runtime/logs/console" \
   "$(unset AGENT_CONSOLE_HOST_LOG_DIR; export LAO_RUNTIME_DIR=/data/rt; resolve_host_console_log_dir /repo)"
-check "hostlog runtime-rel" "/repo/rel/logs/console" \
+check "hostlog ignores process runtime-rel" "/repo/.runtime/logs/console" \
   "$(unset AGENT_CONSOLE_HOST_LOG_DIR; export LAO_RUNTIME_DIR=rel; resolve_host_console_log_dir /repo)"
 ENV_REPO="$TMP/env-repo"; mkdir -p "$ENV_REPO"
 printf 'LAO_RUNTIME_DIR=.state\n' > "$ENV_REPO/.env"
-check "hostlog dotenv runtime" "$ENV_REPO/.state/logs/console" \
+check "hostlog ignores dotenv runtime" "$ENV_REPO/.runtime/logs/console" \
   "$(unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; resolve_host_console_log_dir "$ENV_REPO")"
 printf 'LAO_RUNTIME_DIR=.state\nAGENT_CONSOLE_HOST_LOG_DIR=operator-logs\n' > "$ENV_REPO/.env"
 check "hostlog dotenv explicit" "$ENV_REPO/operator-logs" \
   "$(unset AGENT_CONSOLE_HOST_LOG_DIR LAO_RUNTIME_DIR; resolve_host_console_log_dir "$ENV_REPO")"
 check "hostlog process override wins" "/process/wins" \
   "$(export AGENT_CONSOLE_HOST_LOG_DIR=/process/wins LAO_RUNTIME_DIR=/ignored; resolve_host_console_log_dir "$ENV_REPO")"
+out="$("$ATTACH" --help 2>&1)"
+check "attach help shows fixed runtime fallback" "<repo>/.runtime/logs/console" "$out"
+[[ "$out" != *"LAO_RUNTIME_DIR"* ]] && ok "attach help omits internal LAO_RUNTIME_DIR" || bad "attach help must not advertise LAO_RUNTIME_DIR"
+out="$("$SUP" --help 2>&1)"
+check "supervisor help shows fixed runtime fallback" "<repo>/.runtime/logs/console" "$out"
+[[ "$out" != *"LAO_RUNTIME_DIR"* ]] && ok "supervisor help omits internal LAO_RUNTIME_DIR" || bad "supervisor help must not advertise LAO_RUNTIME_DIR"
 _exists() { case "$1" in lao-daemon|lao-daemon-2) return 0;; *) return 1;; esac; }
 check "next_free_container_name" "lao-daemon-3" "$(next_free_container_name lao-daemon _exists)"
 

@@ -19,6 +19,11 @@ from .runner import ShellRunner, process_next_issue_once
 from .state import StateStore
 
 LOGGER = logging.getLogger(__name__)
+STATE_DB_PATH_REQUIRED = (
+    "state database path is required; pass --db-path PATH, set STATE_DB_PATH, "
+    "or run via ./scripts/compose.sh"
+)
+STATEFUL_COMMANDS = frozenset({"daemon", "state-init", "process-once"})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,7 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit after startup checks without polling.",
     )
-    daemon.add_argument("--db-path", type=Path, help="Override STATE_DB_PATH for local claim state")
+    daemon.add_argument(
+        "--db-path",
+        type=Path,
+        help="State database path (required when STATE_DB_PATH is unset)",
+    )
     daemon.add_argument("--owner-id", default="linear-agent-orchestrator-daemon", help="Lease owner identity")
     daemon.add_argument("--max-iterations", type=int, help="Bound daemon loop for tests/smoke checks")
 
@@ -71,7 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--show-clarification", action="store_true", help="Print clarification comment preview when invalid")
 
     state = subparsers.add_parser("state-init", help="Initialize or migrate the local SQLite state database")
-    state.add_argument("--db-path", type=Path, help="Override STATE_DB_PATH for this command")
+    state.add_argument(
+        "--db-path",
+        type=Path,
+        help="State database path (required when STATE_DB_PATH is unset)",
+    )
     state.add_argument("--json", action="store_true", help="Print migration result as JSON")
 
     dry_run = subparsers.add_parser("runner-dry-run", help="Run the generic shell runner against a local issue markdown file without Linear")
@@ -83,7 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--json", action="store_true", help="Print runner result as JSON")
 
     process_once = subparsers.add_parser("process-once", help="Poll and process one configured Linear Todo issue, then exit")
-    process_once.add_argument("--db-path", type=Path, help="Override STATE_DB_PATH for local claim state")
+    process_once.add_argument(
+        "--db-path",
+        type=Path,
+        help="State database path (required when STATE_DB_PATH is unset)",
+    )
     process_once.add_argument("--owner-id", default="linear-agent-orchestrator-process-once", help="Lease owner identity")
     process_once.add_argument("--first", type=int, default=10, help="Linear page size for one-shot polling")
     process_once.add_argument("--json", action="store_true", help="Print process result as JSON")
@@ -100,28 +117,41 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(env_files=args.env_file)
     configure_logging(config.log_level, config.log_format)
 
+    db_path: Path | None = None
+    if args.command in STATEFUL_COMMANDS:
+        if args.db_path is not None:
+            db_path = args.db_path
+        elif config.state_db_path is not None:
+            db_path = Path(config.state_db_path)
+        else:
+            print(f"{args.command}: {STATE_DB_PATH_REQUIRED}", file=sys.stderr)
+            return 2
+
     require_secrets = not getattr(args, "allow_missing_secrets", False)
     if args.command == "check-config":
         return _check_config(config, require_secrets=require_secrets, as_json=args.json)
     if args.command == "startup-check":
         return _startup_check(config, require_secrets=require_secrets)
     if args.command == "daemon":
+        assert db_path is not None
         return _daemon(
             config,
             require_secrets=require_secrets,
             exit_after_startup=args.exit_after_startup,
-            db_path=args.db_path or Path(config.state_db_path),
+            db_path=db_path,
             owner_id=args.owner_id,
             max_iterations=args.max_iterations,
         )
     if args.command == "validate-issue":
         return _validate_issue(args.path, identifier=args.identifier, as_json=args.json, show_clarification=args.show_clarification)
     if args.command == "state-init":
-        return _state_init(args.db_path or Path(config.state_db_path), as_json=args.json)
+        assert db_path is not None
+        return _state_init(db_path, as_json=args.json)
     if args.command == "runner-dry-run":
         return _runner_dry_run(config, args.path, command_template=args.command_template, work_dir=args.work_dir, artifacts_dir=args.artifacts_dir, identifier=args.identifier, as_json=args.json)
     if args.command == "process-once":
-        return _process_once(config, db_path=args.db_path or Path(config.state_db_path), owner_id=args.owner_id, first=args.first, as_json=args.json)
+        assert db_path is not None
+        return _process_once(config, db_path=db_path, owner_id=args.owner_id, first=args.first, as_json=args.json)
     if args.command == "create-test-issue":
         return _create_test_issue(config, title=args.title, as_json=args.json)
     raise AssertionError(f"Unhandled command: {args.command}")

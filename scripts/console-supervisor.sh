@@ -2,7 +2,8 @@
 # console-supervisor.sh — host-side sibling-pane supervisor for the tmux agent UI.
 #
 # Runs on the HOST beside the daemon pane (host tmux pane 1). It watches the
-# bind-mounted host console log root (<runtime>/logs/console/<run_id>/lifecycle.jsonl)
+# bind-mounted host console log root
+# (<repo>/.runtime/logs/console/<run_id>/lifecycle.jsonl)
 # emitted by the container. For each live run it opens exactly one sibling host
 # tmux pane that attaches to the run's in-container tmux session ("live backend
 # output is visible", Task 2). When the run ends, the inner session dies and the
@@ -55,7 +56,7 @@ usage() {
 usage: console-supervisor.sh [options]
 
   --log-dir <dir>     Host console log root (default: resolve_host_console_log_dir:
-                      $AGENT_CONSOLE_HOST_LOG_DIR | <LAO_RUNTIME_DIR>/logs/console |
+                      $AGENT_CONSOLE_HOST_LOG_DIR |
                       <repo>/.runtime/logs/console)
   --container <name>  Container the panes attach into (default: $AGENT_CONSOLE_CONTAINER
                       | $LAO_DAEMON_CONTAINER_NAME | lao-daemon)

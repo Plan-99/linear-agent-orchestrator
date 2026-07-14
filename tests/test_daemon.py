@@ -1,7 +1,9 @@
 import sys
 
+import pytest
+
 from linear_agent_orchestrator.config import AppConfig, LinearConfig, RunnerConfig
-from linear_agent_orchestrator.daemon import run_daemon
+from linear_agent_orchestrator.daemon import build_live_daemon_components, run_daemon
 from linear_agent_orchestrator.issue_schema import validate_issue_body
 from linear_agent_orchestrator.linear_client import LinearComment, LinearIssue, LinearTransportError, WorkflowRole, WorkflowState
 from linear_agent_orchestrator.runner import ShellRunner
@@ -17,6 +19,12 @@ Write an artifact.
 ## Validation
 - Inspect output
 """
+
+
+@pytest.mark.parametrize("state_db_path", [None, ""])
+def test_live_daemon_components_require_state_database_path(state_db_path):
+    with pytest.raises(ValueError, match="STATE_DB_PATH is required"):
+        build_live_daemon_components(AppConfig(state_db_path=state_db_path))
 
 
 class FakePollingLinear:

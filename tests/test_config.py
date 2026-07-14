@@ -17,6 +17,7 @@ from linear_agent_orchestrator.config import (
 def test_config_defaults_include_first_story_constants():
     config = load_config(env={})
 
+    assert config.state_db_path is None
     assert config.poll_interval_seconds == DEFAULT_POLL_INTERVAL_SECONDS == 60
     assert config.lease_ttl_seconds == DEFAULT_LEASE_TTL_SECONDS == 900
     assert config.lease_renewal_interval_seconds == DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS == 120
@@ -26,6 +27,12 @@ def test_config_defaults_include_first_story_constants():
     assert config.backoff.max_seconds == DEFAULT_BACKOFF_MAX_SECONDS == 300
     assert config.backoff.max_attempts == DEFAULT_BACKOFF_MAX_ATTEMPTS == 5
     assert config.linear.attention_state_name == "In Review"
+
+
+def test_config_loads_explicit_state_db_path():
+    config = load_config(env={"STATE_DB_PATH": "/tmp/lao/state.sqlite3"})
+
+    assert config.state_db_path == "/tmp/lao/state.sqlite3"
 
 
 def test_config_loads_attention_state_name_from_env():

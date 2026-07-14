@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Hardened the tmux agent console and PTY/bootstrap/supervisor scripts with updated runner integration, documentation, and test coverage.
+- Made the official Compose wrapper use the orchestrator checkout's `.runtime/data/state.sqlite3` as its authoritative state location regardless of the target repository; stateful raw CLI commands now require `STATE_DB_PATH` or `--db-path` instead of creating `/workspace/data` implicitly, and `LAO_RUNTIME_DIR` is internal path-translation plumbing rather than a public `.env` override.
 - Changed daemon idle polling so Ctrl-C exits promptly while in-flight runs finish.
 - Interactive runs now end when the operator exits the TUI instead of on structured-result detection; submitting a valid result moves the issue to the attention state while the session stays open, and the Done gate is evaluated after exit (two-phase success path, DEV-23/DEV-27).
 - `RUNNER_TIMEOUT_SECONDS` now acts as an activity-based idle timeout for interactive runs (console output extends the deadline), bounded by the `RUNNER_MAX_LIFETIME_SECONDS` hard cap (DEV-25).

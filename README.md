@@ -44,10 +44,18 @@ cd linear-agent-orchestrator
 이 명령은 외부 env 파일 없이 현재 폴더 아래에 다음을 준비합니다.
 
 - `.env`: ignored secret/config 파일
-- `.runtime/data`: SQLite crash-recovery/idempotency 상태
+- `.runtime/data`: SQLite crash-recovery/idempotency 상태 root
+  (`state.sqlite3`는 첫 stateful 실행에서 생성)
 - `.runtime/work`: 이슈별 입력 및 실행 파일
 - `.runtime/artifacts`: 구조화 결과와 artifact
 - `.runtime/agent-home`: agent credential/config 전용 copy
+
+공식 `scripts/compose.sh`와 기본 runtime 설정에서는 이 경로들이
+`LAO_PROJECT_DIR`과 무관하게 항상 **orchestrator checkout의 `.runtime/` 아래**에
+있습니다. 대상 repo는 `/workspace/project`에 작업용으로만 mount됩니다. 명시적인
+`STATE_DB_PATH`, `--db-path`, `RUNNER_WORK_DIR`, `RUNNER_ARTIFACTS_DIR` override에는
+target 내부 경로를 사용하지 마세요. `LAO_RUNTIME_DIR`은 dev-container 경로 변환을
+위한 내부 plumbing이므로 `.env`에서 설정하는 공개 override가 아닙니다.
 
 SQLite는 작업 queue를 대신하지 않습니다. 작업 대상은 항상 Linear의 현재
 `project + Todo + assignee` 상태로 결정되며, SQLite는 동일 실행의 복구와 중복 방지만
@@ -253,6 +261,12 @@ runner 설정을 수정하지 않은 재큐잉은 안전 복구가 불가능한 
 
 ## 안전한 로컬 명령
 
+공식 `./scripts/compose.sh` 경로는 `STATE_DB_PATH=/workspace/data/state.sqlite3`를
+전달하고 `/workspace/data`를 이 checkout의 `.runtime/data`에 bind-mount합니다.
+따라서 아래 `state-init`, `process-once`, `daemon` 명령은 별도 DB 옵션 없이도
+authoritative DB를 사용합니다. 명시한 `--db-path`는 해당 명령에서만 우선하므로,
+아래 `/tmp` daemon smoke처럼 별도 DB를 쓰는 검증도 가능합니다.
+
 ```bash
 # 전체 재현 테스트
 ./scripts/test.sh
@@ -265,6 +279,16 @@ runner 설정을 수정하지 않은 재큐잉은 안전 복구가 불가능한 
 
 # bounded daemon wiring smoke — Linear secret 불필요, 무한 polling 없음
 ./scripts/compose.sh run --rm orchestrator daemon --allow-missing-secrets --max-iterations 0 --db-path /tmp/lao-smoke.sqlite3
+```
+
+Compose 밖에서 raw CLI를 실행할 때 `daemon`, `state-init`, `process-once`는 host에
+맞는 `STATE_DB_PATH` 또는 `--db-path`를 반드시 받아야 합니다. 둘 다 없으면 exit
+code 2로 종료하며 `data/`를 자동 생성하지 않습니다.
+
+```bash
+linear-agent-orchestrator state-init --db-path "$PWD/.runtime/data/state.sqlite3" --json
+STATE_DB_PATH="$PWD/.runtime/data/state.sqlite3" \
+  linear-agent-orchestrator daemon --allow-missing-secrets --max-iterations 0
 ```
 
 다음 명령은 실제 Linear를 변경하므로 TEST 프로젝트에서 의도적으로만 사용하세요.
@@ -298,8 +322,9 @@ window 1+ = agent run). 실행이 끝나면 해당 window도 종료되고, daemo
 
 tmux 밖에서 `auto`는 기존 headless 실행으로 돌아갑니다. `AGENT_CONSOLE=true`로 강제하면
 pane 대신 `.runtime/logs/console/supervisor.log`에 수동 attach 명령을 남깁니다.
-`.env`의 `LAO_RUNTIME_DIR`/`AGENT_CONSOLE_HOST_LOG_DIR`도 host supervisor와 Compose
-bind mount에 동일하게 적용됩니다.
+`AGENT_CONSOLE_HOST_LOG_DIR`은 console log만 위한 명시적 override로 지원됩니다.
+기본 위치는 orchestrator checkout의 `.runtime/logs/console`이며,
+`LAO_RUNTIME_DIR`은 사용자 override가 아닌 내부 경로 변환용 변수입니다.
 
 - **window 0 = daemon, window 1+ = agent run** (기본
   `AGENT_CONSOLE_OPEN_TARGET=window`). run마다 `lao:<run_id>` 이름의 별도 window가

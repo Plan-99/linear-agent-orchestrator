@@ -42,6 +42,13 @@ mtime 기준으로 더 최신이면 실행할 때마다 자동으로 재복사�
 실패, GitHub #3)에는 자동 갱신이 동작하지 않으니
 `./scripts/bootstrap.sh --refresh-credentials`로 강제 재복사하세요.
 
+공식 `scripts/compose.sh`와 기본 runtime 설정에서는 이 checkout의
+`.runtime/data/state.sqlite3`가 authoritative 상태 DB입니다. 다른
+`LAO_PROJECT_DIR`을 선택해도 DB, work, artifact는 orchestrator의 `.runtime/` 아래에
+남습니다. 명시적 DB/runner 경로 override에는 target 내부 경로를 사용하지 마세요.
+`LAO_RUNTIME_DIR`은 dev-container 경로 변환을 위한 내부 plumbing이므로 `.env`에서
+설정하지 마세요.
+
 ## 3. `.env` 설정
 
 최소 설정:
@@ -68,6 +75,8 @@ AGENT_EFFORT=high
 
 `LAO_PROJECT_DIR`이 가리킬 저장소의 조건:
 
+- LAO의 `.runtime/data`, `.runtime/work`, `.runtime/artifacts`를 대상 repo 안으로
+  만들거나 옮기지 마세요. 대상 repo는 agent가 수정할 작업 checkout일 뿐입니다.
 - **writable한 git 저장소**이고 **커밋이 최소 1개** 있어야 합니다
   (run마다 HEAD에서 worktree를 분기하므로 빈 repo는 불가).
 - **`.gitignore`에 agent 런타임 산출물을 등록**하세요. 성공 커밋이
@@ -96,6 +105,10 @@ AGENT_EFFORT=high
 
 `startup-check`가 실패하면 오류 목록이 그대로 출력됩니다. Linear를 변경하지
 않는 읽기 전용 점검이므로 안심하고 반복 실행하세요.
+공식 `scripts/compose.sh`는 container의 `STATE_DB_PATH`를 이 checkout의
+`.runtime/data/state.sqlite3`에 연결합니다. Compose 밖의 raw `daemon`, `state-init`,
+`process-once`는 host에 맞는 `STATE_DB_PATH` 또는 `--db-path`가 필요하며, 둘 다
+없으면 exit code 2로 종료하고 `data/`를 만들지 않습니다.
 `AGENT_INTERACTIVE=true`인데 tmux 밖에서 점검하면 "requires
 AGENT_CONSOLE=true" 오류가 나는데, 이는 정상입니다(6번 참고) —
 `-e AGENT_CONSOLE=true`를 붙여 점검하면 됩니다.
@@ -189,7 +202,7 @@ In Review만 골라 받을 수 없어 daemon이 바꾸는 모든 상태 전환�
 | In Review 이슈를 Todo로 재큐잉 | Done된 이슈는 영구 종결이라 무시되고, 실패 이슈의 무편집 재큐잉은 fail-in-doubt만 남습니다. 후속 작업은 **새 이슈**로. |
 | 에이전트에게 `LINEAR_API_KEY` 전달 (`RUNNER_ALLOWED_ENV`에 추가) | 에이전트가 자기 이슈를 스스로 Done으로 만들 수 있게 되어 Done gate가 무력화됩니다. |
 | 같은 assignee로 daemon 2개 동시 실행 | 머신 간 claim 조정이 없어 중복 실행됩니다. |
-| `.runtime/data`의 SQLite 임의 삭제 | 복구/중복 방지 기록이 사라집니다. 의도적 reset일 때만. |
+| orchestrator checkout의 `.runtime/data/state.sqlite3` 임의 삭제·이동 | authoritative 복구/중복 방지 기록이 사라지거나 여러 DB로 갈라집니다. 의도적 reset일 때만. |
 | daemon을 tmux/session manager 밖에서 방치 실행 | 터미널이 닫히면 컨테이너도 SIGTERM을 받습니다. |
 | **호스트에서** 대상 repo에 `git worktree prune` 실행 | run worktree의 컨테이너 경로(`/workspace/...`)가 호스트에서는 해석되지 않아, 살아있는 run의 worktree 등록까지 파괴될 수 있습니다. worktree 정리는 orchestrator가 컨테이너 안에서 자동으로 합니다. |
 
