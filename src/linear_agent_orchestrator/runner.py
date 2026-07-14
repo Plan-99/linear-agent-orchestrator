@@ -87,6 +87,23 @@ def _strip_ansi(value: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", value)
 
 
+# A fresh checkout of a large repository legitimately exceeds the default git
+# timeout; a killed `worktree add` leaves a locked registration behind.
+_WORKTREE_ADD_TIMEOUT_SECONDS = 600
+
+
+def _git_error_snippet(output: str, limit: int = 300) -> str:
+    """Tail of git output with checkout-progress spam dropped.
+
+    git leads stderr with hundreds of "Updating files: N%" lines, so a
+    head-truncated snippet hides the actual fatal line at the end.
+    """
+
+    parts = [part.strip() for part in re.split(r"[\r\n]+", output) if part.strip()]
+    parts = [part for part in parts if not part.startswith("Updating files:")]
+    return " ".join(parts)[-limit:]
+
+
 class RunnerError(ValueError):
     """Raised for unsafe or invalid runner configuration."""
 
@@ -229,13 +246,13 @@ class ShellRunner:
         return self.config.worktree_isolation and self._uses_standard_wrapper()
 
     @staticmethod
-    def _git(cwd: Path | str, *args: str) -> tuple[int, str, str]:
+    def _git(cwd: Path | str, *args: str, timeout: int = 120) -> tuple[int, str, str]:
         try:
             completed = subprocess.run(
                 ["git", "-C", str(cwd), *args],
                 text=True,
                 capture_output=True,
-                timeout=120,
+                timeout=timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -251,7 +268,10 @@ class ShellRunner:
         return candidate
 
     def _remove_worktree(self, base: Path, worktree: Path, *, delete_branch: str | None = None) -> None:
-        self._git(base, "worktree", "remove", "--force", str(worktree))
+        # Double --force also clears locked registrations: a run killed inside
+        # `git worktree add` leaves the entry locked ("initializing"), which a
+        # single --force and `worktree prune` both refuse to touch.
+        self._git(base, "worktree", "remove", "--force", "--force", str(worktree))
         if worktree.exists():
             shutil.rmtree(worktree, ignore_errors=True)
         self._git(base, "worktree", "prune")
@@ -264,15 +284,29 @@ class ShellRunner:
         base = Path(self.config.project_dir)
         safe_name = sanitize_path_part(issue.identifier or issue.id)
         worktree = Path(self.config.work_dir) / "worktrees" / safe_name
-        # A previous crashed/kept run of this issue may have left a worktree.
-        if worktree.exists() or worktree.is_symlink():
-            self._remove_worktree(base, worktree)
+        # A previous crashed/kept run may have left a worktree directory, a
+        # registration without a directory, or a locked entry from a killed
+        # `worktree add`; git refuses the add below over any of them, and only
+        # the directory is visible to an exists() check — so always clean.
+        self._remove_worktree(base, worktree)
         branch = self._unique_branch(base, f"lao/{safe_name}-{execution_key(issue, self.config)[:8]}")
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        code, out, err = self._git(base, "worktree", "add", "-b", branch, str(worktree), "HEAD")
+        code, out, err = self._git(
+            base,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(worktree),
+            "HEAD",
+            timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
+        )
         if code != 0:
+            # `add -b` creates the branch before the registration checks that
+            # can fail it, so delete it or every failed retry leaks a branch.
+            self._git(base, "branch", "-D", branch)
             raise RunnerError(
-                f"Failed to create isolated worktree for {issue.identifier}: {(err or out).strip()[:300]}"
+                f"Failed to create isolated worktree for {issue.identifier}: {_git_error_snippet(err or out)}"
             )
         base_commit = self._git(worktree, "rev-parse", "HEAD")[1].strip() or None
         return _WorkspaceContext(

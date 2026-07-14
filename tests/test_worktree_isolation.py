@@ -1,12 +1,15 @@
 """Per-run git worktree isolation: branch commit, preservation, and preflight."""
 
 from pathlib import Path
+import shutil
 import subprocess
+
+import pytest
 
 from linear_agent_orchestrator.config import RunnerConfig
 from linear_agent_orchestrator.issue_schema import validate_issue_body
 from linear_agent_orchestrator.linear_client import LinearIssue
-from linear_agent_orchestrator.runner import ShellRunner, execution_key
+from linear_agent_orchestrator.runner import RunnerError, ShellRunner, execution_key
 
 VALID_BODY = """## Task
 Write an artifact.
@@ -255,3 +258,58 @@ def test_preflight_allows_dirty_base_repo_when_isolated(tmp_path):
 
     assert isolated.preflight_workspace() == []
     assert any("dirty" in error for error in legacy.preflight_workspace())
+
+
+def test_stale_registration_without_directory_is_cleared(tmp_path):
+    """Regression: a .git/worktrees entry whose directory is gone (operator
+    cleanup, crash between rmtree and prune) wedged the issue forever because
+    cleanup only ran when the directory existed, while `git worktree add`
+    refuses over the registration ("missing but already registered")."""
+    repo = make_repo(tmp_path)
+    wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)
+    config = make_config(tmp_path, repo, wrapper)
+    stale = Path(config.work_dir) / "worktrees" / "DEV-1"
+    git(repo, "worktree", "add", "-b", "stale-branch", str(stale), "HEAD")
+    shutil.rmtree(stale)
+
+    result = ShellRunner(config).run(make_issue())
+
+    assert result.completed_semantically
+    assert "worktrees/DEV-1" not in git(repo, "worktree", "list").stdout
+
+
+def test_locked_registration_from_killed_add_is_cleared(tmp_path):
+    """Regression: a run killed inside `git worktree add` leaves the entry
+    locked ("initializing"); single-force remove and prune both skip it, so
+    every retry failed with "missing but locked worktree"."""
+    repo = make_repo(tmp_path)
+    wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)
+    config = make_config(tmp_path, repo, wrapper)
+    stale = Path(config.work_dir) / "worktrees" / "DEV-1"
+    git(repo, "worktree", "add", "-b", "stale-branch", str(stale), "HEAD")
+    git(repo, "worktree", "lock", "--reason", "initializing", str(stale))
+    shutil.rmtree(stale)
+
+    result = ShellRunner(config).run(make_issue())
+
+    assert result.completed_semantically
+    assert "worktrees/DEV-1" not in git(repo, "worktree", "list").stdout
+
+
+def test_failed_worktree_add_does_not_leak_branch(tmp_path):
+    """`worktree add -b` creates the branch before the checks that can fail
+    the add; without cleanup every failed retry leaked one lao/* branch."""
+    repo = make_repo(tmp_path)
+    wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)
+    config = make_config(tmp_path, repo, wrapper)
+    issue = make_issue()
+    # A plain file at the worktree path survives cleanup (it is not a
+    # registered worktree and not a directory) and makes the add fail.
+    blocker = Path(config.work_dir) / "worktrees" / "DEV-1"
+    blocker.parent.mkdir(parents=True)
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(RunnerError, match="Failed to create isolated worktree"):
+        ShellRunner(config).run(issue)
+
+    assert git(repo, "branch", "--list", "lao/*").stdout.strip() == ""
