@@ -304,7 +304,10 @@ class ShellRunner:
         if code != 0:
             # `add -b` creates the branch before the registration checks that
             # can fail it, so delete it or every failed retry leaks a branch.
-            self._git(base, "branch", "-D", branch)
+            # A killed add can also leave a locked registration that still
+            # references the branch, which makes a plain `branch -D` fail —
+            # clear the registration first.
+            self._remove_worktree(base, worktree, delete_branch=branch)
             raise RunnerError(
                 f"Failed to create isolated worktree for {issue.identifier}: {_git_error_snippet(err or out)}"
             )

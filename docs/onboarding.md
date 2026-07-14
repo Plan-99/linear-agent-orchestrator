@@ -187,6 +187,7 @@ In Review만 골라 받을 수 없어 daemon이 바꾸는 모든 상태 전환�
 | 같은 assignee로 daemon 2개 동시 실행 | 머신 간 claim 조정이 없어 중복 실행됩니다. |
 | `.runtime/data`의 SQLite 임의 삭제 | 복구/중복 방지 기록이 사라집니다. 의도적 reset일 때만. |
 | daemon을 tmux/session manager 밖에서 방치 실행 | 터미널이 닫히면 컨테이너도 SIGTERM을 받습니다. |
+| **호스트에서** 대상 repo에 `git worktree prune` 실행 | run worktree의 컨테이너 경로(`/workspace/...`)가 호스트에서는 해석되지 않아, 살아있는 run의 worktree 등록까지 파괴될 수 있습니다. worktree 정리는 orchestrator가 컨테이너 안에서 자동으로 합니다. |
 
 ## 11. 자주 겪는 문제
 

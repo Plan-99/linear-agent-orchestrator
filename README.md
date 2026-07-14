@@ -357,6 +357,9 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
 - credential copy는 자동 refresh되지 않습니다.
 - SQLite를 삭제하면 복구/idempotency 기록도 사라지므로 의도적인 reset 외에는 삭제하지
   마세요.
+- 호스트에서 대상 repo에 `git worktree prune`을 실행하지 마세요. run worktree의
+  컨테이너 경로(`/workspace/...`)가 호스트에서 해석되지 않아 살아있는 run의 등록까지
+  파괴될 수 있습니다. worktree 정리는 orchestrator가 컨테이너 안에서 수행합니다.
 
 ## 주요 모듈
 
