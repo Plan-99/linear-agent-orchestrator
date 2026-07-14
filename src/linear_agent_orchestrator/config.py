@@ -335,6 +335,11 @@ def apply_env_file_to_process(path: Path, environ: MutableMapping[str, str] | No
         target.setdefault(key, value)
 
 
+# Recovery guidance for stale agent-home credential copies (GitHub #3): a
+# host-side token rotation invalidates the dedicated copy until it is reseeded.
+_CREDENTIAL_RECOVERY_HINT = "re-login on the host, then run ./scripts/bootstrap.sh --refresh-credentials"
+
+
 def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[str]:
     """Validate the fixed-workspace agent backend before any issue is claimed."""
 
@@ -376,16 +381,24 @@ def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[
     if require_auth and runner.backend in {"omx", "codex"} and shutil.which("codex") is not None:
         auth_check = _run_preflight_command(("codex", "login", "status"))
         if auth_check[0] != 0:
-            errors.append(f"Codex authentication check failed: {_preflight_output(auth_check)}")
+            errors.append(
+                f"Codex authentication check failed: {_preflight_output(auth_check)}"
+                f" (recover: {_CREDENTIAL_RECOVERY_HINT})"
+            )
     if require_auth and runner.backend == "claude" and shutil.which("claude") is not None:
         auth_check = _run_preflight_command(("claude", "auth", "status", "--json"))
         if auth_check[0] != 0:
-            errors.append(f"Claude authentication check failed: {_preflight_output(auth_check)}")
+            errors.append(
+                f"Claude authentication check failed: {_preflight_output(auth_check)}"
+                f" (recover: {_CREDENTIAL_RECOVERY_HINT})"
+            )
         else:
             try:
                 auth_status = json.loads(auth_check[1])
                 if not isinstance(auth_status, dict) or auth_status.get("loggedIn") is not True:
-                    errors.append("Claude authentication check reported loggedIn=false")
+                    errors.append(
+                        f"Claude authentication check reported loggedIn=false (recover: {_CREDENTIAL_RECOVERY_HINT})"
+                    )
             except json.JSONDecodeError:
                 errors.append("Claude authentication check returned invalid JSON")
     return errors

@@ -6,6 +6,23 @@ cd "$ROOT_DIR"
 
 AGENT_HOME=.runtime/agent-home
 
+# --refresh-credentials: force re-copy of every existing host credential
+# original regardless of mtime. Escape hatch for the GitHub #3 case where the
+# stale copy carries the newer mtime (see copy_credential below).
+REFRESH_CREDENTIALS=false
+for arg in "$@"; do
+  case "$arg" in
+    --refresh-credentials)
+      REFRESH_CREDENTIALS=true
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      echo "Usage: $0 [--refresh-credentials]" >&2
+      exit 1
+      ;;
+  esac
+done
+
 mkdir -p .runtime/data .runtime/work .runtime/artifacts .runtime/logs/console \
   "$AGENT_HOME/.codex" "$AGENT_HOME/.claude"
 touch .runtime/data/.gitkeep .runtime/work/.gitkeep .runtime/artifacts/.gitkeep .runtime/logs/.gitkeep
@@ -36,12 +53,28 @@ HOST_GID="$(detect_host_id gid)"
 
 # Seed the dedicated agent home with credential copies. Compose mounts only
 # this directory at /home/agent — never the live host CLI homes.
+#
+# A copy is refreshed whenever the host original is strictly newer (mtime), so
+# a host-side token rotation self-heals on the next bootstrap/daemon start
+# (GitHub #3). Known limitation of the mtime heuristic: if the container CLI
+# rewrites the copy *after* the host rotation (e.g. the 16:40 case in #3 — a
+# failed refresh with the already-rotated token), the stale copy carries the
+# newer mtime and is kept; --refresh-credentials is the escape hatch there.
 copy_credential() {
   local source="$1"
   local destination="$2"
-  if [[ -f "$source" && ! -e "$destination" ]]; then
+  if [[ ! -f "$source" ]]; then
+    return 0
+  fi
+  if [[ ! -e "$destination" ]]; then
     install -m 0600 "$source" "$destination"
     echo "Seeded $(basename "$destination") into $AGENT_HOME/ (dedicated copy)."
+  elif [[ "$REFRESH_CREDENTIALS" == "true" ]]; then
+    install -m 0600 "$source" "$destination"
+    echo "Refreshed $(basename "$destination") from host (--refresh-credentials)."
+  elif [[ "$source" -nt "$destination" ]]; then
+    install -m 0600 "$source" "$destination"
+    echo "Refreshed $(basename "$destination") from newer host original."
   fi
 }
 

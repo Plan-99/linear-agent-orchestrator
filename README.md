@@ -94,17 +94,29 @@ Linear user ID로 설정하면 됩니다. 미할당 이슈와 다른 사람에�
 
 ### 3. agent 인증 준비
 
-`bootstrap.sh`는 실행 시점의 다음 파일이 존재하면 `.runtime/agent-home`으로 **한 번만**
-복사합니다.
+`bootstrap.sh`는 실행 시점의 다음 파일이 존재하면 `.runtime/agent-home`으로 복사합니다.
 
 - `${CODEX_HOME:-$HOME/.codex}/auth.json`
 - `${CODEX_HOME:-$HOME/.codex}/config.toml`
 - `$HOME/.claude/.credentials.json`
 - `$HOME/.claude.json`
 
-먼저 host에서 사용할 CLI에 로그인한 뒤 bootstrap을 실행하세요. host 인증을 갱신한 경우
-daemon을 중지하고 해당 전용 copy를 삭제한 다음 `./scripts/bootstrap.sh`를 다시 실행해야
-합니다. live host credential 파일은 컨테이너에 직접 mount되지 않습니다.
+먼저 host에서 사용할 CLI에 로그인한 뒤 bootstrap을 실행하세요. live host credential
+파일은 컨테이너에 직접 mount되지 않습니다.
+
+사본 갱신 규칙 (GitHub #3):
+
+- host 원본이 사본보다 mtime 기준으로 더 최신이면 bootstrap 실행 시(daemon.sh는 시작할
+  때 bootstrap을 실행) 자동으로 재복사됩니다. host 재로그인 후에는 bootstrap만 다시
+  돌리면 됩니다.
+- 컨테이너 쪽 CLI가 사본을 덮어써 사본 mtime이 host보다 최신이 된 경우(예: 이미 회전된
+  refresh token으로 갱신 실패)에는 mtime 휴리스틱이 동작하지 않으므로
+  `./scripts/bootstrap.sh --refresh-credentials`로 강제 재복사하세요.
+- 근본 해법은 **컨테이너 전용 독립 grant**입니다: daemon 중지 → 사본 삭제
+  (`rm .runtime/agent-home/.claude/.credentials.json`) → 컨테이너 안에서 로그인 1회
+  (`./scripts/compose.sh run --rm --entrypoint claude orchestrator` 실행 후 `/login`).
+  이후 host와 컨테이너가 서로 다른 grant를 사용하므로 refresh token rotation 충돌이
+  원천적으로 사라집니다.
 
 ### 4. 빌드와 사전 점검
 
@@ -354,7 +366,9 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
 - 동일 assignee를 사용하는 여러 machine 사이의 distributed claim은 없습니다.
 - 자동 push/PR/merge/이슈 삭제는 없습니다.
 - Docker socket과 issue-controlled bind mount는 지원하지 않습니다.
-- credential copy는 자동 refresh되지 않습니다.
+- credential copy는 bootstrap 실행 시점에만 갱신됩니다(host 원본이 더 최신이면 자동
+  재복사, `--refresh-credentials`로 강제 재복사). 장기 실행 중 divergence는 여전히
+  가능합니다("3. agent 인증 준비" 참고).
 - SQLite를 삭제하면 복구/idempotency 기록도 사라지므로 의도적인 reset 외에는 삭제하지
   마세요.
 - 호스트에서 대상 repo에 `git worktree prune`을 실행하지 마세요. run worktree의

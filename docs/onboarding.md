@@ -34,9 +34,13 @@ cd linear-agent-orchestrator
 ```
 
 `bootstrap.sh`는 `.runtime/` 디렉토리들과 `.env`(예시에서 복사), agent
-credential 사본(`.runtime/agent-home`)을 준비합니다. host에서 인증을
-갱신했다면 daemon을 멈추고 해당 사본을 지운 뒤 bootstrap을 다시 실행해야
-합니다(사본은 자동 갱신되지 않습니다).
+credential 사본(`.runtime/agent-home`)을 준비합니다. host 원본이 사본보다
+mtime 기준으로 더 최신이면 실행할 때마다 자동으로 재복사되므로, host에서
+재로그인한 뒤에는 bootstrap(또는 시작 시 bootstrap을 실행하는
+`./scripts/daemon.sh`)만 다시 돌리면 됩니다. 단, 컨테이너 쪽 CLI가 사본을
+덮어써 사본 mtime이 host보다 최신이 된 경우(예: 이미 회전된 token으로 갱신
+실패, GitHub #3)에는 자동 갱신이 동작하지 않으니
+`./scripts/bootstrap.sh --refresh-credentials`로 강제 재복사하세요.
 
 ## 3. `.env` 설정
 
@@ -195,9 +199,15 @@ In Review만 골라 받을 수 없어 daemon이 바꾸는 모든 상태 전환�
   ② 자신에게 할당 + Todo 상태? ③ 3섹션이 전부 채워짐? (clarification
   댓글이 달렸는지 확인) ④ 이미 처리된 적 있는 이슈? (Done/failed 이슈는
   재사용 불가)
-- **startup-check에서 backend 인증 실패** — host에서 재로그인 후
-  `.runtime/agent-home`의 해당 사본을 지우고 `./scripts/bootstrap.sh`
-  재실행.
+- **startup-check에서 backend 인증 실패** — 대부분 host token rotation으로
+  `.runtime/agent-home` 사본이 무효화된 경우입니다(GitHub #3). host에서
+  재로그인 후 `./scripts/bootstrap.sh --refresh-credentials`를 실행하세요.
+  반복 재발한다면 근본 해법은 **컨테이너 전용 독립 grant**입니다: daemon을
+  중지하고 사본(`rm .runtime/agent-home/.claude/.credentials.json`)을 지운
+  뒤, 컨테이너 안에서 로그인을 1회 수행합니다
+  (`./scripts/compose.sh run --rm --entrypoint claude orchestrator` 실행 후
+  `/login`). 이후 host와 컨테이너가 서로 다른 grant를 쓰므로 refresh token
+  rotation 충돌이 원천적으로 사라집니다.
 - **결과 브랜치에 로그 파일이 섞임** — 대상 repo `.gitignore`에 agent
   런타임 산출물 등록(4번 참고).
 - **실패한 run 조사** — Linear 실패 댓글 + `.runtime/work/worktrees/`에
