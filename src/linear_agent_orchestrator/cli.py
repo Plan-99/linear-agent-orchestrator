@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 import logging
 from datetime import UTC, datetime
@@ -10,10 +11,16 @@ from pathlib import Path
 import sys
 
 from . import __version__
-from .config import AppConfig, RunnerConfig, load_config
+from .config import (
+    LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS,
+    AppConfig,
+    LinearConfig,
+    RunnerConfig,
+    load_config,
+)
 from .daemon import run_daemon
 from .issue_schema import clarification_comment, validate_issue_body
-from .linear_client import LinearClient, LinearIssue
+from .linear_client import LinearClient, LinearIssue, OAuthClientCredentialsTokenProvider
 from .logging import configure_logging
 from .runner import ShellRunner, process_next_issue_once
 from .state import StateStore
@@ -24,6 +31,17 @@ STATE_DB_PATH_REQUIRED = (
     "or run via ./scripts/compose.sh"
 )
 STATEFUL_COMMANDS = frozenset({"daemon", "state-init", "process-once"})
+LINEAR_ACCESS_PREFLIGHT_QUERY = """
+query LinearAccessPreflight($teamId: String!, $projectId: ID!, $assigneeId: String!) {
+  team(id: $teamId) {
+    id
+    projects(first: 1, filter: { id: { eq: $projectId } }) {
+      nodes { id }
+    }
+  }
+  user(id: $assigneeId) { id }
+}
+"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,10 +186,32 @@ def _check_config(config: AppConfig, require_secrets: bool, as_json: bool) -> in
     return 1 if errors else 0
 
 
-def _startup_check(config: AppConfig, require_secrets: bool) -> int:
+def _linear_client_factory(config: LinearConfig) -> Callable[[], LinearClient]:
+    """Build clients that share one process-scoped OAuth token provider."""
+
+    oauth_token_provider = None
+    if (
+        config.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS
+        and config.oauth_client_id
+        and config.oauth_client_secret
+    ):
+        oauth_token_provider = OAuthClientCredentialsTokenProvider.from_config(config)
+
+    if oauth_token_provider is None:
+        return lambda: LinearClient.from_config(config)
+    return lambda: LinearClient.from_config(config, oauth_token_provider=oauth_token_provider)
+
+
+def _startup_check(
+    config: AppConfig,
+    require_secrets: bool,
+    *,
+    client_factory: Callable[[], LinearClient] | None = None,
+) -> int:
     errors = config.validate_startup(require_secrets=require_secrets)
     if require_secrets and not errors:
-        errors.extend(linear_assignee_preflight_errors(config))
+        client = client_factory() if client_factory is not None else None
+        errors.extend(linear_assignee_preflight_errors(config, client=client))
     if errors:
         for error in errors:
             LOGGER.error("startup_config_error", extra={"error": error})
@@ -180,6 +220,7 @@ def _startup_check(config: AppConfig, require_secrets: bool) -> int:
         "startup_check_passed",
         extra={
             "environment": config.environment,
+            "linear_auth_mode": config.linear.auth_mode,
             "poll_interval_seconds": config.poll_interval_seconds,
             "lease_ttl_seconds": config.lease_ttl_seconds,
             "runner_timeout_seconds": config.runner.timeout_seconds,
@@ -189,14 +230,37 @@ def _startup_check(config: AppConfig, require_secrets: bool) -> int:
 
 
 def linear_assignee_preflight_errors(config: AppConfig, client: LinearClient | None = None) -> list[str]:
-    """Resolve the configured/default assignee through Linear before claiming work."""
+    """Verify read access to the configured Linear team, project, and assignee."""
 
     try:
-        assignee_id = (client or LinearClient.from_config(config.linear)).resolve_assignee_id(config.linear)
+        live_client = client or LinearClient.from_config(config.linear)
+        if not config.linear.team_id:
+            return ["Linear access preflight requires LINEAR_TEAM_ID"]
+        team_id = live_client.resolve_team_uuid(config.linear.team_id)
+        project_id = live_client.resolve_project_id(config.linear)
+        if not project_id:
+            return ["Linear access preflight returned an empty project ID"]
+        assignee_id = live_client.resolve_assignee_id(config.linear)
+        if not assignee_id:
+            return ["Linear access preflight returned an empty assignee ID"]
+        data = live_client.graphql(
+            LINEAR_ACCESS_PREFLIGHT_QUERY,
+            {
+                "teamId": team_id,
+                "projectId": project_id,
+                "assigneeId": assignee_id,
+            },
+        )
     except Exception as exc:  # noqa: BLE001 - startup must fail closed for any client/transport error
-        return [f"Linear assignee preflight failed: {type(exc).__name__}: {str(exc)[:300]}"]
-    if not assignee_id:
-        return ["Linear assignee preflight returned an empty assignee ID"]
+        return [f"Linear access preflight failed: {type(exc).__name__}: {str(exc)[:300]}"]
+
+    team = data.get("team") or {}
+    project_nodes = ((team.get("projects") or {}).get("nodes") or []) if isinstance(team, dict) else []
+    if not any(isinstance(node, dict) and str(node.get("id")) == project_id for node in project_nodes):
+        return ["Linear access preflight could not access the configured project in the configured team"]
+    user = data.get("user") or {}
+    if not isinstance(user, dict) or str(user.get("id") or "") != assignee_id:
+        return ["Linear access preflight could not access LINEAR_ASSIGNEE_ID"]
     return []
 
 
@@ -286,15 +350,9 @@ def _runner_dry_run(
 
 
 def _create_test_issue(config: AppConfig, *, title: str | None, as_json: bool) -> int:
-    missing = []
-    if not config.linear.api_key:
-        missing.append("LINEAR_API_KEY is required")
-    if not config.linear.team_id:
-        missing.append("LINEAR_TEAM_ID is required")
-    if not (config.linear.project_name or config.linear.project_id):
-        missing.append("LINEAR_PROJECT_NAME or LINEAR_PROJECT_ID is required")
-    if missing:
-        for error in missing:
+    errors = config.linear.validation_errors(require_secrets=True)
+    if errors:
+        for error in errors:
             LOGGER.error("create_test_issue_config_error", extra={"error": error})
         return 1
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -321,13 +379,15 @@ def _create_test_issue(config: AppConfig, *, title: str | None, as_json: bool) -
 
 def _process_once(config: AppConfig, *, db_path: Path, owner_id: str, first: int, as_json: bool) -> int:
     errors = config.validate_startup(require_secrets=True)
+    linear = None
     if not errors:
-        errors.extend(linear_assignee_preflight_errors(config))
+        linear = _linear_client_factory(config.linear)()
+        errors.extend(linear_assignee_preflight_errors(config, client=linear))
     if errors:
         for error in errors:
             LOGGER.error("process_once_config_error", extra={"error": error})
         return 1
-    linear = LinearClient.from_config(config.linear)
+    assert linear is not None
     runner = ShellRunner(config.runner)
     with StateStore(db_path) as state:
         result = process_next_issue_once(
@@ -383,10 +443,16 @@ def _daemon(
     owner_id: str,
     max_iterations: int | None,
 ) -> int:
-    startup_code = _startup_check(config, require_secrets=require_secrets)
+    linear_client_factory = _linear_client_factory(config.linear)
+    startup_code = _startup_check(
+        config,
+        require_secrets=require_secrets,
+        client_factory=linear_client_factory,
+    )
     if startup_code != 0:
         return startup_code
-    # Test-friendly smoke: validates config and initializes/migrates state without Linear network access.
+    # With --allow-missing-secrets this is a local-only smoke; normal startup
+    # includes the read-only Linear access preflight above.
     if exit_after_startup or max_iterations == 0:
         with StateStore(db_path) as state:
             schema_version = state.schema_version()
@@ -400,12 +466,12 @@ def _daemon(
             max_iterations=max_iterations,
             component_factory=lambda: (
                 StateStore(db_path),
-                LinearClient.from_config(config.linear),
+                linear_client_factory(),
                 ShellRunner(config.runner),
             ),
         )
     else:
-        linear = LinearClient.from_config(config.linear)
+        linear = linear_client_factory()
         runner = ShellRunner(config.runner)
         with StateStore(db_path) as state:
             result = run_daemon(

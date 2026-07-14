@@ -23,10 +23,13 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       STATE_DB_PATH: ${STATE_DB_PATH:-/workspace/data/state.sqlite3}
+      LINEAR_AUTH_MODE: ${LINEAR_AUTH_MODE:-api_key}
       LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_OAUTH_CLIENT_ID: ${LINEAR_OAUTH_CLIENT_ID:-}
+      LINEAR_OAUTH_CLIENT_SECRET: ${LINEAR_OAUTH_CLIENT_SECRET:-}
       LINEAR_TEAM_ID: ${LINEAR_TEAM_ID:-}
-      # Only issues assigned to this user are polled; empty means the API
-      # viewer (the user owning LINEAR_API_KEY).
+      # Only issues assigned to this user are polled. API-key mode may leave it
+      # empty to use the viewer; OAuth app-actor mode requires a human user ID.
       LINEAR_ASSIGNEE_ID: ${LINEAR_ASSIGNEE_ID:-}
       LINEAR_PROJECT_NAME: ${LINEAR_PROJECT_NAME:-}
       LINEAR_PROJECT_ID: ${LINEAR_PROJECT_ID:-}
@@ -110,7 +113,10 @@ services:
       AGENT_CONSOLE: "false"
       AGENT_CONSOLE_LOG_DIR: /tmp/lao-tests/logs/console
       AGENT_CONSOLE_DIRECT_INPUT: "false"
+      LINEAR_AUTH_MODE: api_key
       LINEAR_API_KEY: ""
+      LINEAR_OAUTH_CLIENT_ID: ""
+      LINEAR_OAUTH_CLIENT_SECRET: ""
       LINEAR_TEAM_ID: ""
       LINEAR_ASSIGNEE_ID: ""
       LINEAR_PROJECT_NAME: ""

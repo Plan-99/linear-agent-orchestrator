@@ -26,6 +26,11 @@ DEFAULT_RUNNER_MAX_LIFETIME_SECONDS = 21600
 DEFAULT_BACKOFF_INITIAL_SECONDS = 5
 DEFAULT_BACKOFF_MAX_SECONDS = 300
 DEFAULT_BACKOFF_MAX_ATTEMPTS = 5
+LINEAR_AUTH_MODE_API_KEY = "api_key"
+LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS = "oauth_client_credentials"
+SUPPORTED_LINEAR_AUTH_MODES = frozenset(
+    {LINEAR_AUTH_MODE_API_KEY, LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS}
+)
 _RUNNER_PLACEHOLDERS = {
     "prompt_path",
     "context_path",
@@ -49,7 +54,10 @@ class BackoffConfig:
 class LinearConfig:
     """Linear API and queue targeting configuration."""
 
-    api_key: str | None = None
+    auth_mode: str = LINEAR_AUTH_MODE_API_KEY
+    api_key: str | None = field(default=None, repr=False)
+    oauth_client_id: str | None = None
+    oauth_client_secret: str | None = field(default=None, repr=False)
     team_id: str | None = None
     project_name: str | None = None
     project_id: str | None = None
@@ -58,6 +66,70 @@ class LinearConfig:
     done_state_name: str = "Done"
     attention_state_name: str = "In Review"
     assignee_id: str | None = None
+
+    def auth_validation_errors(self, *, require_secrets: bool = True) -> list[str]:
+        """Validate one unambiguous Linear authentication configuration."""
+
+        errors: list[str] = []
+        if self.auth_mode not in SUPPORTED_LINEAR_AUTH_MODES:
+            supported = ", ".join(sorted(SUPPORTED_LINEAR_AUTH_MODES))
+            errors.append(f"LINEAR_AUTH_MODE must be one of: {supported}")
+            return errors
+
+        has_oauth_credential = bool(self.oauth_client_id or self.oauth_client_secret)
+        if self.api_key and has_oauth_credential:
+            errors.append(
+                "LINEAR_API_KEY cannot be combined with LINEAR_OAUTH_CLIENT_ID or "
+                "LINEAR_OAUTH_CLIENT_SECRET"
+            )
+        elif self.auth_mode == LINEAR_AUTH_MODE_API_KEY and has_oauth_credential:
+            errors.append(
+                "LINEAR_OAUTH_CLIENT_ID and LINEAR_OAUTH_CLIENT_SECRET require "
+                "LINEAR_AUTH_MODE=oauth_client_credentials"
+            )
+        elif self.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS and self.api_key:
+            errors.append(
+                "LINEAR_API_KEY requires LINEAR_AUTH_MODE=api_key and cannot be used in OAuth mode"
+            )
+
+        if (
+            self.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS
+            and not self.assignee_id
+        ):
+            errors.append(
+                "LINEAR_ASSIGNEE_ID is required for "
+                "LINEAR_AUTH_MODE=oauth_client_credentials"
+            )
+
+        if require_secrets:
+            if self.auth_mode == LINEAR_AUTH_MODE_API_KEY:
+                if not self.api_key:
+                    errors.append("LINEAR_API_KEY is required")
+            else:
+                if not self.oauth_client_id:
+                    errors.append(
+                        "LINEAR_OAUTH_CLIENT_ID is required for "
+                        "LINEAR_AUTH_MODE=oauth_client_credentials"
+                    )
+                if not self.oauth_client_secret:
+                    errors.append(
+                        "LINEAR_OAUTH_CLIENT_SECRET is required for "
+                        "LINEAR_AUTH_MODE=oauth_client_credentials"
+                    )
+        return errors
+
+    def validation_errors(self, *, require_secrets: bool = True) -> list[str]:
+        """Validate Linear authentication and its queue target."""
+
+        errors = self.auth_validation_errors(require_secrets=require_secrets)
+        if self.auth_mode not in SUPPORTED_LINEAR_AUTH_MODES:
+            return errors
+        if require_secrets:
+            if not self.team_id:
+                errors.append("LINEAR_TEAM_ID is required")
+            if not (self.project_name or self.project_id):
+                errors.append("LINEAR_PROJECT_NAME or LINEAR_PROJECT_ID is required")
+        return errors
 
 
 @dataclass(frozen=True)
@@ -159,13 +231,8 @@ class AppConfig:
             errors.append("MAX_PARALLEL_RUNS must be positive")
         if self.max_parallel_runs > 1 and not self.runner.worktree_isolation:
             errors.append("MAX_PARALLEL_RUNS > 1 requires AGENT_WORKTREE_ISOLATION=true (parallel runs must not share one checkout)")
+        errors.extend(self.linear.validation_errors(require_secrets=require_secrets))
         if require_secrets:
-            if not self.linear.api_key:
-                errors.append("LINEAR_API_KEY is required")
-            if not self.linear.team_id:
-                errors.append("LINEAR_TEAM_ID is required")
-            if not (self.linear.project_name or self.linear.project_id):
-                errors.append("LINEAR_PROJECT_NAME or LINEAR_PROJECT_ID is required")
             if not self.runner.command_template:
                 errors.append("RUNNER_COMMAND_TEMPLATE is required")
         if self.runner.command_template:
@@ -185,6 +252,8 @@ class AppConfig:
         data = asdict(self)
         if self.linear.api_key:
             data["linear"]["api_key"] = "***REDACTED***"  # type: ignore[index]
+        if self.linear.oauth_client_secret:
+            data["linear"]["oauth_client_secret"] = "***REDACTED***"  # type: ignore[index]
         return data
 
 
@@ -293,7 +362,10 @@ def load_config(
             max_attempts=_get_int(source, "BACKOFF_MAX_ATTEMPTS", DEFAULT_BACKOFF_MAX_ATTEMPTS),
         ),
         linear=LinearConfig(
+            auth_mode=_get_str(source, "LINEAR_AUTH_MODE", LINEAR_AUTH_MODE_API_KEY).strip().casefold(),
             api_key=_get_optional_str(source, "LINEAR_API_KEY"),
+            oauth_client_id=_get_optional_str(source, "LINEAR_OAUTH_CLIENT_ID"),
+            oauth_client_secret=_get_optional_str(source, "LINEAR_OAUTH_CLIENT_SECRET"),
             team_id=_get_optional_str(source, "LINEAR_TEAM_ID"),
             project_name=_get_optional_str(source, "LINEAR_PROJECT_NAME"),
             project_id=_get_optional_str(source, "LINEAR_PROJECT_ID"),

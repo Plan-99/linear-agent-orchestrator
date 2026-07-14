@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from linear_agent_orchestrator.config import (
@@ -9,6 +10,8 @@ from linear_agent_orchestrator.config import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_RUNNER_MAX_LIFETIME_SECONDS,
     DEFAULT_RUNNER_TIMEOUT_SECONDS,
+    LINEAR_AUTH_MODE_API_KEY,
+    LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS,
     load_config,
     load_dotenv_file,
 )
@@ -26,6 +29,7 @@ def test_config_defaults_include_first_story_constants():
     assert config.backoff.initial_seconds == DEFAULT_BACKOFF_INITIAL_SECONDS == 5
     assert config.backoff.max_seconds == DEFAULT_BACKOFF_MAX_SECONDS == 300
     assert config.backoff.max_attempts == DEFAULT_BACKOFF_MAX_ATTEMPTS == 5
+    assert config.linear.auth_mode == LINEAR_AUTH_MODE_API_KEY
     assert config.linear.attention_state_name == "In Review"
 
 
@@ -59,6 +63,95 @@ def test_config_loads_required_linear_and_runner_values_from_env_without_leaking
     assert config.runner.command_template == "echo {prompt_path}"
     assert config.runner.allowed_env == ("PATH", "HOME")
     assert config.redacted_dict()["linear"]["api_key"] == "***REDACTED***"
+
+
+def test_config_loads_oauth_client_credentials_and_redacts_only_the_secret():
+    config = load_config(
+        env={
+            "LINEAR_AUTH_MODE": "OAUTH_CLIENT_CREDENTIALS",
+            "LINEAR_OAUTH_CLIENT_ID": "oauth-client-id",
+            "LINEAR_OAUTH_CLIENT_SECRET": "oauth-client-secret",
+            "LINEAR_TEAM_ID": "team-id",
+            "LINEAR_PROJECT_ID": "project-id",
+            "LINEAR_ASSIGNEE_ID": "human-user-id",
+            "RUNNER_COMMAND_TEMPLATE": "echo {prompt_path}",
+        }
+    )
+
+    assert config.validate_startup(require_secrets=True) == []
+    assert config.linear.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS
+    assert config.linear.oauth_client_id == "oauth-client-id"
+    assert config.linear.oauth_client_secret == "oauth-client-secret"
+    redacted = config.redacted_dict()["linear"]
+    assert redacted["oauth_client_id"] == "oauth-client-id"
+    assert redacted["oauth_client_secret"] == "***REDACTED***"
+    assert "oauth-client-secret" not in json.dumps(config.redacted_dict())
+    assert "oauth-client-secret" not in repr(config)
+
+
+def test_oauth_validation_requires_client_credentials_and_explicit_human_assignee():
+    complete = {
+        "LINEAR_AUTH_MODE": "oauth_client_credentials",
+        "LINEAR_OAUTH_CLIENT_ID": "client-id",
+        "LINEAR_OAUTH_CLIENT_SECRET": "client-secret",
+        "LINEAR_TEAM_ID": "team-id",
+        "LINEAR_PROJECT_NAME": "TEST",
+        "LINEAR_ASSIGNEE_ID": "human-user-id",
+        "RUNNER_COMMAND_TEMPLATE": "echo {prompt_path}",
+    }
+    required = {
+        "LINEAR_OAUTH_CLIENT_ID": "LINEAR_OAUTH_CLIENT_ID is required",
+        "LINEAR_OAUTH_CLIENT_SECRET": "LINEAR_OAUTH_CLIENT_SECRET is required",
+        "LINEAR_ASSIGNEE_ID": "LINEAR_ASSIGNEE_ID is required",
+    }
+
+    for key, expected in required.items():
+        config = load_config(env={name: value for name, value in complete.items() if name != key})
+        assert any(expected in error for error in config.validate_startup(require_secrets=True))
+
+    missing_assignee = load_config(
+        env={
+            name: value
+            for name, value in complete.items()
+            if name != "LINEAR_ASSIGNEE_ID"
+        }
+    )
+    assert missing_assignee.validate_startup(require_secrets=False) == [
+        "LINEAR_ASSIGNEE_ID is required for "
+        "LINEAR_AUTH_MODE=oauth_client_credentials"
+    ]
+
+
+def test_linear_auth_validation_rejects_unsupported_mode_and_mixed_credentials():
+    unsupported = load_config(env={"LINEAR_AUTH_MODE": "magic"})
+    assert unsupported.validate_startup(require_secrets=False) == [
+        "LINEAR_AUTH_MODE must be one of: api_key, oauth_client_credentials"
+    ]
+
+    mixed = load_config(
+        env={
+            "LINEAR_AUTH_MODE": "oauth_client_credentials",
+            "LINEAR_API_KEY": "api-secret",
+            "LINEAR_OAUTH_CLIENT_ID": "client-id",
+            "LINEAR_OAUTH_CLIENT_SECRET": "client-secret",
+            "LINEAR_ASSIGNEE_ID": "human-user-id",
+        }
+    )
+    assert mixed.validate_startup(require_secrets=False) == [
+        "LINEAR_API_KEY cannot be combined with LINEAR_OAUTH_CLIENT_ID or "
+        "LINEAR_OAUTH_CLIENT_SECRET"
+    ]
+
+    wrong_mode = load_config(
+        env={
+            "LINEAR_OAUTH_CLIENT_ID": "client-id",
+            "LINEAR_OAUTH_CLIENT_SECRET": "client-secret",
+        }
+    )
+    assert wrong_mode.validate_startup(require_secrets=False) == [
+        "LINEAR_OAUTH_CLIENT_ID and LINEAR_OAUTH_CLIENT_SECRET require "
+        "LINEAR_AUTH_MODE=oauth_client_credentials"
+    ]
 
 
 def test_runner_max_lifetime_loads_from_env_and_rejects_non_positive():

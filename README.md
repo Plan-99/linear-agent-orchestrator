@@ -66,12 +66,15 @@ SQLite는 작업 queue를 대신하지 않습니다. 작업 대상은 항상 Lin
 최소 설정 예시는 다음과 같습니다.
 
 ```dotenv
-LINEAR_API_KEY=lin_api_...
+# 권장: Linear OAuth2 Client Credentials(app actor)
+LINEAR_AUTH_MODE=oauth_client_credentials
+LINEAR_API_KEY=
+LINEAR_OAUTH_CLIENT_ID=<client-id>
+LINEAR_OAUTH_CLIENT_SECRET=<client-secret>
 LINEAR_TEAM_ID=...
 LINEAR_PROJECT_NAME=TEST
-
-# 비워 두면 LINEAR_API_KEY 소유자(API viewer)를 사용합니다.
-# LINEAR_ASSIGNEE_ID=...
+# OAuth 모드에서는 실제 사람 담당자의 Linear user UUID가 필수입니다.
+LINEAR_ASSIGNEE_ID=<human-user-id>
 
 # agent가 실제로 수정할 신뢰된 Git checkout의 절대 host 경로입니다.
 LAO_PROJECT_DIR=/absolute/host/path/to/target-repository
@@ -95,10 +98,51 @@ worktree에서 작업하고, 의미적으로 성공한 run만 로컬 `lao/<issue
 조사용으로 남습니다. `false`로 끄면 기존 고정-디렉토리 모드로 돌아가며, 이때는
 run 전 clean worktree가 강제되고 남은 변경이 다음 실행을 fail-closed로 차단합니다.
 
-협업 시 각 개발자는 자신의 API key를 사용하고 `LINEAR_ASSIGNEE_ID`를 비워 두거나 자신의
-Linear user ID로 설정하면 됩니다. 미할당 이슈와 다른 사람에게 할당된 이슈는 가져오지
-않습니다. 단, 같은 assignee/database를 공유하지 않는 daemon 두 개를 동시에 실행하는
-구성은 지원하지 않습니다.
+OAuth app credential을 여러 운영자가 사용하더라도 각 daemon은
+`LINEAR_ASSIGNEE_ID`로 실제 사람 담당자를 명시해야 합니다. 미할당 이슈와 다른 사람에게
+할당된 이슈는 가져오지 않습니다. 같은 assignee/database를 공유하는 daemon 두 개를
+동시에 실행하는 구성은 지원하지 않습니다.
+
+### Linear 인증 모드
+
+장기 실행 daemon에는 `oauth_client_credentials`를 권장합니다. Linear 관리자가
+Settings의 OAuth Applications에서 private 앱을 만들고
+[**Client Credentials tokens**](https://linear.app/developers/oauth-2-0-authentication#client-credentials-tokens)를
+활성화한 뒤, 앱의 team access에 대상 팀을 포함합니다. LAO는 고정된 최소 scope
+`read,write`로 token을 요청합니다. Client Credentials token은 app actor이므로 LAO가
+쓴 댓글과 상태 변경이 사람의 self-action으로 기록되지 않습니다.
+
+OAuth 모드의 설정 계약은 다음과 같습니다.
+
+- `LINEAR_OAUTH_CLIENT_ID`, `LINEAR_OAUTH_CLIENT_SECRET`, 그리고 사람의
+  `LINEAR_ASSIGNEE_ID`가 모두 필요합니다.
+- `LINEAR_API_KEY`는 비우거나 제거해야 합니다. API key credential과 OAuth credential을
+  동시에 채우면 잘못된 actor 사용을 막기 위해 startup이 실패합니다.
+- access token은 파일이나 DB에 저장하지 않고 프로세스 메모리에서만 보관합니다. 만료
+  5분 전 재발급하며, Linear가 `401`을 반환하면 token을 폐기하고 한 번만 재발급해
+  요청을 재시도합니다.
+- Client Credentials token은 30일 유효하고 refresh token이 없습니다. client secret을
+  회전하면 기존 Client Credentials token도 무효화됩니다. `.env`를 갱신하고 daemon을
+  recreate해 새 secret으로 token을 다시 발급하세요.
+- client secret이나 access token을 `RUNNER_ALLOWED_ENV`에 추가하지 마세요.
+
+OAuth secret을 입력한 뒤에는 `chmod 600 .env`로 파일을 소유자만 읽고 쓸 수 있게
+제한하고, `.env`가 Git에서 ignored 상태인지 확인하세요.
+
+기존 개인 API key 방식은 호환 및 롤백 용도로 계속 지원합니다.
+
+```dotenv
+LINEAR_AUTH_MODE=api_key
+LINEAR_API_KEY=lin_api_...
+LINEAR_OAUTH_CLIENT_ID=
+LINEAR_OAUTH_CLIENT_SECRET=
+# 비우면 API key 소유자(API viewer)를 사용합니다.
+# LINEAR_ASSIGNEE_ID=
+```
+
+OAuth에서 API key로 롤백할 때는 daemon을 중지하고 위와 같이 credential set을 교체한 뒤
+`startup-check`를 통과시켜 daemon을 다시 시작합니다. OAuth 앱 생성부터 개인 Slack
+DM 검증까지의 운영 절차는 [온보딩 가이드](docs/onboarding.md)를 참고하세요.
 
 ### 3. agent 인증 준비
 
@@ -251,9 +295,14 @@ LINEAR_ATTENTION_STATE_NAME="In Review"
 LINEAR_DONE_STATE_NAME="In Review"
 ```
 
-알림은 orchestrator가 아니라 **Linear 네이티브 Slack 연동**으로 구성합니다. Linear의
-Slack integration에서 대상 workspace/channel을 연결하고, 이 팀의 이슈가 `In Review`에
-진입할 때 해당 채널로 알리도록 notification rule을 설정하세요.
+알림은 orchestrator가 아니라 **Linear 네이티브 Slack 연동**으로 구성합니다. 개인
+API key로 LAO를 실행하면 상태 변경 actor와 커스텀 View 구독자가 같은 사람이어서
+Linear의 [self-action 알림 억제 정책](https://linear.app/docs/custom-views)에 따라
+Inbox와 개인 Slack DM이 생성되지 않습니다.
+개인 DM을 쓰려면 OAuth Client Credentials app actor로 실행하고, `Assignee = 본인` 및
+`Status = In Review`인 개인 View의 issue-added 알림을 구독한 뒤 Linear 개인 Slack
+알림을 켜세요. 팀 채널 알림과는 별도 경로입니다. 상세 검증 절차는
+[온보딩 가이드](docs/onboarding.md#9-slack-알림-설정-권장)를 참고하세요.
 
 재작업 시에는 `In Review` 이슈를 Todo로 되돌리지 않습니다. execution key 특성상 이슈나
 runner 설정을 수정하지 않은 재큐잉은 안전 복구가 불가능한 fail-in-doubt만 남깁니다.

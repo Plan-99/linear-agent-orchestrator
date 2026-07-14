@@ -6,8 +6,8 @@ Linear 이슈를 에이전트(Codex/OMX/Claude Code)에게 자동으로 전달�
 
 핵심 원칙 세 가지만 기억하세요.
 
-1. **각자 자기 daemon** — 개발자마다 자신의 Linear API key로 자기 머신에서
-   daemon을 돌리고, 자신에게 할당된 이슈만 처리됩니다.
+1. **각자 자기 daemon과 명시적 assignee** — 개발자마다 자기 머신에서 daemon을
+   돌리고, OAuth app actor와 별개로 지정한 사람에게 할당된 이슈만 처리됩니다.
 2. **대상 repo마다 Linear 프로젝트 1개** — daemon 하나는 repo 하나만
    마운트하고 프로젝트 하나만 폴링합니다. 섞으면 다른 repo용 이슈가 엉뚱한
    repo에서 실행됩니다.
@@ -21,9 +21,15 @@ Linear 이슈를 에이전트(Codex/OMX/Claude Code)에게 자동으로 전달�
 - host에서 사용할 backend CLI에 **먼저 로그인**해 두세요
   (`codex login`, 또는 Claude Code `claude` 로그인). bootstrap이 이
   인증 파일을 전용 사본으로 복사해 갑니다.
-- [Linear 설정](https://linear.app/settings/api)에서 **자신의 Personal API
-  key**를 발급받으세요. 팀 공용 key를 쓰면 안 됩니다(누가 어떤 이슈를
-  집어가는지 assignee로 구분되기 때문).
+- 권장 인증은 Linear OAuth2 Client Credentials입니다. Linear 관리자가 Settings →
+  API → OAuth Applications에서 private 앱 `LAO Agent Orchestrator`를 만들고
+  [**Client Credentials tokens**](https://linear.app/developers/oauth-2-0-authentication#client-credentials-tokens)를
+  활성화합니다. scope는 LAO가 `read,write`로
+  고정해 요청하며, 앱 상세 페이지의 team access에 daemon이 사용할 팀을 포함합니다.
+- 관리자는 client ID와 client secret을 승인된 secret manager로 운영자에게
+  전달합니다. 이 값은 채팅, 이슈, 로그 또는 Git에 올리지 않습니다.
+- OAuth 앱을 아직 준비할 수 없다면 [Linear API 설정](https://linear.app/settings/api)에서
+  자신의 Personal API key를 발급해 legacy fallback으로 사용할 수 있습니다.
 
 ## 2. 설치
 
@@ -51,15 +57,17 @@ mtime 기준으로 더 최신이면 실행할 때마다 자동으로 재복사�
 
 ## 3. `.env` 설정
 
-최소 설정:
+권장 OAuth app actor 설정:
 
 ```dotenv
-LINEAR_API_KEY=lin_api_...        # 자신의 key
+LINEAR_AUTH_MODE=oauth_client_credentials
+LINEAR_API_KEY=                  # OAuth와 동시에 설정하지 않음
+LINEAR_OAUTH_CLIENT_ID=<client-id>
+LINEAR_OAUTH_CLIENT_SECRET=<client-secret>
 LINEAR_TEAM_ID=DEV                # 팀 key 또는 UUID
 LINEAR_PROJECT_NAME=<프로젝트명>   # 이 daemon이 폴링할 프로젝트
-
-# 비워 두면 API key 소유자(자기 자신)에게 할당된 이슈만 처리합니다.
-# LINEAR_ASSIGNEE_ID=
+# 앱 actor와 별개인 실제 사람 담당자의 Linear user UUID — OAuth에서 필수
+LINEAR_ASSIGNEE_ID=<human-user-id>
 
 # 에이전트가 실제로 수정할 신뢰된 Git checkout의 절대 host 경로
 LAO_PROJECT_DIR=/absolute/path/to/target-repo
@@ -70,6 +78,37 @@ AGENT_EFFORT=high
 ```
 
 전체 항목과 기본값은 [.env.example](../.env.example)을 참고하세요.
+
+`LINEAR_AUTH_MODE`를 생략하면 기존 호환을 위해 `api_key`로 동작합니다. 한 daemon에는
+credential set을 정확히 하나만 설정하세요. OAuth client ID/secret과
+`LINEAR_API_KEY`를 동시에 채우면 actor 혼동을 막기 위해 startup이 실패합니다.
+OAuth 모드에서는 app viewer를 사람 담당자로 오인하지 않도록
+`LINEAR_ASSIGNEE_ID`를 비울 수 없습니다.
+
+OAuth app을 준비할 수 없거나 긴급 롤백하는 경우에만 개인 API key 모드를 사용합니다.
+
+```dotenv
+LINEAR_AUTH_MODE=api_key
+LINEAR_API_KEY=lin_api_...
+LINEAR_OAUTH_CLIENT_ID=
+LINEAR_OAUTH_CLIENT_SECRET=
+# 비우면 API key 소유자를 사용하며, 필요하면 사람 UUID를 명시합니다.
+# LINEAR_ASSIGNEE_ID=
+```
+
+Client Credentials access token은 30일 유효하고 refresh token이 없습니다. LAO는 token을
+파일이나 DB에 쓰지 않고 메모리에만 보관하며 만료 5분 전에 다시 발급합니다. GraphQL
+요청이 `401`이면 cached token을 폐기하고 한 번만 재발급·재시도합니다. client secret을
+회전하면 기존 Client Credentials token도 무효화됩니다. `.env`를 갱신하고 daemon을
+recreate해 새 secret으로 token을 다시 발급하세요.
+client secret과 access token은 `RUNNER_ALLOWED_ENV`에 절대 추가하지 않습니다.
+
+OAuth secret을 입력한 뒤에는 파일 권한과 Git ignore 상태를 확인합니다.
+
+```bash
+chmod 600 .env
+git check-ignore .env
+```
 
 ## 4. 대상 repo 준비
 
@@ -184,23 +223,57 @@ LINEAR_DONE_STATE_NAME="In Review"
    Slack 연결. 이미 되어 있다면 건너뜁니다.
 2. **개인 설정 (각자 1회, 약 1분)**:
    - Linear 개인 설정에서 **자기 Slack 계정 연결** (Notifications 또는
-     Connected accounts; 뷰 구독 중 authorize 프롬프트가 뜨기도 합니다).
-     DM 대상은 자기 계정을 연결한 사람에게만 보입니다.
+     Connected accounts). Personal Slack notifications는 Linear Inbox에 생성된
+     notification을 Slack의 Linear 앱 개인 DM으로 전달합니다.
    - `Status = In Review` + `Assignee = 자기 자신` 필터로 **자기 전용 커스텀
-     뷰**를 만듭니다. 뷰 구독은 뷰의 고정 필터 기준으로 발송되므로 뷰 하나를
-     팀이 공유할 수 없고, 사람마다 자기 뷰가 필요합니다.
-   - 뷰 메뉴(⋯) → Slack 알림 구독 → **자기 개인 DM** 선택.
+     뷰**를 만듭니다. 공유 View를 사용하더라도 각 운영자가 자신의 assignee 조건을
+     확인하고 개인 notification을 따로 구독해야 합니다.
+   - 뷰의 bell 메뉴에서 **이슈가 뷰에 추가될 때** 개인 notification을 구독하고,
+     개인 설정 → Notifications → Slack에서 해당 notification의 Slack 전달을 켭니다.
+     뷰 메뉴의 `Configure custom view Slack notifications`는 개인 DM이 아니라
+     별도 Slack **채널**로 보내는 기능입니다.
 
-개인 알림 채널(개인 설정 → Notifications → Slack)을 켜는 방법도 있지만,
-In Review만 골라 받을 수 없어 daemon이 바꾸는 모든 상태 전환마다 DM이
-옵니다. 뷰 구독 방식을 권장합니다.
+여기서 OAuth app actor가 중요합니다. Linear는 구독한 View에
+[**자신이 수행한 작업**](https://linear.app/docs/custom-views)으로 이슈가 들어오면
+알림 소음을 줄이기 위해 notification을 만들지 않습니다. 개인 API key는
+LAO의 상태 변경도 key 소유자의 self-action으로 기록하므로, View 조건을 충족해도 Linear
+Inbox notification이 없고 그 결과 개인 Slack DM도 오지 않습니다. Client Credentials
+token은 mutation actor를 LAO 앱으로 기록하므로 `app actor != View 구독자`가 되어 이
+self-action 억제를 피합니다.
+
+설정 후 다음 순서로 실제 경로를 확인하세요.
+
+1. 본인에게 할당된 Todo 테스트 이슈를 LAO가 처리하게 합니다.
+2. 이슈 Activity에서 댓글과 `In Review` 상태 변경 actor가
+   `LAO Agent Orchestrator` 앱인지 확인합니다.
+3. 이슈가 본인의 `Assignee = 본인` + `Status = In Review` View에 추가되는지 확인합니다.
+4. Linear Inbox notification과 Slack의 Linear 앱 개인 DM이 모두 오는지 확인합니다.
+
+앱 actor가 맞는데 DM만 없다면 Linear 개인 설정 → Notifications → Slack 연결과 해당
+View의 issue-added 구독을 확인하세요. Inbox notification 자체가 없다면 Slack 재연결보다
+먼저 actor와 View 필터를 다시 확인해야 합니다.
+
+View 구독 없이 일반 status-change 알림을 폭넓게 켜면 daemon의 다른 상태 전환도
+DM으로 올 수 있습니다. 리뷰 진입만 받으려면 위의 issue-added View 구독을 기준으로
+알림 유형을 구성하세요.
+
+OAuth 장애 시 롤백 절차:
+
+1. daemon을 중지합니다.
+2. `.env`에서 `LINEAR_AUTH_MODE=api_key`로 바꾸고 OAuth client ID/secret을 비웁니다.
+3. 자신의 `LINEAR_API_KEY`를 설정하고, 필요에 따라 `LINEAR_ASSIGNEE_ID`를 유지합니다.
+4. `./scripts/compose.sh run --rm orchestrator startup-check`를 통과시킵니다.
+5. `./scripts/daemon.sh`로 다시 시작합니다.
+
+API key 모드에서는 actor가 다시 사람으로 바뀌므로 self-action 기반 View DM은 오지 않는
+것이 정상입니다. 운영 복구와 Slack 알림 복구를 같은 것으로 간주하지 마세요.
 
 ## 10. 하지 말 것
 
 | 금지 | 이유 |
 |---|---|
 | In Review 이슈를 Todo로 재큐잉 | Done된 이슈는 영구 종결이라 무시되고, 실패 이슈의 무편집 재큐잉은 fail-in-doubt만 남습니다. 후속 작업은 **새 이슈**로. |
-| 에이전트에게 `LINEAR_API_KEY` 전달 (`RUNNER_ALLOWED_ENV`에 추가) | 에이전트가 자기 이슈를 스스로 Done으로 만들 수 있게 되어 Done gate가 무력화됩니다. |
+| 에이전트에게 Linear credential 전달 (`LINEAR_API_KEY`, OAuth client secret/token을 `RUNNER_ALLOWED_ENV`에 추가) | 에이전트가 자기 이슈를 스스로 Done으로 만들 수 있게 되어 Done gate가 무력화됩니다. |
 | 같은 assignee로 daemon 2개 동시 실행 | 머신 간 claim 조정이 없어 중복 실행됩니다. |
 | orchestrator checkout의 `.runtime/data/state.sqlite3` 임의 삭제·이동 | authoritative 복구/중복 방지 기록이 사라지거나 여러 DB로 갈라집니다. 의도적 reset일 때만. |
 | daemon을 tmux/session manager 밖에서 방치 실행 | 터미널이 닫히면 컨테이너도 SIGTERM을 받습니다. |

@@ -14,17 +14,30 @@ Implementation notes from Linear docs:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from base64 import b64encode
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
+from http.client import HTTPException
 import json
-from typing import Any, Mapping, Protocol
+from math import isfinite
+from threading import Lock
+import time
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .config import LinearConfig
+from .config import (
+    LINEAR_AUTH_MODE_API_KEY,
+    LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS,
+    LinearConfig,
+)
 from .issue_schema import IssueSchemaResult, clarification_comment, validate_issue_body
 
 LINEAR_GRAPHQL_ENDPOINT = "https://api.linear.app/graphql"
+LINEAR_OAUTH_TOKEN_ENDPOINT = "https://api.linear.app/oauth/token"
+LINEAR_OAUTH_SCOPES = "read,write"
+OAUTH_TOKEN_REFRESH_SKEW_SECONDS = 300
 DEFAULT_PAGE_SIZE = 50
 
 
@@ -33,7 +46,12 @@ class LinearError(Exception):
 
 
 class LinearAuthenticationError(LinearError):
-    """Raised when no supported Linear credential is configured."""
+    """Raised for missing, invalid, or rejected Linear credentials."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.transient = False
 
 
 class LinearGraphQLError(LinearError):
@@ -79,7 +97,7 @@ class LinearAuth(Protocol):
 class ApiKeyAuth:
     """Personal API key or app key auth using Linear's Authorization header."""
 
-    api_key: str
+    api_key: str = dataclass_field(repr=False)
 
     def headers(self) -> dict[str, str]:
         if not self.api_key:
@@ -91,12 +109,168 @@ class ApiKeyAuth:
 class OAuthTokenAuth:
     """Future-ready OAuth bearer token auth abstraction."""
 
-    access_token: str
+    access_token: str = dataclass_field(repr=False)
 
     def headers(self) -> dict[str, str]:
         if not self.access_token:
             raise LinearAuthenticationError("OAuth access token is required")
         return {"Authorization": f"Bearer {self.access_token}"}
+
+
+class OAuthClientCredentialsTokenProvider:
+    """Thread-safe, in-memory Linear client-credentials token cache."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        *,
+        timeout_seconds: int = 30,
+        refresh_skew_seconds: int = OAUTH_TOKEN_REFRESH_SKEW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not client_id:
+            raise LinearAuthenticationError("LINEAR_OAUTH_CLIENT_ID is required")
+        if not client_secret:
+            raise LinearAuthenticationError("LINEAR_OAUTH_CLIENT_SECRET is required")
+        if timeout_seconds <= 0:
+            raise ValueError("OAuth token timeout_seconds must be positive")
+        if refresh_skew_seconds < 0:
+            raise ValueError("OAuth token refresh_skew_seconds must not be negative")
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._timeout_seconds = timeout_seconds
+        self._refresh_skew_seconds = refresh_skew_seconds
+        self._clock = clock
+        self._lock = Lock()
+        self._access_token: str | None = None
+        self._expires_at = 0.0
+
+    @classmethod
+    def from_config(cls, config: LinearConfig) -> "OAuthClientCredentialsTokenProvider":
+        """Build a provider from a validated OAuth Linear configuration."""
+
+        if not config.oauth_client_id:
+            raise LinearAuthenticationError("LINEAR_OAUTH_CLIENT_ID is required")
+        if not config.oauth_client_secret:
+            raise LinearAuthenticationError("LINEAR_OAUTH_CLIENT_SECRET is required")
+        return cls(config.oauth_client_id, config.oauth_client_secret)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(client_id=<redacted>, client_secret=<redacted>, "
+            f"timeout_seconds={self._timeout_seconds}, "
+            f"refresh_skew_seconds={self._refresh_skew_seconds})"
+        )
+
+    def get_access_token(self) -> str:
+        """Return a cached token, fetching one when absent or near expiry."""
+
+        with self._lock:
+            now = self._clock()
+            if self._access_token and now < self._expires_at - self._refresh_skew_seconds:
+                return self._access_token
+            access_token, expires_in = self._request_access_token()
+            self._access_token = access_token
+            self._expires_at = self._clock() + expires_in
+            return access_token
+
+    def invalidate(self, access_token: str | None = None) -> None:
+        """Discard the cache, conditionally when a rejected token is supplied."""
+
+        with self._lock:
+            if access_token is not None and access_token != self._access_token:
+                return
+            self._access_token = None
+            self._expires_at = 0.0
+
+    def _request_access_token(self) -> tuple[str, float]:
+        credentials = b64encode(f"{self._client_id}:{self._client_secret}".encode("utf-8")).decode("ascii")
+        body = urlencode(
+            {
+                "grant_type": "client_credentials",
+                "scope": LINEAR_OAUTH_SCOPES,
+            }
+        ).encode("ascii")
+        request = Request(
+            LINEAR_OAUTH_TOKEN_ENDPOINT,
+            data=body,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout_seconds) as response:  # noqa: S310 - fixed Linear endpoint
+                response_body = response.read().decode("utf-8")
+        except HTTPError as exc:
+            if exc.fp:
+                exc.close()
+            if exc.code in {408, 429} or 500 <= exc.code < 600:
+                raise LinearTransportError(
+                    f"Linear OAuth token HTTP error {exc.code}",
+                    status_code=exc.code,
+                    transient=True,
+                ) from exc
+            raise LinearAuthenticationError(
+                f"Linear OAuth token request rejected with HTTP {exc.code}",
+                status_code=exc.code,
+            ) from exc
+        except URLError as exc:
+            raise LinearTransportError("Linear OAuth token transport error", transient=True) from exc
+        except TimeoutError as exc:
+            raise LinearTransportError("Linear OAuth token transport timeout", transient=True) from exc
+        except (OSError, HTTPException) as exc:
+            raise LinearTransportError("Linear OAuth token transport error", transient=True) from exc
+        except UnicodeDecodeError as exc:
+            raise LinearAuthenticationError("Linear OAuth token response was not valid UTF-8") from exc
+
+        try:
+            payload = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise LinearAuthenticationError("Linear OAuth token response was not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise LinearAuthenticationError("Linear OAuth token response JSON was not an object")
+
+        access_token = payload.get("access_token")
+        token_type = payload.get("token_type")
+        expires_in = payload.get("expires_in")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LinearAuthenticationError("Linear OAuth token response missing access_token")
+        if not isinstance(token_type, str) or token_type.casefold() != "bearer":
+            raise LinearAuthenticationError("Linear OAuth token response has unsupported token_type")
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or not isfinite(expires_in)
+            or expires_in <= 0
+        ):
+            raise LinearAuthenticationError("Linear OAuth token response has invalid expires_in")
+        return access_token.strip(), float(expires_in)
+
+
+@dataclass(frozen=True)
+class OAuthClientCredentialsAuth:
+    """Bearer auth backed by a refreshable client-credentials token provider."""
+
+    token_provider: OAuthClientCredentialsTokenProvider = dataclass_field(repr=False)
+
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token_provider.get_access_token()}"}
+
+    def invalidate(self, access_token: str | None = None) -> None:
+        self.token_provider.invalidate(access_token)
+
+
+@runtime_checkable
+class RefreshableLinearAuth(LinearAuth, Protocol):
+    """Auth strategy whose rejected access token can be invalidated."""
+
+    def invalidate(self, access_token: str | None = None) -> None:
+        """Invalidate a rejected access token."""
+        ...
 
 
 class GraphQLTransport(Protocol):
@@ -117,33 +291,51 @@ class UrllibGraphQLTransport:
 
     def execute(self, query: str, variables: Mapping[str, Any] | None = None) -> dict[str, Any]:
         body = json.dumps({"query": query, "variables": dict(variables or {})}).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            **self.auth.headers(),
-        }
-        request = Request(self.endpoint, data=body, headers=headers, method="POST")
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310 - configured API endpoint
-                response_body = response.read().decode("utf-8")
-                return _decode_json_payload(response_body)
-        except HTTPError as exc:
-            response_body = exc.read().decode("utf-8") if exc.fp else ""
+        refreshable_auth = self.auth if isinstance(self.auth, RefreshableLinearAuth) else None
+        for attempt in range(2):
+            auth_headers = self.auth.headers()
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                **auth_headers,
+            }
+            request = Request(self.endpoint, data=body, headers=headers, method="POST")
             try:
-                payload = _decode_json_payload(response_body) if response_body else {}
-            except LinearGraphQLError:
-                payload = {}
-            if isinstance(payload.get("errors"), list):
-                raise _graphql_error(payload["errors"])
-            raise LinearTransportError(
-                f"Linear HTTP error {exc.code}",
-                status_code=exc.code,
-                transient=exc.code == 429 or 500 <= exc.code < 600,
-            ) from exc
-        except URLError as exc:
-            raise LinearTransportError(f"Linear transport error: {exc.reason}", transient=True) from exc
-        except TimeoutError as exc:
-            raise LinearTransportError("Linear transport timeout", transient=True) from exc
+                with urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310 - configured API endpoint
+                    response_body = response.read().decode("utf-8")
+                    return _decode_json_payload(response_body)
+            except HTTPError as exc:
+                if exc.code == 401 and refreshable_auth is not None:
+                    if attempt == 0:
+                        refreshable_auth.invalidate(_bearer_access_token(auth_headers))
+                        if exc.fp:
+                            exc.close()
+                        continue
+                    refreshable_auth.invalidate(_bearer_access_token(auth_headers))
+                    if exc.fp:
+                        exc.close()
+                    raise LinearAuthenticationError(
+                        "Linear OAuth access token was rejected after one refresh",
+                        status_code=401,
+                    ) from exc
+
+                response_body = exc.read().decode("utf-8") if exc.fp else ""
+                try:
+                    payload = _decode_json_payload(response_body) if response_body else {}
+                except LinearGraphQLError:
+                    payload = {}
+                if isinstance(payload.get("errors"), list):
+                    raise _graphql_error(payload["errors"])
+                raise LinearTransportError(
+                    f"Linear HTTP error {exc.code}",
+                    status_code=exc.code,
+                    transient=exc.code == 429 or 500 <= exc.code < 600,
+                ) from exc
+            except URLError as exc:
+                raise LinearTransportError(f"Linear transport error: {exc.reason}", transient=True) from exc
+            except TimeoutError as exc:
+                raise LinearTransportError("Linear transport timeout", transient=True) from exc
+        raise AssertionError("unreachable OAuth retry state")
 
 
 @dataclass(frozen=True)
@@ -222,10 +414,30 @@ class LinearClient:
         self._viewer_id: str | None = None
 
     @classmethod
-    def from_config(cls, config: LinearConfig) -> "LinearClient":
-        if not config.api_key:
-            raise LinearAuthenticationError("LINEAR_API_KEY is required")
-        return cls(UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, ApiKeyAuth(config.api_key)))
+    def from_config(
+        cls,
+        config: LinearConfig,
+        *,
+        oauth_token_provider: OAuthClientCredentialsTokenProvider | None = None,
+    ) -> "LinearClient":
+        auth_errors = config.auth_validation_errors(require_secrets=True)
+        if auth_errors:
+            raise LinearAuthenticationError(auth_errors[0])
+
+        if config.auth_mode == LINEAR_AUTH_MODE_API_KEY:
+            if oauth_token_provider is not None:
+                raise LinearAuthenticationError("OAuth token provider cannot be used with LINEAR_AUTH_MODE=api_key")
+            if not config.api_key:
+                raise LinearAuthenticationError("LINEAR_API_KEY is required")
+            return cls(UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, ApiKeyAuth(config.api_key)))
+
+        if config.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS:
+            if config.api_key:
+                raise LinearAuthenticationError("LINEAR_API_KEY cannot be used with OAuth client credentials")
+            provider = oauth_token_provider or OAuthClientCredentialsTokenProvider.from_config(config)
+            return cls(UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, OAuthClientCredentialsAuth(provider)))
+
+        raise LinearAuthenticationError(f"Unsupported LINEAR_AUTH_MODE: {config.auth_mode!r}")
 
     def graphql(self, query: str, variables: Mapping[str, Any] | None = None) -> dict[str, Any]:
         payload = self.transport.execute(query, variables)
@@ -467,6 +679,14 @@ def _decode_json_payload(response_body: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise LinearGraphQLError("Linear response JSON was not an object")
     return payload
+
+
+def _bearer_access_token(headers: Mapping[str, str]) -> str | None:
+    authorization = headers.get("Authorization")
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    access_token = authorization[len("Bearer ") :]
+    return access_token or None
 
 
 def _graphql_error(errors: list[dict[str, Any]]) -> LinearGraphQLError:

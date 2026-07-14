@@ -1,11 +1,27 @@
+from base64 import b64decode
+from http.client import IncompleteRead
+from io import BytesIO
+import json
+from threading import Barrier, Lock, Thread
+from urllib.error import HTTPError
+from urllib.parse import parse_qs
+
 import pytest
 
+import linear_agent_orchestrator.linear_client as linear_client_module
 from linear_agent_orchestrator.config import LinearConfig
 from linear_agent_orchestrator.linear_client import (
     ApiKeyAuth,
     COMMENT_CREATE_MUTATION,
+    LINEAR_GRAPHQL_ENDPOINT,
+    LINEAR_OAUTH_TOKEN_ENDPOINT,
     LinearClient,
+    LinearAuthenticationError,
     LinearGraphQLError,
+    LinearTransportError,
+    OAuthClientCredentialsAuth,
+    OAuthClientCredentialsTokenProvider,
+    UrllibGraphQLTransport,
     WorkflowRole,
 )
 
@@ -23,6 +39,329 @@ class MockTransport:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class UrlopenResponse:
+    def __init__(self, payload):
+        if isinstance(payload, bytes):
+            self.body = payload
+        else:
+            self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def oauth_token_response(token="oauth-token", *, expires_in=600):
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+        "scope": "read write",
+    }
+
+
+def http_error(url, status, body=b""):
+    return HTTPError(url, status, "request failed", {}, BytesIO(body))
+
+
+def test_oauth_client_credentials_request_uses_fixed_endpoint_basic_auth_and_fixed_scope(monkeypatch):
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return UrlopenResponse(oauth_token_response())
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+
+    assert provider.get_access_token() == "oauth-token"
+    assert len(calls) == 1
+    request, timeout = calls[0]
+    headers = {name.casefold(): value for name, value in request.header_items()}
+    assert request.full_url == LINEAR_OAUTH_TOKEN_ENDPOINT
+    assert request.get_method() == "POST"
+    assert timeout == 30
+    assert headers["content-type"] == "application/x-www-form-urlencoded"
+    assert headers["accept"] == "application/json"
+    basic_value = headers["authorization"].removeprefix("Basic ")
+    assert b64decode(basic_value).decode("utf-8") == "client-id:client-secret"
+    assert parse_qs(request.data.decode("ascii")) == {
+        "grant_type": ["client_credentials"],
+        "scope": ["read,write"],
+    }
+
+
+def test_oauth_token_cache_refreshes_at_five_minute_skew_and_supports_conditional_invalidation(monkeypatch):
+    now = [1_000.0]
+    responses = [oauth_token_response("token-1"), oauth_token_response("token-2"), oauth_token_response("token-3")]
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        return UrlopenResponse(responses.pop(0))
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret", clock=lambda: now[0])
+
+    assert provider.get_access_token() == "token-1"
+    now[0] = 1_299.0
+    assert provider.get_access_token() == "token-1"
+    now[0] = 1_300.0
+    assert provider.get_access_token() == "token-2"
+    provider.invalidate("token-1")
+    assert provider.get_access_token() == "token-2"
+    provider.invalidate("token-2")
+    assert provider.get_access_token() == "token-3"
+    assert len(calls) == 3
+
+
+def test_oauth_token_cache_is_shared_safely_across_threads(monkeypatch):
+    opener_lock = Lock()
+    opener_calls = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal opener_calls
+        with opener_lock:
+            opener_calls += 1
+        return UrlopenResponse(oauth_token_response("shared-token"))
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+    barrier = Barrier(8)
+    results = []
+
+    def get_token():
+        barrier.wait()
+        results.append(provider.get_access_token())
+
+    threads = [Thread(target=get_token) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results == ["shared-token"] * 8
+    assert opener_calls == 1
+
+
+def test_oauth_graphql_401_invalidates_exact_rejected_token_and_retries_once(monkeypatch):
+    token_responses = [oauth_token_response("token-1"), oauth_token_response("token-2")]
+    graphql_authorizations = []
+
+    def fake_urlopen(request, timeout):
+        if request.full_url == LINEAR_OAUTH_TOKEN_ENDPOINT:
+            return UrlopenResponse(token_responses.pop(0))
+        graphql_authorizations.append(request.get_header("Authorization"))
+        if len(graphql_authorizations) == 1:
+            raise http_error(request.full_url, 401)
+        return UrlopenResponse({"data": {"viewer": {"id": "viewer-1"}}})
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+    transport = UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, OAuthClientCredentialsAuth(provider))
+
+    assert transport.execute("query { viewer { id } }") == {"data": {"viewer": {"id": "viewer-1"}}}
+    assert graphql_authorizations == ["Bearer token-1", "Bearer token-2"]
+    assert token_responses == []
+
+
+def test_late_oauth_401_for_old_token_does_not_invalidate_newer_cached_token(monkeypatch):
+    token_responses = [oauth_token_response("token-1"), oauth_token_response("token-2")]
+
+    def fake_urlopen(request, timeout):
+        return UrlopenResponse(token_responses.pop(0))
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+
+    assert provider.get_access_token() == "token-1"
+    provider.invalidate("token-1")
+    assert provider.get_access_token() == "token-2"
+    provider.invalidate("token-1")
+    assert provider.get_access_token() == "token-2"
+    assert token_responses == []
+
+
+def test_oauth_graphql_second_401_fails_without_a_third_attempt(monkeypatch):
+    token_responses = [
+        oauth_token_response("token-1"),
+        oauth_token_response("token-2"),
+        oauth_token_response("token-3"),
+    ]
+    graphql_calls = []
+
+    def fake_urlopen(request, timeout):
+        if request.full_url == LINEAR_OAUTH_TOKEN_ENDPOINT:
+            return UrlopenResponse(token_responses.pop(0))
+        graphql_calls.append(request)
+        raise http_error(request.full_url, 401)
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+    transport = UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, OAuthClientCredentialsAuth(provider))
+
+    with pytest.raises(LinearAuthenticationError, match="after one refresh") as exc_info:
+        transport.execute("query { viewer { id } }")
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.transient is False
+    assert len(graphql_calls) == 2
+    assert provider.get_access_token() == "token-3"
+    assert token_responses == []
+
+
+def test_api_key_graphql_401_is_not_refreshed_or_retried(monkeypatch):
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        raise http_error(request.full_url, 401)
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    transport = UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, ApiKeyAuth("api-key"))
+
+    with pytest.raises(LinearTransportError) as exc_info:
+        transport.execute("query { viewer { id } }")
+
+    assert exc_info.value.status_code == 401
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_oauth_token_transient_http_errors_are_classified_for_backoff(monkeypatch, status):
+    monkeypatch.setattr(
+        linear_client_module,
+        "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(http_error(request.full_url, status)),
+    )
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+
+    with pytest.raises(LinearTransportError) as exc_info:
+        provider.get_access_token()
+
+    assert exc_info.value.status_code == status
+    assert exc_info.value.transient is True
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [ConnectionResetError("connection reset"), IncompleteRead(b"partial")],
+)
+def test_oauth_token_response_read_network_errors_are_transient(monkeypatch, read_error):
+    class FailingReadResponse(UrlopenResponse):
+        def read(self):
+            raise read_error
+
+    monkeypatch.setattr(
+        linear_client_module,
+        "urlopen",
+        lambda request, timeout: FailingReadResponse(b""),
+    )
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+
+    with pytest.raises(LinearTransportError) as exc_info:
+        provider.get_access_token()
+
+    assert exc_info.value.transient is True
+
+
+def test_oauth_token_auth_errors_and_object_reprs_do_not_leak_credentials(monkeypatch):
+    client_id = "sensitive-client-id"
+    client_secret = "sensitive-client-secret"
+    error_body = json.dumps({"error_description": client_secret}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        raise http_error(request.full_url, 400, error_body)
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    provider = OAuthClientCredentialsTokenProvider(client_id, client_secret)
+    auth = OAuthClientCredentialsAuth(provider)
+
+    with pytest.raises(LinearAuthenticationError) as exc_info:
+        provider.get_access_token()
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.transient is False
+    for rendered in (repr(provider), repr(auth), str(exc_info.value)):
+        assert client_id not in rendered
+        assert client_secret not in rendered
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"not-json",
+        {"token_type": "Bearer", "expires_in": 600},
+        {"access_token": "token", "token_type": "MAC", "expires_in": 600},
+        {"access_token": "token", "token_type": "Bearer", "expires_in": 0},
+        {"access_token": "token", "token_type": "Bearer", "expires_in": float("nan")},
+    ],
+)
+def test_oauth_token_malformed_success_payloads_fail_closed(monkeypatch, payload):
+    monkeypatch.setattr(linear_client_module, "urlopen", lambda request, timeout: UrlopenResponse(payload))
+    provider = OAuthClientCredentialsTokenProvider("client-id", "client-secret")
+
+    with pytest.raises(LinearAuthenticationError):
+        provider.get_access_token()
+
+
+def test_linear_client_from_config_preserves_api_key_and_accepts_shared_oauth_provider():
+    api_client = LinearClient.from_config(LinearConfig(api_key="api-key"))
+    assert isinstance(api_client.transport, UrllibGraphQLTransport)
+    assert isinstance(api_client.transport.auth, ApiKeyAuth)
+
+    oauth_config = LinearConfig(
+        auth_mode="oauth_client_credentials",
+        oauth_client_id="client-id",
+        oauth_client_secret="client-secret",
+        assignee_id="user-1",
+    )
+    shared_provider = OAuthClientCredentialsTokenProvider.from_config(oauth_config)
+    oauth_client = LinearClient.from_config(oauth_config, oauth_token_provider=shared_provider)
+    assert isinstance(oauth_client.transport, UrllibGraphQLTransport)
+    assert isinstance(oauth_client.transport.auth, OAuthClientCredentialsAuth)
+    assert oauth_client.transport.auth.token_provider is shared_provider
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            LinearConfig(
+                api_key="api-key",
+                oauth_client_id="client-id",
+                oauth_client_secret="client-secret",
+            ),
+            "cannot be combined",
+        ),
+        (
+            LinearConfig(
+                auth_mode="oauth_client_credentials",
+                oauth_client_id="client-id",
+                oauth_client_secret="client-secret",
+            ),
+            "LINEAR_ASSIGNEE_ID is required",
+        ),
+        (
+            LinearConfig(
+                auth_mode="oauth_client_credentials",
+                oauth_client_id="client-id",
+                assignee_id="user-1",
+            ),
+            "LINEAR_OAUTH_CLIENT_SECRET is required",
+        ),
+    ],
+)
+def test_linear_client_from_config_enforces_auth_invariants(config, expected):
+    with pytest.raises(LinearAuthenticationError, match=expected):
+        LinearClient.from_config(config)
 
 
 def workflow_response():
