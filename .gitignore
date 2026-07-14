@@ -14,6 +14,7 @@ venv/
 
 # Local OMX orchestration/session state
 .omx/
+.omc/
 
 # Project-local runtime state and artifacts. Directory skeleton is kept so the
 # project can be deployed from this folder without external absolute paths.
