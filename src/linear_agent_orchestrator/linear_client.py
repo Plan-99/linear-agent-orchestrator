@@ -281,6 +281,19 @@ class GraphQLTransport(Protocol):
         ...
 
 
+def _read_graphql_response_body(response: Any, *, status_code: int | None = None) -> str:
+    """Read a GraphQL response, classifying interrupted reads as transient."""
+
+    try:
+        return response.read().decode("utf-8")
+    except (OSError, HTTPException) as exc:
+        raise LinearTransportError(
+            "Linear GraphQL response read error",
+            status_code=status_code,
+            transient=True,
+        ) from exc
+
+
 class UrllibGraphQLTransport:
     """Small stdlib-only JSON GraphQL transport."""
 
@@ -302,7 +315,7 @@ class UrllibGraphQLTransport:
             request = Request(self.endpoint, data=body, headers=headers, method="POST")
             try:
                 with urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310 - configured API endpoint
-                    response_body = response.read().decode("utf-8")
+                    response_body = _read_graphql_response_body(response)
                     return _decode_json_payload(response_body)
             except HTTPError as exc:
                 if exc.code == 401 and refreshable_auth is not None:
@@ -319,7 +332,11 @@ class UrllibGraphQLTransport:
                         status_code=401,
                     ) from exc
 
-                response_body = exc.read().decode("utf-8") if exc.fp else ""
+                response_body = (
+                    _read_graphql_response_body(exc, status_code=exc.code)
+                    if exc.fp
+                    else ""
+                )
                 try:
                     payload = _decode_json_payload(response_body) if response_body else {}
                 except LinearGraphQLError:
@@ -329,12 +346,14 @@ class UrllibGraphQLTransport:
                 raise LinearTransportError(
                     f"Linear HTTP error {exc.code}",
                     status_code=exc.code,
-                    transient=exc.code == 429 or 500 <= exc.code < 600,
+                    transient=exc.code in {408, 429} or 500 <= exc.code < 600,
                 ) from exc
             except URLError as exc:
                 raise LinearTransportError(f"Linear transport error: {exc.reason}", transient=True) from exc
             except TimeoutError as exc:
                 raise LinearTransportError("Linear transport timeout", transient=True) from exc
+            except (OSError, HTTPException) as exc:
+                raise LinearTransportError("Linear transport error", transient=True) from exc
         raise AssertionError("unreachable OAuth retry state")
 
 

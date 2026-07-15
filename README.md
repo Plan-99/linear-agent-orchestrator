@@ -295,14 +295,16 @@ LINEAR_ATTENTION_STATE_NAME="In Review"
 LINEAR_DONE_STATE_NAME="In Review"
 ```
 
-알림은 orchestrator가 아니라 **Linear 네이티브 Slack 연동**으로 구성합니다. 개인
-API key로 LAO를 실행하면 상태 변경 actor와 커스텀 View 구독자가 같은 사람이어서
-Linear의 [self-action 알림 억제 정책](https://linear.app/docs/custom-views)에 따라
-Inbox와 개인 Slack DM이 생성되지 않습니다.
-개인 DM을 쓰려면 OAuth Client Credentials app actor로 실행하고, `Assignee = 본인` 및
-`Status = In Review`인 개인 View의 issue-added 알림을 구독한 뒤 Linear 개인 Slack
-알림을 켜세요. 팀 채널 알림과는 별도 경로입니다. 상세 검증 절차는
-[온보딩 가이드](docs/onboarding.md#9-slack-알림-설정-권장)를 참고하세요.
+알림은 orchestrator가 직접 보내지 않고 **Linear 네이티브 알림과 Slack 연동**으로
+처리합니다. 현재 기본 운영 기준은 LAO 앱 actor가 댓글을 달거나 상태를 바꿨을 때,
+운영자가 Linear를 보고 있지 않아도 개인 전역 설정에 따라 Linear 앱 또는 Slack 알림이
+도착하는 것입니다. 이 경로는 `In Review`만 골라 보내지 않으며 다른 Linear 이벤트도
+함께 알릴 수 있습니다.
+
+`In Review`만 받는 Custom View 개인 구독이나 특정 Slack 채널 게시가 필요하면 별도로
+설정하고 실제 채널 메시지까지 수동 확인해야 합니다. Linear Inbox나 개인 Slack DM의
+도착만으로 Custom View 채널 게시를 성공으로 판정하지 않습니다. 상세 정책과 선택적
+구성은 [온보딩 가이드](docs/onboarding.md#9-slack-알림-설정-권장)를 참고하세요.
 
 재작업 시에는 `In Review` 이슈를 Todo로 되돌리지 않습니다. execution key 특성상 이슈나
 runner 설정을 수정하지 않은 재큐잉은 안전 복구가 불가능한 fail-in-doubt만 남깁니다.

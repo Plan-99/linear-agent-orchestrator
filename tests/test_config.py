@@ -65,6 +65,48 @@ def test_config_loads_required_linear_and_runner_values_from_env_without_leaking
     assert config.redacted_dict()["linear"]["api_key"] == "***REDACTED***"
 
 
+def test_runner_allowed_env_rejects_linear_credentials_even_without_secret_checks():
+    credential_names = (
+        "LINEAR_API_KEY",
+        "LINEAR_OAUTH_CLIENT_ID",
+        "LINEAR_OAUTH_CLIENT_SECRET",
+        "LINEAR_ACCESS_TOKEN",
+        "LINEAR_API_TOKEN",
+        "LINEAR_OAUTH_ACCESS_TOKEN",
+        "LINEAR_OAUTH_TOKEN",
+        "LINEAR_TOKEN",
+    )
+
+    for credential_name in credential_names:
+        config = load_config(
+            env={"RUNNER_ALLOWED_ENV": f"PATH,{credential_name.lower()},HOME"}
+        )
+
+        assert config.validate_startup(require_secrets=False) == [
+            "RUNNER_ALLOWED_ENV must not include Linear credential variables: "
+            + credential_name
+        ]
+
+
+def test_runner_allowed_env_reports_only_sorted_credential_names_not_values():
+    secret = "never-print-this-linear-secret"
+    config = load_config(
+        env={
+            "LINEAR_API_KEY": secret,
+            "LINEAR_OAUTH_ACCESS_TOKEN": secret,
+            "RUNNER_ALLOWED_ENV": "LINEAR_OAUTH_ACCESS_TOKEN,PATH,LINEAR_API_KEY",
+        }
+    )
+
+    errors = config.validate_startup(require_secrets=False)
+
+    assert errors == [
+        "RUNNER_ALLOWED_ENV must not include Linear credential variables: "
+        "LINEAR_API_KEY, LINEAR_OAUTH_ACCESS_TOKEN"
+    ]
+    assert secret not in "\n".join(errors)
+
+
 def test_config_loads_oauth_client_credentials_and_redacts_only_the_secret():
     config = load_config(
         env={
@@ -181,6 +223,22 @@ def test_environment_overrides_dotenv_file(tmp_path: Path):
     assert config.linear.team_id == "file-team"
     assert config.linear.project_id == "file-project"
     assert config.runner.command_template == "echo from file"
+
+
+def test_empty_process_auth_mode_allows_oauth_env_file_and_missing_mode_defaults_to_api_key(
+    tmp_path: Path,
+):
+    env_file = tmp_path / ".env.oauth"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n",
+        encoding="utf-8",
+    )
+
+    oauth_config = load_config(env={"LINEAR_AUTH_MODE": ""}, env_files=[env_file])
+    default_config = load_config(env={"LINEAR_AUTH_MODE": ""})
+
+    assert oauth_config.linear.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS
+    assert default_config.linear.auth_mode == LINEAR_AUTH_MODE_API_KEY
 
 
 def test_missing_secret_validation_lists_required_values():

@@ -205,8 +205,39 @@ Task / Acceptance Criteria / Validation 3섹션이 미리 채워져 나옵니다
 
 ## 9. Slack 알림 설정 (권장)
 
-리뷰가 필요한 이슈(In Review 진입)만 자기 Slack DM으로 받는 구성입니다.
-알림은 orchestrator가 아니라 **Linear 네이티브 Slack 연동**으로 처리합니다.
+알림은 orchestrator가 직접 보내지 않고 **Linear 네이티브 알림과 Slack 연동**으로
+처리합니다. 현재 운영 수용 기준은 다음과 같습니다.
+
+- LAO 앱 actor가 이슈에 진행/결과 댓글을 남기고 상태를 변경합니다.
+- 운영자가 Linear를 보고 있지 않을 때, 개인 전역 알림 설정에 따라 Linear 앱 또는
+  Slack 알림이 도착합니다.
+- 이 기본 경로는 `In Review` 전용이 아닙니다. 선택한 전역 알림 유형에 따라 다른 댓글,
+  할당, 상태 변경도 함께 알릴 수 있습니다.
+- `In Review` 전용 Custom View 알림과 특정 Slack 채널 게시는 선택 사항이며, 기본 운영
+  완료 조건으로 간주하지 않습니다.
+
+### 기본 운영 정책
+
+1. **워크스페이스 연동 (관리자 1회)** — Linear Settings → Integrations →
+   Slack을 연결합니다. 이미 연결되어 있다면 건너뜁니다.
+2. **개인 전역 알림 (각 운영자)** — Linear 개인 설정 → Notifications에서 필요한
+   댓글/상태 변경 알림과 Slack 전달을 켭니다. 실제 항목과 전달 범위는 워크스페이스 및
+   개인 설정을 따릅니다.
+3. **검증** — 새 Todo 테스트 이슈 하나를 LAO가 처리하게 한 뒤 다음을 확인합니다.
+   - 이슈 Activity의 댓글과 상태 변경 actor가 `LAO Agent Orchestrator` 앱입니다.
+   - 진행 댓글, 결과 댓글, `In Progress` 및 최종 상태 전환이 기록됩니다.
+   - 운영자가 Linear를 보고 있지 않은 상태에서 Linear 앱 또는 Slack 알림이 하나 이상
+     도착합니다.
+
+이 검증에서 Linear 앱 알림이나 Linear 봇 개인 DM이 도착하면 **개인 전역 알림 경로**가
+동작한 것입니다. 특정 Custom View에 연결한 Slack 채널 메시지의 성공 증거는 아닙니다.
+
+OAuth app actor는 알림과 audit에서 사람의 동작과 LAO의 동작을 구분합니다. 개인 API
+key로 LAO를 실행하면 상태 변경 actor가 key 소유자 자신으로 기록되어 Linear의
+[self-action 알림 억제 정책](https://linear.app/docs/custom-views)이 적용될 수 있습니다.
+Client Credentials token은 mutation actor를 LAO 앱으로 기록하므로 이 혼동을 피합니다.
+
+### 선택 사항: In Review 전용 알림
 
 전제: 실패/timeout run과 interactive run의 result 제출은 기본 설정으로 이미
 In Review로 이동합니다. 성공(Done)까지 같은 리뷰 큐로 모으려면 `.env`에서
@@ -217,45 +248,23 @@ LINEAR_ATTENTION_STATE_NAME="In Review"
 LINEAR_DONE_STATE_NAME="In Review"
 ```
 
-설정은 두 계층입니다.
+개인 DM을 좁혀 받으려면 `Status = In Review`와 본인 assignee 조건의 Custom View를
+만들고, bell 메뉴에서 **이슈가 View에 추가될 때** 개인 notification을 구독합니다.
+Linear 개인 설정 → Notifications → Slack 전달도 함께 켭니다.
 
-1. **워크스페이스 연동 (관리자 1회)** — Linear Settings → Integrations →
-   Slack 연결. 이미 되어 있다면 건너뜁니다.
-2. **개인 설정 (각자 1회, 약 1분)**:
-   - Linear 개인 설정에서 **자기 Slack 계정 연결** (Notifications 또는
-     Connected accounts). Personal Slack notifications는 Linear Inbox에 생성된
-     notification을 Slack의 Linear 앱 개인 DM으로 전달합니다.
-   - `Status = In Review` + `Assignee = 자기 자신` 필터로 **자기 전용 커스텀
-     뷰**를 만듭니다. 공유 View를 사용하더라도 각 운영자가 자신의 assignee 조건을
-     확인하고 개인 notification을 따로 구독해야 합니다.
-   - 뷰의 bell 메뉴에서 **이슈가 뷰에 추가될 때** 개인 notification을 구독하고,
-     개인 설정 → Notifications → Slack에서 해당 notification의 Slack 전달을 켭니다.
-     뷰 메뉴의 `Configure custom view Slack notifications`는 개인 DM이 아니라
-     별도 Slack **채널**로 보내는 기능입니다.
+특정 팀 Slack 채널로 보내려면 View의 `Configure custom view Slack notifications`에서
+대상 workspace/channel과 `Issue added to view`를 별도로 선택합니다. 다음 항목을 모두
+확인해야 채널 경로가 성공한 것입니다.
 
-여기서 OAuth app actor가 중요합니다. Linear는 구독한 View에
-[**자신이 수행한 작업**](https://linear.app/docs/custom-views)으로 이슈가 들어오면
-알림 소음을 줄이기 위해 notification을 만들지 않습니다. 개인 API key는
-LAO의 상태 변경도 key 소유자의 self-action으로 기록하므로, View 조건을 충족해도 Linear
-Inbox notification이 없고 그 결과 개인 Slack DM도 오지 않습니다. Client Credentials
-token은 mutation actor를 LAO 앱으로 기록하므로 `app actor != View 구독자`가 되어 이
-self-action 억제를 피합니다.
+1. 설정 이후 생성한 새 이슈가 View 밖(`Todo`)에서 안(`In Review`)으로 전환됩니다.
+2. 설정한 **Slack 채널에 실제 메시지**가 도착합니다.
+3. Linear Inbox나 개인 Slack DM은 채널 메시지를 대신하는 성공 증거로 사용하지 않습니다.
 
-설정 후 다음 순서로 실제 경로를 확인하세요.
-
-1. 본인에게 할당된 Todo 테스트 이슈를 LAO가 처리하게 합니다.
-2. 이슈 Activity에서 댓글과 `In Review` 상태 변경 actor가
-   `LAO Agent Orchestrator` 앱인지 확인합니다.
-3. 이슈가 본인의 `Assignee = 본인` + `Status = In Review` View에 추가되는지 확인합니다.
-4. Linear Inbox notification과 Slack의 Linear 앱 개인 DM이 모두 오는지 확인합니다.
-
-앱 actor가 맞는데 DM만 없다면 Linear 개인 설정 → Notifications → Slack 연결과 해당
-View의 issue-added 구독을 확인하세요. Inbox notification 자체가 없다면 Slack 재연결보다
-먼저 actor와 View 필터를 다시 확인해야 합니다.
-
-View 구독 없이 일반 status-change 알림을 폭넓게 켜면 daemon의 다른 상태 전환도
-DM으로 올 수 있습니다. 리뷰 진입만 받으려면 위의 issue-added View 구독을 기준으로
-알림 유형을 구성하세요.
+채널 경로는 개인 구독과 독립적이므로, 도착하지 않으면 View의 이벤트 선택, Slack
+workspace/channel, private channel 권한을 먼저 확인합니다. 공유 채널용 View는 평가
+대상이 명확하도록 동적인 `Assignee = Me`보다 명시적인 assignee 조건을 권장합니다.
+이 선택적 채널 검증이 실패해도 위의 개인 전역 알림 수용 기준이 충족되면 기본 운영은
+가능합니다.
 
 OAuth 장애 시 롤백 절차:
 

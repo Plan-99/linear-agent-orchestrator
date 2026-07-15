@@ -111,7 +111,8 @@ if [[ ! -f .env ]]; then
   chmod 600 .env
   cat <<'MSG'
 Created project-local .env from .env.example.
-Edit .env and fill LINEAR_API_KEY / LINEAR_TEAM_ID before real Linear runs.
+Edit .env, choose LINEAR_AUTH_MODE, and fill its matching credentials plus
+LINEAR_TEAM_ID and a project target before real Linear runs.
 MSG
 else
   chmod 600 .env
@@ -131,13 +132,18 @@ ensure_env_default LOG_FORMAT json
 ensure_env_default STATE_DB_PATH /workspace/data/state.sqlite3
 ensure_env_default LAO_UID "$HOST_UID"
 ensure_env_default LAO_GID "$HOST_GID"
+ensure_env_default LINEAR_AUTH_MODE api_key
 if ! grep -Eq '^LINEAR_PROJECT_(NAME|ID)=.+' .env; then
   ensure_env_default LINEAR_PROJECT_NAME TEST
 fi
-# Only issues assigned to LINEAR_ASSIGNEE_ID are polled; empty means the API
-# viewer. Keep a documented placeholder so operators know the knob exists.
+# Migrate the API-key-only wording written by pre-OAuth bootstrap versions.
+if grep -Fqx '# Only issues assigned to this user are polled; empty = API viewer.' .env; then
+  sed -i 's|^# Only issues assigned to this user are polled; empty = API viewer\.$|# Assignee filter: OAuth mode requires a human user ID; API-key mode may use its viewer.|' .env
+fi
+# Keep a documented placeholder so operators know OAuth mode requires an
+# explicit human assignee while API-key mode may use the credential viewer.
 if ! grep -Eq '^#? ?LINEAR_ASSIGNEE_ID=' .env; then
-  printf '# Only issues assigned to this user are polled; empty = API viewer.\n# LINEAR_ASSIGNEE_ID=\n' >> .env
+  printf '# Assignee filter: OAuth mode requires a human user ID; API-key mode may use its viewer.\n# LINEAR_ASSIGNEE_ID=\n' >> .env
 fi
 ensure_env_default LINEAR_QUEUE_STATE_NAME Todo
 ensure_env_default LINEAR_IN_PROGRESS_STATE_NAME "'In Progress'"

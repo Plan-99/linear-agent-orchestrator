@@ -1,0 +1,33 @@
+# Version-control and local orchestration metadata
+.git
+.omx
+.omc
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+.docker-secrets
+
+# Runtime state, credentials, logs, and artifacts
+.runtime
+data
+artifacts
+work
+logs
+*.sqlite3
+*.log
+
+# Python/build caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+**/__pycache__
+**/*.py[cod]
+.coverage
+htmlcov
+*.egg-info
+build
+dist
+.venv
+venv

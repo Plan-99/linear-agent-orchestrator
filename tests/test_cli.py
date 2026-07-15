@@ -48,6 +48,7 @@ class StubAssigneeClient:
         project_nodes = [{"id": self.project_id}] if self.include_project else []
         user = {"id": self.assignee_id} if self.include_user else None
         return {
+            "viewer": {"id": "oauth-app-viewer-id"},
             "team": {"id": self.team_id, "projects": {"nodes": project_nodes}},
             "user": user,
         }
@@ -182,6 +183,7 @@ def test_oauth_startup_check_fetches_token_and_runs_read_only_access_preflight(m
                         "id": team_id,
                         "projects": {"nodes": [{"id": project_id}]},
                     },
+                    "viewer": {"id": "oauth-app-viewer-id"},
                     "user": {"id": assignee_id},
                 }
             }
@@ -302,6 +304,30 @@ def test_linear_access_preflight_fails_closed_for_inaccessible_project_or_assign
         config,
         client=StubAssigneeClient(assignee_id="user-42", include_user=False),
     ) == ["Linear access preflight could not access LINEAR_ASSIGNEE_ID"]
+
+
+def test_oauth_access_preflight_rejects_app_viewer_as_human_assignee():
+    app_viewer_id = "oauth-app-viewer-id"
+    config = AppConfig(
+        linear=LinearConfig(
+            auth_mode="oauth_client_credentials",
+            oauth_client_id="client-id",
+            oauth_client_secret="client-secret",
+            team_id="DEV",
+            project_id="project-uuid",
+            assignee_id=app_viewer_id,
+        )
+    )
+
+    errors = linear_assignee_preflight_errors(
+        config,
+        client=StubAssigneeClient(assignee_id=app_viewer_id),
+    )
+
+    assert errors == [
+        "OAuth LINEAR_ASSIGNEE_ID must identify a human user different from "
+        "the OAuth app actor"
+    ]
 
 
 def test_create_test_issue_uses_central_oauth_validation(tmp_path, capsys, monkeypatch):

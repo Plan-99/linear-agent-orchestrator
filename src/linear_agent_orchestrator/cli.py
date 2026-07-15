@@ -33,6 +33,7 @@ STATE_DB_PATH_REQUIRED = (
 STATEFUL_COMMANDS = frozenset({"daemon", "state-init", "process-once"})
 LINEAR_ACCESS_PREFLIGHT_QUERY = """
 query LinearAccessPreflight($teamId: String!, $projectId: ID!, $assigneeId: String!) {
+  viewer { id }
   team(id: $teamId) {
     id
     projects(first: 1, filter: { id: { eq: $projectId } }) {
@@ -261,6 +262,16 @@ def linear_assignee_preflight_errors(config: AppConfig, client: LinearClient | N
     user = data.get("user") or {}
     if not isinstance(user, dict) or str(user.get("id") or "") != assignee_id:
         return ["Linear access preflight could not access LINEAR_ASSIGNEE_ID"]
+    if config.linear.auth_mode == LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS:
+        viewer = data.get("viewer") or {}
+        viewer_id = str(viewer.get("id") or "") if isinstance(viewer, dict) else ""
+        if not viewer_id:
+            return ["Linear access preflight could not resolve the OAuth app viewer"]
+        if viewer_id == assignee_id:
+            return [
+                "OAuth LINEAR_ASSIGNEE_ID must identify a human user different from "
+                "the OAuth app actor"
+            ]
     return []
 
 

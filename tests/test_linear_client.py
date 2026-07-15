@@ -235,6 +235,61 @@ def test_api_key_graphql_401_is_not_refreshed_or_retried(monkeypatch):
 
 
 @pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_graphql_transient_http_errors_are_classified_for_backoff(monkeypatch, status):
+    monkeypatch.setattr(
+        linear_client_module,
+        "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(http_error(request.full_url, status)),
+    )
+    transport = UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, ApiKeyAuth("api-key"))
+
+    with pytest.raises(LinearTransportError) as exc_info:
+        transport.execute("query { viewer { id } }")
+
+    assert exc_info.value.status_code == status
+    assert exc_info.value.transient is True
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [ConnectionResetError("connection reset"), IncompleteRead(b"partial")],
+)
+@pytest.mark.parametrize("http_error_response", [False, True])
+def test_graphql_response_read_network_errors_are_transient(
+    monkeypatch,
+    read_error,
+    http_error_response,
+):
+    class FailingReadResponse(UrlopenResponse):
+        def read(self):
+            raise read_error
+
+    class FailingReadStream(BytesIO):
+        def read(self, *args, **kwargs):
+            raise read_error
+
+    def fake_urlopen(request, timeout):
+        if http_error_response:
+            raise HTTPError(
+                request.full_url,
+                503,
+                "request failed",
+                {},
+                FailingReadStream(),
+            )
+        return FailingReadResponse(b"")
+
+    monkeypatch.setattr(linear_client_module, "urlopen", fake_urlopen)
+    transport = UrllibGraphQLTransport(LINEAR_GRAPHQL_ENDPOINT, ApiKeyAuth("api-key"))
+
+    with pytest.raises(LinearTransportError) as exc_info:
+        transport.execute("query { viewer { id } }")
+
+    assert exc_info.value.status_code == (503 if http_error_response else None)
+    assert exc_info.value.transient is True
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
 def test_oauth_token_transient_http_errors_are_classified_for_backoff(monkeypatch, status):
     monkeypatch.setattr(
         linear_client_module,

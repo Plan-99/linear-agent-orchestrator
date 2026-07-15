@@ -31,6 +31,18 @@ LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS = "oauth_client_credentials"
 SUPPORTED_LINEAR_AUTH_MODES = frozenset(
     {LINEAR_AUTH_MODE_API_KEY, LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS}
 )
+_FORBIDDEN_RUNNER_LINEAR_CREDENTIAL_ENV_NAMES = frozenset(
+    {
+        "LINEAR_ACCESS_TOKEN",
+        "LINEAR_API_KEY",
+        "LINEAR_API_TOKEN",
+        "LINEAR_OAUTH_ACCESS_TOKEN",
+        "LINEAR_OAUTH_CLIENT_ID",
+        "LINEAR_OAUTH_CLIENT_SECRET",
+        "LINEAR_OAUTH_TOKEN",
+        "LINEAR_TOKEN",
+    }
+)
 _RUNNER_PLACEHOLDERS = {
     "prompt_path",
     "context_path",
@@ -219,6 +231,18 @@ class AppConfig:
             errors.append("runner_timeout_seconds must be positive")
         if self.runner.max_lifetime_seconds <= 0:
             errors.append("runner_max_lifetime_seconds must be positive")
+        forbidden_runner_env = sorted(
+            {
+                name.upper()
+                for name in self.runner.allowed_env
+                if name.upper() in _FORBIDDEN_RUNNER_LINEAR_CREDENTIAL_ENV_NAMES
+            }
+        )
+        if forbidden_runner_env:
+            errors.append(
+                "RUNNER_ALLOWED_ENV must not include Linear credential variables: "
+                + ", ".join(forbidden_runner_env)
+            )
         if self.backoff.initial_seconds <= 0:
             errors.append("backoff.initial_seconds must be positive")
         if self.backoff.max_seconds < self.backoff.initial_seconds:
