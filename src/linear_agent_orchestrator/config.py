@@ -340,7 +340,11 @@ def load_dotenv_file(path: Path) -> dict[str, str]:
             parsed = shlex.split(raw_value, comments=False, posix=True)
         except ValueError as exc:
             raise ValueError(f"Invalid dotenv line {line_number} in {path}: {exc}") from exc
-        values[key] = parsed[0] if parsed else ""
+        # Preserve unquoted multi-word dotenv values such as
+        # ``LINEAR_IN_PROGRESS_STATE_NAME=In Progress``. ``shlex`` still
+        # handles quoted/escaped values, while joining prevents silently
+        # truncating everything after the first token.
+        values[key] = " ".join(parsed) if parsed else ""
     return values
 
 

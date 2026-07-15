@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+import hashlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -124,9 +125,30 @@ def build_parser() -> argparse.ArgumentParser:
     process_once.add_argument("--first", type=int, default=10, help="Linear page size for one-shot polling")
     process_once.add_argument("--json", action="store_true", help="Print process result as JSON")
 
-    create_issue = subparsers.add_parser("create-test-issue", help="Create a safe canonical Linear TEST issue for live e2e validation")
-    create_issue.add_argument("--title", help="Issue title; defaults to timestamped G005 smoke title")
-    create_issue.add_argument("--json", action="store_true", help="Print created issue as JSON")
+    create_issue = subparsers.add_parser(
+        "create-issue",
+        help="Create a canonical issue in the configured Linear team/project",
+    )
+    create_issue.add_argument("--title", required=True, help="Issue title")
+    create_issue.add_argument(
+        "--description-file",
+        required=True,
+        type=Path,
+        help="UTF-8 markdown file containing the canonical issue body",
+    )
+    create_issue.add_argument("--json", action="store_true", help="Print result as JSON")
+    create_issue.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate without contacting Linear; print only target metadata and a body digest",
+    )
+
+    create_test_issue = subparsers.add_parser(
+        "create-test-issue",
+        help="Create a safe canonical Linear TEST issue for live e2e validation",
+    )
+    create_test_issue.add_argument("--title", help="Issue title; defaults to timestamped G005 smoke title")
+    create_test_issue.add_argument("--json", action="store_true", help="Print created issue as JSON")
 
     return parser
 
@@ -171,6 +193,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "process-once":
         assert db_path is not None
         return _process_once(config, db_path=db_path, owner_id=args.owner_id, first=args.first, as_json=args.json)
+    if args.command == "create-issue":
+        return _create_issue(
+            config,
+            title=args.title,
+            description_file=args.description_file,
+            as_json=args.json,
+            dry_run=args.dry_run,
+        )
     if args.command == "create-test-issue":
         return _create_test_issue(config, title=args.title, as_json=args.json)
     raise AssertionError(f"Unhandled command: {args.command}")
@@ -360,6 +390,111 @@ def _runner_dry_run(
     return 0 if result.completed_semantically else 1
 
 
+def _create_issue(
+    config: AppConfig,
+    *,
+    title: str,
+    description_file: Path,
+    as_json: bool,
+    dry_run: bool,
+) -> int:
+    """Validate and create one issue without retrying the mutation."""
+
+    try:
+        body = description_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        LOGGER.error(
+            "create_issue_description_error",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return 1
+
+    schema = validate_issue_body(body)
+    errors = list(schema.diagnostics)
+    if not title.strip():
+        errors.append("--title must not be blank")
+    errors.extend(config.linear.validation_errors(require_secrets=True))
+    if errors:
+        for error in errors:
+            LOGGER.error(
+                "create_issue_validation_error",
+                extra={"error": _redact_linear_secrets(error, config.linear)},
+            )
+        return 1
+
+    body_bytes = body.encode("utf-8")
+    if dry_run:
+        payload = {
+            "dry_run": True,
+            "target": {
+                "assignee_id": config.linear.assignee_id,
+                "project_id": config.linear.project_id,
+                "project_name": config.linear.project_name,
+                "queue_state_name": config.linear.queue_state_name,
+                "team_id": config.linear.team_id,
+                "title": title,
+            },
+            "body": {
+                "length_bytes": len(body_bytes),
+                "sha256": hashlib.sha256(body_bytes).hexdigest(),
+            },
+        }
+        if as_json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            target = payload["target"]
+            digest = payload["body"]
+            print("create issue dry-run: valid")
+            print(
+                "target "
+                f"team={target['team_id']} project_id={target['project_id']} "
+                f"project_name={target['project_name']} state={target['queue_state_name']} "
+                f"assignee={target['assignee_id']} title={target['title']}"
+            )
+            print(f"body sha256={digest['sha256']} length_bytes={digest['length_bytes']}")
+        return 0
+
+    client = _linear_client_factory(config.linear)()
+    preflight_errors = linear_assignee_preflight_errors(config, client=client)
+    if preflight_errors:
+        for error in preflight_errors:
+            LOGGER.error(
+                "create_issue_preflight_error",
+                extra={"error": _redact_linear_secrets(error, config.linear)},
+            )
+        return 1
+
+    try:
+        issue = client.create_issue(config.linear, title=title, description=body)
+    except Exception as exc:  # noqa: BLE001 - CLI fails closed and must not retry a mutation
+        error = f"{type(exc).__name__}: {exc}"
+        LOGGER.error(
+            "create_issue_failed",
+            extra={"error": _redact_linear_secrets(error, config.linear)},
+        )
+        return 1
+    _print_created_issue(issue, as_json=as_json)
+    return 0
+
+
+def _redact_linear_secrets(message: str, config: LinearConfig) -> str:
+    """Redact configured credentials from command errors before logging."""
+
+    redacted = message
+    for secret in (config.api_key, config.oauth_client_secret):
+        if secret:
+            redacted = redacted.replace(secret, "***REDACTED***")
+    return redacted
+
+
+def _print_created_issue(issue: LinearIssue, *, as_json: bool) -> None:
+    payload = {"issue_id": issue.id, "identifier": issue.identifier, "url": issue.url, "title": issue.title}
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"created {issue.identifier} {issue.url or ''}".rstrip())
+
+
 def _create_test_issue(config: AppConfig, *, title: str | None, as_json: bool) -> int:
     errors = config.linear.validation_errors(require_secrets=True)
     if errors:
@@ -380,11 +515,7 @@ def _create_test_issue(config: AppConfig, *, title: str | None, as_json: bool) -
         "- Confirm this issue has start/result comments and status Done.\n"
     )
     issue = LinearClient.from_config(config.linear).create_issue(config.linear, title=issue_title, description=body)
-    payload = {"issue_id": issue.id, "identifier": issue.identifier, "url": issue.url, "title": issue.title}
-    if as_json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print(f"created {issue.identifier} {issue.url or ''}".rstrip())
+    _print_created_issue(issue, as_json=as_json)
     return 0
 
 

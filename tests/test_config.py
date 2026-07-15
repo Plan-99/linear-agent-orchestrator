@@ -268,6 +268,20 @@ def test_dotenv_parser_supports_comments_export_and_quotes(tmp_path: Path):
     }
 
 
+def test_dotenv_parser_preserves_unquoted_multiword_values(tmp_path: Path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_IN_PROGRESS_STATE_NAME=In Progress\n"
+        "RUNNER_COMMAND_TEMPLATE=echo hello world\n",
+        encoding="utf-8",
+    )
+
+    assert load_dotenv_file(env_file) == {
+        "LINEAR_IN_PROGRESS_STATE_NAME": "In Progress",
+        "RUNNER_COMMAND_TEMPLATE": "echo hello world",
+    }
+
+
 def test_startup_validation_rejects_invalid_runner_templates_before_processing():
     base = {
         "LINEAR_API_KEY": "lin_api_secret",

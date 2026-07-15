@@ -17,7 +17,9 @@ Linear 이슈를 에이전트(Codex/OMX/Claude Code)에게 자동으로 전달�
 
 ## 1. 사전 준비
 
-- Docker와 Docker Compose
+- Git, Docker와 Docker Compose
+- `flock` 명령 (`util-linux` 패키지) — 동시에 두 launcher가 업데이트하거나 daemon을
+  시작하지 못하게 하는 host lock에 사용합니다.
 - host에서 사용할 backend CLI에 **먼저 로그인**해 두세요
   (`codex login`, 또는 Claude Code `claude` 로그인). bootstrap이 이
   인증 파일을 전용 사본으로 복사해 갑니다.
@@ -36,17 +38,26 @@ Linear 이슈를 에이전트(Codex/OMX/Claude Code)에게 자동으로 전달�
 ```bash
 git clone https://github.com/Plan-99/linear-agent-orchestrator.git
 cd linear-agent-orchestrator
-./scripts/bootstrap.sh
+./run.sh
 ```
 
-`bootstrap.sh`는 `.runtime/` 디렉토리들과 `.env`(예시에서 복사), agent
+`run.sh`가 팀원이 평소 사용하는 유일한 시작 명령입니다. 최초 실행은 `.env`를
+예시에서 만들고 필수 설정이 비어 있으면 daemon을 시작하지 않습니다. 3번에 따라
+`.env`를 채운 뒤 `./run.sh`를 다시 실행하세요.
+
+내부 bootstrap 단계는 `.runtime/` 디렉토리들과 `.env`(예시에서 복사), agent
 credential 사본(`.runtime/agent-home`)을 준비합니다. host 원본이 사본보다
 mtime 기준으로 더 최신이면 실행할 때마다 자동으로 재복사되므로, host에서
-재로그인한 뒤에는 bootstrap(또는 시작 시 bootstrap을 실행하는
-`./scripts/daemon.sh`)만 다시 돌리면 됩니다. 단, 컨테이너 쪽 CLI가 사본을
+재로그인한 뒤에는 `./run.sh`만 다시 돌리면 됩니다. 단, 컨테이너 쪽 CLI가 사본을
 덮어써 사본 mtime이 host보다 최신이 된 경우(예: 이미 회전된 token으로 갱신
 실패, GitHub #3)에는 자동 갱신이 동작하지 않으니
-`./scripts/bootstrap.sh --refresh-credentials`로 강제 재복사하세요.
+`./run.sh --refresh-credentials`로 강제 재복사하세요.
+
+시작할 때 `run.sh`는 현재 branch의 설정된 upstream만 fast-forward 방식으로
+갱신하고, 새 launcher를 한 번 재실행합니다. 자동으로 받아 실행하는 코드이므로
+운영 전에 `git remote -v`와 branch upstream이 조직에서 신뢰하는 저장소인지
+확인하세요. branch를 바꾸거나 commit/push하지 않으며 reset, stash, rebase로 로컬
+변경을 숨기지 않습니다.
 
 공식 `scripts/compose.sh`와 기본 runtime 설정에서는 이 checkout의
 `.runtime/data/state.sqlite3`가 authoritative 상태 DB입니다. 다른
@@ -135,7 +146,30 @@ git check-ignore .env
 - Linear에 이 repo 전용 프로젝트를 만들고 `.env`의
   `LINEAR_PROJECT_NAME`을 맞추세요.
 
-## 5. 검증
+## 5. 자동 업데이트와 검증
+
+일상적인 검증과 daemon 실행은 하나의 명령으로 처리합니다.
+
+```bash
+./run.sh
+```
+
+`run.sh`는 `.env`의 활성 backend에 필요한 공식 npm stable 버전을 확인합니다.
+`codex`는 Codex, `claude`는 Claude Code, `omx`는 OMX와 Codex를 함께 갱신합니다.
+새 소스나 버전은 별도의 candidate 이미지에서 CLI 버전/help, 전체 pytest, 실제
+`.env`의 read-only startup check를 통과해야만 last-known-good 이미지로
+승격됩니다. 검증된 source SHA, image ID와 세 도구 버전은
+`.runtime/update/verified.env`에 기록되며, 실패한 candidate는 이 상태를 덮어쓰지
+않습니다.
+
+이미지 태그와 Compose project는 physical checkout 경로별 namespace를 사용하므로
+같은 host의 다른 LAO checkout과 충돌하지 않습니다. 승격 직전 Git SHA/clean
+worktree를 다시 확인하며, 중단된 승격은 previous 이미지에서 복구합니다.
+
+fallback은 현재 checkout의 Compose launch contract로 검증됩니다. Compose나
+entrypoint의 breaking change는 기존 verified 이미지와 하위 호환되게 전환해야 하며,
+호환성 또는 startup 검사가 실패하면 daemon을 시작하지 않습니다.
+다음 수동 명령은 개발과 장애 분석용입니다.
 
 ```bash
 ./scripts/test.sh                                          # 전체 테스트
@@ -152,20 +186,30 @@ git check-ignore .env
 AGENT_CONSOLE=true" 오류가 나는데, 이는 정상입니다(6번 참고) —
 `-e AGENT_CONSOLE=true`를 붙여 점검하면 됩니다.
 
-## 6. daemon 실행
+## 6. daemon 실행과 fallback
 
 ```bash
 # host tmux 안에서 실행하세요
 tmux new -s lao
-./scripts/daemon.sh
+./run.sh
 ```
 
 - **`AGENT_INTERACTIVE=true`라면 tmux 안 실행이 필수**입니다. tmux 밖에서는
   콘솔이 headless로 떨어져 기동이 거부됩니다.
+- Git working tree가 dirty이거나 upstream 없음/divergence/Git·npm 장애가 있으면
+  업데이트를 건너뛰고 기존 검증 이미지로 실행합니다. 최초 실행이라 검증 이미지가
+  없으면 중단합니다.
+- `.env` 설정이나 인증 startup check가 실패하면 오래된 이미지로 우회하지 않고
+  daemon 시작을 중단합니다.
+- 실행 중인 orchestrator service의 daemon을 감지하면 이를 종료하거나 두 번째
+  daemon을 시작하지 않고 상태만 알립니다.
 - window 0 = daemon, 이슈를 집어갈 때마다 window 1+ 에 `lao:<run_id>`
   콘솔이 열립니다.
 - 종료는 `Ctrl-C` — 유휴 중엔 즉시, 실행 중인 run이 있으면 마무리 후
   종료됩니다.
+- `run.sh`는 foreground를 유지합니다. terminal/tmux를 종료하면 container도
+  SIGTERM을 받을 수 있습니다.
+- daemon CLI 인자는 `./run.sh -- --max-iterations 1`처럼 `--` 뒤에 전달합니다.
 
 ## 7. 이슈 작성
 
@@ -179,6 +223,20 @@ Task / Acceptance Criteria / Validation 3섹션이 미리 채워져 나옵니다
   (예: "저장소 루트에서 `python -m pytest -q` 실행, exit code 0").
 - 본문의 코드 블록 안에 `#`로 시작하는 줄은 섹션 헤딩으로 오인될 수
   있으니 피하세요.
+
+Codex에서 어느 저장소를 작업 중이든 LAO 형식 이슈를 만들려면 checkout에 포함된
+skill을 공식 user-scope discovery 위치에 한 번 연결하세요.
+
+```bash
+cd /path/to/linear-agent-orchestrator
+mkdir -p "$HOME/.agents/skills"
+ln -sfn "$PWD/skills/linear-create-issue" "$HOME/.agents/skills/linear-create-issue"
+```
+
+새 Codex 세션에서 `$linear-create-issue`를 호출할 수 있습니다. skill은 live 생성 전
+offline preview를 의무화하고, 명시적 생성 요청당 mutation을 한 번만 실행합니다.
+기본 `.env` 또는 별도 credential 파일은 group/other가 읽을 수 없는 `0600` 권한이어야
+합니다.
 
 ## 8. 처리 사이클
 
@@ -272,7 +330,7 @@ OAuth 장애 시 롤백 절차:
 2. `.env`에서 `LINEAR_AUTH_MODE=api_key`로 바꾸고 OAuth client ID/secret을 비웁니다.
 3. 자신의 `LINEAR_API_KEY`를 설정하고, 필요에 따라 `LINEAR_ASSIGNEE_ID`를 유지합니다.
 4. `./scripts/compose.sh run --rm orchestrator startup-check`를 통과시킵니다.
-5. `./scripts/daemon.sh`로 다시 시작합니다.
+5. `./run.sh`로 다시 시작합니다.
 
 API key 모드에서는 actor가 다시 사람으로 바뀌므로 self-action 기반 View DM은 오지 않는
 것이 정상입니다. 운영 복구와 Slack 알림 복구를 같은 것으로 간주하지 마세요.
@@ -296,7 +354,7 @@ API key 모드에서는 actor가 다시 사람으로 바뀌므로 self-action �
   재사용 불가)
 - **startup-check에서 backend 인증 실패** — 대부분 host token rotation으로
   `.runtime/agent-home` 사본이 무효화된 경우입니다(GitHub #3). host에서
-  재로그인 후 `./scripts/bootstrap.sh --refresh-credentials`를 실행하세요.
+  재로그인 후 `./run.sh --refresh-credentials`를 실행하세요.
   반복 재발한다면 근본 해법은 **컨테이너 전용 독립 grant**입니다: daemon을
   중지하고 사본(`rm .runtime/agent-home/.claude/.credentials.json`)을 지운
   뒤, 컨테이너 안에서 로그인을 1회 수행합니다

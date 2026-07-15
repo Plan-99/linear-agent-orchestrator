@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -361,6 +362,224 @@ def test_create_test_issue_uses_central_oauth_validation(tmp_path, capsys, monke
 
     assert exit_code == 0
     assert json.loads(capsys.readouterr().out)["identifier"] == "DEV-123"
+
+
+def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metadata(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    secret = "dry-run-client-secret"
+    body = (
+        "## Task\n"
+        "Implement the requested change without exposing this body.\n\n"
+        "## Acceptance Criteria\n"
+        "- The change is complete.\n\n"
+        "## Validation\n"
+        "- Run focused tests.\n"
+    )
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        f"LINEAR_OAUTH_CLIENT_SECRET={secret}\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_PROJECT_NAME=SphereVLA\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_network_boundary(*args, **kwargs):
+        raise AssertionError("dry-run must not construct a Linear client")
+
+    monkeypatch.setattr(cli, "_linear_client_factory", unexpected_network_boundary)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            "Create a reusable Linear issue skill",
+            "--description-file",
+            str(description_file),
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    body_bytes = body.encode("utf-8")
+    assert payload == {
+        "body": {
+            "length_bytes": len(body_bytes),
+            "sha256": hashlib.sha256(body_bytes).hexdigest(),
+        },
+        "dry_run": True,
+        "target": {
+            "assignee_id": "human-user-id",
+            "project_id": "project-id",
+            "project_name": "SphereVLA",
+            "queue_state_name": "Todo",
+            "team_id": "DEV",
+            "title": "Create a reusable Linear issue skill",
+        },
+    }
+    assert body not in captured.out
+    assert secret not in captured.out + captured.err
+
+
+def test_create_issue_invalid_schema_fails_before_network(tmp_path, capsys, monkeypatch):
+    description_file = tmp_path / "invalid.md"
+    description_file.write_text("## Task\nOnly one section.\n", encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_API_KEY=api-secret\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_network_boundary(*args, **kwargs):
+        raise AssertionError("invalid schema must fail before constructing a Linear client")
+
+    monkeypatch.setattr(cli, "_linear_client_factory", unexpected_network_boundary)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            "Invalid body",
+            "--description-file",
+            str(description_file),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Missing required section: Acceptance Criteria" in captured.err
+    assert "Missing required section: Validation" in captured.err
+    assert "api-secret" not in captured.err
+
+
+def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, capsys, monkeypatch):
+    body = (
+        "## Task\nCreate the requested Linear issue.\n\n"
+        "## Acceptance Criteria\n- The issue exists once.\n\n"
+        "## Validation\n- Return its identifier and URL.\n"
+    )
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        "LINEAR_OAUTH_CLIENT_SECRET=client-secret\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+
+    class StubCreateClient(StubAssigneeClient):
+        def __init__(self):
+            super().__init__(assignee_id="human-user-id", project_id="project-id")
+
+        def create_issue(self, config, *, title, description):
+            self.calls.append(("create_issue", title, description))
+            assert config.auth_mode == "oauth_client_credentials"
+            return SimpleNamespace(
+                id="issue-id",
+                identifier="DEV-456",
+                url="https://linear.example/DEV-456",
+                title=title,
+            )
+
+    client = StubCreateClient()
+    monkeypatch.setattr(cli, "_linear_client_factory", lambda config: lambda: client)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            "Reusable issue creation",
+            "--description-file",
+            str(description_file),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert [call[0] for call in client.calls] == [
+        "resolve_team_uuid",
+        "resolve_project_id",
+        "resolve_assignee_id",
+        "graphql",
+        "create_issue",
+    ]
+    assert sum(call[0] == "create_issue" for call in client.calls) == 1
+    assert client.calls[-1][1:] == ("Reusable issue creation", body)
+    assert json.loads(capsys.readouterr().out) == {
+        "identifier": "DEV-456",
+        "issue_id": "issue-id",
+        "title": "Reusable issue creation",
+        "url": "https://linear.example/DEV-456",
+    }
+
+
+def test_create_issue_redacts_configured_secret_from_preflight_errors(tmp_path, capsys, monkeypatch):
+    secret = "never-print-this-oauth-secret"
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(
+        "## Task\nCreate an issue.\n\n"
+        "## Acceptance Criteria\n- It exists.\n\n"
+        "## Validation\n- Check its URL.\n",
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        f"LINEAR_OAUTH_CLIENT_SECRET={secret}\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_linear_client_factory", lambda config: lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "linear_assignee_preflight_errors",
+        lambda config, client=None: [f"Linear preflight rejected credential {secret}"],
+    )
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            "Secret redaction",
+            "--description-file",
+            str(description_file),
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert "***REDACTED***" in captured.err
 
 
 def test_process_once_rejects_oauth_without_explicit_assignee_before_network(

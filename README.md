@@ -34,14 +34,22 @@ agent는 orchestrator와 같은 컨테이너에서 실행되므로 이 컨테이
 
 ## 빠른 시작
 
-### 1. 프로젝트 로컬 설정 생성
+Host에는 Git, Docker/Compose와 중복 launcher를 막는 `flock` 명령이 필요합니다.
+Debian/Ubuntu에서는 `util-linux` 패키지에 포함되어 있습니다.
+
+### 1. 한 명령으로 초기화 및 실행
 
 ```bash
 cd linear-agent-orchestrator
-./scripts/bootstrap.sh
+./run.sh
 ```
 
-이 명령은 외부 env 파일 없이 현재 폴더 아래에 다음을 준비합니다.
+`./run.sh`가 권장 운영 진입점입니다. 최초 실행에서는 `.env`를 만들고 필수 설정이
+비어 있으면 안전하게 중단합니다. 안내에 따라 `.env`를 채운 뒤 같은 명령을 다시
+실행하세요. 이후에는 LAO와 선택한 agent 도구의 업데이트 확인, 검증 이미지 준비,
+startup check, foreground daemon 실행까지 한 번에 처리합니다.
+
+초기화 과정은 외부 env 파일 없이 현재 폴더 아래에 다음을 준비합니다.
 
 - `.env`: ignored secret/config 파일
 - `.runtime/data`: SQLite crash-recovery/idempotency 상태 root
@@ -146,31 +154,60 @@ DM 검증까지의 운영 절차는 [온보딩 가이드](docs/onboarding.md)를
 
 ### 3. agent 인증 준비
 
-`bootstrap.sh`는 실행 시점의 다음 파일이 존재하면 `.runtime/agent-home`으로 복사합니다.
+`run.sh`의 내부 bootstrap 단계는 다음 파일이 존재하면 `.runtime/agent-home`으로 복사합니다.
 
 - `${CODEX_HOME:-$HOME/.codex}/auth.json`
 - `${CODEX_HOME:-$HOME/.codex}/config.toml`
 - `$HOME/.claude/.credentials.json`
 - `$HOME/.claude.json`
 
-먼저 host에서 사용할 CLI에 로그인한 뒤 bootstrap을 실행하세요. live host credential
+먼저 host에서 사용할 CLI에 로그인한 뒤 `./run.sh`를 실행하세요. live host credential
 파일은 컨테이너에 직접 mount되지 않습니다.
 
 사본 갱신 규칙 (GitHub #3):
 
-- host 원본이 사본보다 mtime 기준으로 더 최신이면 bootstrap 실행 시(daemon.sh는 시작할
-  때 bootstrap을 실행) 자동으로 재복사됩니다. host 재로그인 후에는 bootstrap만 다시
-  돌리면 됩니다.
+- host 원본이 사본보다 mtime 기준으로 더 최신이면 `run.sh`의 bootstrap 단계에서
+  자동으로 재복사됩니다. host 재로그인 후에는 `./run.sh`만 다시 실행하면 됩니다.
 - 컨테이너 쪽 CLI가 사본을 덮어써 사본 mtime이 host보다 최신이 된 경우(예: 이미 회전된
   refresh token으로 갱신 실패)에는 mtime 휴리스틱이 동작하지 않으므로
-  `./scripts/bootstrap.sh --refresh-credentials`로 강제 재복사하세요.
+  `./run.sh --refresh-credentials`로 강제 재복사하세요.
 - 근본 해법은 **컨테이너 전용 독립 grant**입니다: daemon 중지 → 사본 삭제
   (`rm .runtime/agent-home/.claude/.credentials.json`) → 컨테이너 안에서 로그인 1회
   (`./scripts/compose.sh run --rm --entrypoint claude orchestrator` 실행 후 `/login`).
   이후 host와 컨테이너가 서로 다른 grant를 사용하므로 refresh token rotation 충돌이
   원천적으로 사라집니다.
 
-### 4. 빌드와 사전 점검
+### 4. 자동 업데이트와 검증
+
+정상 운영에서는 다음 명령만 사용합니다.
+
+```bash
+./run.sh
+```
+
+`run.sh`는 시작할 때 현재 checkout branch의 설정된 upstream을 확인하고
+fast-forward 가능한 변경만 가져옵니다. 업데이트된 launcher를 한 번 재실행한 뒤
+`.env`의 `AGENT_BACKEND`에 맞는 공식 npm stable 최신 버전을 확인합니다.
+
+- `codex`: Codex CLI
+- `claude`: Claude Code
+- `omx`: OMX와 내부에서 사용하는 Codex CLI
+
+새 소스나 도구 버전은 별도 candidate 이미지에 빌드됩니다. CLI 버전/help,
+전체 pytest, 실제 `.env`를 사용한 read-only startup check가 모두 성공해야만
+검증 이미지(last-known-good)로 승격됩니다. 검증된 source SHA, image ID와 세 CLI
+버전은 `.runtime/update/verified.env`에 기록됩니다. candidate가 실패하면 이 파일과
+기존 검증 이미지는 바뀌지 않습니다.
+
+verified/previous 이미지 태그와 Compose project 이름은 physical checkout 경로에서
+파생되므로 같은 host의 서로 다른 LAO checkout이 서로의 이미지나 container를
+덮어쓰지 않습니다. candidate 승격 직전에는 Git SHA와 clean worktree를 다시
+확인하고, 승격 도중 host가 중단된 흔적이 있으면 previous 태그에서 자동 복구합니다.
+
+fallback도 현재 checkout의 Compose launch contract로 help/startup 검사를 통과해야
+실행됩니다. Compose/entrypoint를 변경할 때는 기존 verified 이미지와의 하위 호환성을
+유지해야 하며, 호환되지 않으면 daemon을 시작하지 않고 fail closed합니다.
+다음은 개발·장애 분석용 수동 명령입니다. 평소 daemon 시작에는 필요하지 않습니다.
 
 ```bash
 ./scripts/test.sh
@@ -186,13 +223,32 @@ secret 없이 로컬 wiring만 확인하려면 다음을 사용합니다.
 ./scripts/compose.sh run --rm orchestrator startup-check --allow-missing-secrets
 ```
 
-### 5. daemon 실행
+### 5. daemon 실행과 fallback
 
 foreground 실행:
 
 ```bash
-./scripts/daemon.sh
+./run.sh
 ```
+
+host CLI에 다시 로그인한 credential을 무조건 복사하려면 다음과 같이 실행합니다.
+
+```bash
+./run.sh --refresh-credentials
+```
+
+daemon 인자는 `--` 뒤에 전달할 수 있습니다.
+
+```bash
+./run.sh -- --max-iterations 1
+```
+
+Git working tree가 dirty이거나 upstream이 없거나, branch가 diverge했거나, Git/npm에
+접속할 수 없으면 `run.sh`는 reset, stash, rebase를 하지 않습니다. 대신 이미 검증된
+이미지가 있으면 경고 후 그 이미지로 시작합니다. 최초 실행이라 fallback 이미지가
+없거나 `.env`/인증 startup check가 실패하면 daemon을 시작하지 않습니다. 실행 중인
+orchestrator service의 daemon을 감지하면 업데이트를 위해 종료하거나 중복 실행하지 않고
+상태만 알립니다.
 
 `Ctrl-C` 또는 SIGTERM을 받으면 유휴(polling 대기) 중에는 약 1초 안에 종료하고,
 agent 실행 중에는 해당 run을 정리한 뒤 종료합니다(실행 중인 agent를 중간에 죽이지
@@ -200,13 +256,18 @@ agent 실행 중에는 해당 run을 정리한 뒤 종료합니다(실행 중인
 실행 상태를 확인하려면 명령을 한 줄로 입력하세요.
 
 ```bash
-docker ps --filter 'label=com.docker.compose.project=linear-agent-orchestrator' --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}'
-CONTAINER=$(docker ps -q --filter 'label=com.docker.compose.project=linear-agent-orchestrator' | head -1)
-docker logs -f --tail 100 "$CONTAINER"
+./scripts/compose.sh ps --all
+./scripts/compose.sh logs --follow --tail 100 orchestrator
 ```
 
-여러 줄 명령을 사용할 때 `\` 뒤에는 공백을 넣지 마세요. `scripts/daemon.sh`는 foreground
-프로세스이므로 terminal/session manager가 종료되면 컨테이너도 SIGTERM을 받을 수 있습니다.
+여러 줄 명령을 사용할 때 `\` 뒤에는 공백을 넣지 마세요. `run.sh`와 내부
+`scripts/daemon.sh`는 foreground 프로세스이므로 terminal/session manager가 종료되면
+컨테이너도 SIGTERM을 받을 수 있습니다.
+
+자동 pull은 현재 설정된 Git upstream의 코드를 받아 새 `run.sh`를 실행합니다. 따라서
+`git remote -v`와 branch upstream이 조직에서 신뢰하는 저장소를 가리키는지 확인하고,
+신뢰하지 않는 fork나 임의 remote를 upstream으로 설정하지 마세요. 자동 pull은 commit,
+push, branch 전환 또는 로컬 변경 삭제를 수행하지 않습니다.
 
 ## backend와 모델 변경
 
@@ -349,20 +410,36 @@ STATE_DB_PATH="$PWD/.runtime/data/state.sqlite3" \
 ./scripts/compose.sh run --rm orchestrator process-once --json
 ```
 
+### Codex에서 Linear 이슈 생성 skill 사용
+
+저장소의 `skills/linear-create-issue`는 LAO schema 검증, offline preview, 단일 live
+mutation을 묶은 Codex skill입니다. Codex가 어느 작업 디렉터리에서든 발견하도록 공식
+user-scope 위치에 symlink한 뒤 새 세션을 시작하세요.
+
+```bash
+mkdir -p "$HOME/.agents/skills"
+ln -sfn "$PWD/skills/linear-create-issue" "$HOME/.agents/skills/linear-create-issue"
+```
+
+Codex에서 `$linear-create-issue`로 명시 호출하거나 "Linear에 이슈로 올려줘"처럼
+요청할 수 있습니다. live 생성 전에 launcher가 항상 `--dry-run`으로 team, project,
+state, assignee와 본문 digest를 확인합니다. credential 파일은 `0600` 이하여야 하며,
+명시적인 생성 요청이 없으면 Linear mutation을 실행하지 않습니다.
+
 ## 대화형 agent 콘솔 (tmux)
 
 기본값은 **`auto`**입니다(host tmux 안이면 활성화, 아니면 headless). `true`/`false`로
 강제할 수 있습니다. 활성화되면 각 agent 실행이 컨테이너 안에서 tmux 세션으로 열리고,
 운영자는 host에서 실시간으로 관찰(및 대화 모드에서는 입력)할 수 있습니다.
 
-`./scripts/daemon.sh`를 host tmux 안에서 실행하면 새 이슈를 claim할 때마다
+`./run.sh`를 host tmux 안에서 실행하면 새 이슈를 claim할 때마다
 `lao:<run_id>` 이름의 **새 tmux window**가 자동으로 열립니다(window 0 = daemon,
 window 1+ = agent run). 실행이 끝나면 해당 window도 종료되고, daemon은 window 0에서
 계속 polling합니다.
 
 ```bash
-# daemon과 run별 console window 자동 실행
-./scripts/daemon.sh
+# 자동 업데이트 후 daemon과 run별 console window 실행
+./run.sh
 
 # live/종료 run 조회 또는 수동 attach
 ./scripts/console-attach.sh --list
@@ -442,8 +519,8 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
 - 동일 assignee를 사용하는 여러 machine 사이의 distributed claim은 없습니다.
 - 자동 push/PR/merge/이슈 삭제는 없습니다.
 - Docker socket과 issue-controlled bind mount는 지원하지 않습니다.
-- credential copy는 bootstrap 실행 시점에만 갱신됩니다(host 원본이 더 최신이면 자동
-  재복사, `--refresh-credentials`로 강제 재복사). 장기 실행 중 divergence는 여전히
+- credential copy는 `run.sh` 시작의 bootstrap 단계에서만 갱신됩니다(host 원본이 더
+  최신이면 자동 재복사, `./run.sh --refresh-credentials`로 강제 재복사). 장기 실행 중 divergence는 여전히
   가능합니다("3. agent 인증 준비" 참고).
 - SQLite를 삭제하면 복구/idempotency 기록도 사라지므로 의도적인 reset 외에는 삭제하지
   마세요.

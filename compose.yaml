@@ -1,12 +1,18 @@
+x-lao-build: &lao-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    LAO_UID: ${LAO_UID:-1000}
+    LAO_GID: ${LAO_GID:-1000}
+    CODEX_VERSION: ${CODEX_VERSION:-0.144.1}
+    OMX_VERSION: ${OMX_VERSION:-0.20.0}
+    CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.195}
+    LAO_SOURCE_REVISION: ${LAO_SOURCE_REVISION:-unknown}
+
 services:
   orchestrator:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        LAO_UID: ${LAO_UID:-1000}
-        LAO_GID: ${LAO_GID:-1000}
-    image: linear-agent-orchestrator:local
+    build: *lao-build
+    image: ${LAO_IMAGE:-linear-agent-orchestrator:local}
     # Non-root: run as the host user so bind-mounted files are host-owned.
     user: "${LAO_UID:-1000}:${LAO_GID:-1000}"
     init: true
@@ -92,13 +98,8 @@ services:
     command: ["startup-check", "--allow-missing-secrets"]
 
   tests:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        LAO_UID: ${LAO_UID:-1000}
-        LAO_GID: ${LAO_GID:-1000}
-    image: linear-agent-orchestrator:local
+    build: *lao-build
+    image: ${LAO_IMAGE:-linear-agent-orchestrator:local}
     init: true
     cap_drop:
       - ALL

@@ -1,20 +1,24 @@
 # syntax=docker/dockerfile:1
-FROM node:20-slim AS agent-cli
 
+# Exact, pinned top-level defaults for direct and first-time builds. The update
+# launcher may override these with equally exact, validated versions.
 ARG CODEX_VERSION=0.144.1
 ARG OMX_VERSION=0.20.0
 ARG CLAUDE_CODE_VERSION=2.1.195
+ARG LAO_SOURCE_REVISION=unknown
 
-RUN npm install --global \
+FROM node:22-slim AS agent-cli
+
+ARG CODEX_VERSION
+ARG OMX_VERSION
+ARG CLAUDE_CODE_VERSION
+
+RUN npm install --global --engine-strict \
       "@openai/codex@${CODEX_VERSION}" \
       "oh-my-codex@${OMX_VERSION}" \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 FROM python:3.12-slim AS runtime
-
-# Match the host user so bind-mounted files are never written as root.
-ARG LAO_UID=1000
-ARG LAO_GID=1000
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -52,6 +56,9 @@ COPY src ./src
 COPY tests ./tests
 COPY docs ./docs
 COPY scripts ./scripts
+RUN pip install --upgrade pip \
+    && pip install -e '.[test]'
+
 
 COPY --from=agent-cli /usr/local/bin/node /usr/local/bin/node
 COPY --from=agent-cli /usr/local/lib/node_modules /usr/local/lib/node_modules
@@ -63,8 +70,11 @@ RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/
     && install -m 0755 scripts/lao-pty-host.sh /usr/local/bin/lao-pty-host \
     && install -m 0755 scripts/lao-pty-entry.sh /usr/local/bin/lao-pty-entry
 
-RUN pip install --upgrade pip \
-    && pip install -e '.[test]'
+# Match the host user so bind-mounted files are never written as root. Keep
+# these build args close to their first use so host-ID changes do not invalidate
+# the expensive OS and Python dependency layers above.
+ARG LAO_UID=1000
+ARG LAO_GID=1000
 
 RUN (getent group "${LAO_GID}" >/dev/null || groupadd --gid "${LAO_GID}" agent) \
     && useradd --create-home --home-dir /home/agent --uid "${LAO_UID}" --gid "${LAO_GID}" --non-unique agent \
@@ -73,6 +83,18 @@ RUN (getent group "${LAO_GID}" >/dev/null || groupadd --gid "${LAO_GID}" agent) 
 
 ENV HOME=/home/agent \
     CODEX_HOME=/home/agent/.codex
+
+# Labels are deliberately last: changing a CLI version or source revision must
+# not invalidate the reusable apt/pip/runtime setup layers.
+ARG CODEX_VERSION
+ARG OMX_VERSION
+ARG CLAUDE_CODE_VERSION
+ARG LAO_SOURCE_REVISION
+
+LABEL org.opencontainers.image.revision="${LAO_SOURCE_REVISION}" \
+      io.linear-agent-orchestrator.codex.version="${CODEX_VERSION}" \
+      io.linear-agent-orchestrator.omx.version="${OMX_VERSION}" \
+      io.linear-agent-orchestrator.claude-code.version="${CLAUDE_CODE_VERSION}"
 
 USER agent
 

@@ -1,8 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
+
+# shellcheck source=scripts/host-path-lib.sh
+source "$ROOT_DIR/scripts/host-path-lib.sh"
+
+# Read one literal KEY=value entry without evaluating shell syntax. Callers
+# provide the allowlisted key; arbitrary state-file keys are never exported.
+read_update_value() {
+  local wanted="$1" file="$2" line value found=""
+  [[ -f "$file" ]] || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" == "$wanted="* ]] || continue
+    value="${line#*=}"
+    if [[ ${#value} -ge 2 && "$value" == \"*\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ ${#value} -ge 2 && "$value" == \'*\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    found="$value"
+  done < "$file"
+
+  [[ -n "$found" ]] || return 1
+  printf '%s' "$found"
+}
 
 # Read LAO_* values from .env when they are not already in the environment, so
 # shell-exported defaults below never override explicit .env configuration
@@ -20,20 +45,39 @@ if [[ -f .env ]]; then
   done
 fi
 
-# In the Codex/OMX dev container, Docker bind mounts are resolved by the host
-# daemon. If /workspace is mounted from the host, translate this project path
-# so Compose binds the real host folder. Prefer /proc/self/mountinfo because
-# HOST_WORKSPACE can be stale when the container was renamed or remounted. On a
-# normal host checkout, orchestrator paths stay project-relative.
-orchestrator_dir="$ROOT_DIR"
-if [[ "$ROOT_DIR" == /workspace/* ]]; then
-  host_workspace="$(awk '$5 == "/workspace" {print $4}' /proc/self/mountinfo | tail -n 1 | sed 's/\\040/ /g')"
-  if [[ -n "$host_workspace" && "$host_workspace" != "/" ]]; then
-    orchestrator_dir="${host_workspace}${ROOT_DIR#/workspace}"
-  elif [[ -n "${HOST_WORKSPACE:-}" ]]; then
-    orchestrator_dir="${HOST_WORKSPACE}${ROOT_DIR#/workspace}"
+# Exact CLI versions from the last verified build are the normal build inputs.
+# Process environment values (used for candidate builds) always win. LAO_IMAGE
+# is deliberately not loaded here: callers must opt into candidate/verified
+# tags so a standalone `test.sh --build` cannot overwrite a last-known-good
+# image. The state file is never sourced and only these known keys are read.
+verified_env="$ROOT_DIR/.runtime/update/verified.env"
+for key in CODEX_VERSION OMX_VERSION CLAUDE_CODE_VERSION; do
+  if [[ -z "${!key+x}" ]] && value="$(read_update_value "$key" "$verified_env")"; then
+    export "$key=$value"
+  fi
+done
+
+# A candidate launcher may pin the revision explicitly. Otherwise label normal
+# builds with the current checkout; only non-Git/failure cases fall back to the
+# last verified revision and finally Dockerfile/Compose's `unknown` default.
+if [[ -z "${LAO_SOURCE_REVISION+x}" ]]; then
+  if revision="$(git -C "$ROOT_DIR" rev-parse --verify HEAD 2>/dev/null)" && [[ -n "$revision" ]]; then
+    export LAO_SOURCE_REVISION="$revision"
+  elif revision="$(read_update_value LAO_SOURCE_REVISION "$verified_env")"; then
+    export LAO_SOURCE_REVISION="$revision"
   fi
 fi
+
+# Docker bind mounts and all Compose resources must use the same host checkout
+# identity as run.sh/updater, even when invoked directly in a dev container.
+orchestrator_dir="$(lao_host_checkout_path "$ROOT_DIR")"
+instance_id="${LAO_INSTANCE_ID:-$(lao_checkout_instance_id "$ROOT_DIR")}"
+if [[ ! "$instance_id" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+  echo "compose.sh: invalid LAO_INSTANCE_ID '$instance_id'." >&2
+  exit 64
+fi
+export LAO_INSTANCE_ID="$instance_id"
+export COMPOSE_PROJECT_NAME="lao-${instance_id}"
 
 # Exactly one trusted repository is mounted at /workspace/project; it defaults
 # to this checkout. Runtime state (data/work/artifacts/agent-home) always
