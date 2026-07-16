@@ -61,10 +61,12 @@ mtime 기준으로 더 최신이면 실행할 때마다 자동으로 재복사�
 
 공식 `scripts/compose.sh`와 기본 runtime 설정에서는 이 checkout의
 `.runtime/data/state.sqlite3`가 authoritative 상태 DB입니다. 다른
-`LAO_PROJECT_DIR`을 선택해도 DB, work, artifact는 orchestrator의 `.runtime/` 아래에
-남습니다. 명시적 DB/runner 경로 override에는 target 내부 경로를 사용하지 마세요.
-`LAO_RUNTIME_DIR`은 dev-container 경로 변환을 위한 내부 plumbing이므로 `.env`에서
-설정하지 마세요.
+`LAO_PROJECT_DIR`을 선택해도 DB, runner scratch, artifact는 orchestrator의
+`.runtime/` 아래에 남습니다. agent가 실제 소스를 수정하는 Git checkout은 별도
+`AGENT_WORKTREE_ROOT/<issue>`에 생성됩니다. Docker-host 모드의 기본 root는 대상
+repo 옆의 `<LAO_PROJECT_DIR>-worktrees`입니다. 명시적 DB/runner 경로 override에는
+target 내부 경로를 사용하지 마세요. `LAO_RUNTIME_DIR`은 dev-container 경로 변환을
+위한 내부 plumbing이므로 `.env`에서 설정하지 마세요.
 
 ## 3. `.env` 설정
 
@@ -82,6 +84,10 @@ LINEAR_ASSIGNEE_ID=<human-user-id>
 
 # 에이전트가 실제로 수정할 신뢰된 Git checkout의 절대 host 경로
 LAO_PROJECT_DIR=/absolute/path/to/target-repo
+# issue branch는 base checkout의 현재 branch가 아니라 항상 이 ref에서 시작
+AGENT_BASE_REF=main
+# ordinary Compose 기본값; Docker-host에서는 target sibling으로 자동 변환
+AGENT_WORKTREE_ROOT=/workspace/work/worktrees
 
 # 신뢰된 이슈가 대상 Docker container를 직접 개발해야 할 때만 true
 # (host root와 동등한 권한)
@@ -94,15 +100,18 @@ AGENT_EFFORT=high
 
 전체 항목과 기본값은 [.env.example](../.env.example)을 참고하세요.
 `LAO_DOCKER_HOST=true`이면 agent가 host Docker daemon으로 sibling project
-container를 build/run할 수 있습니다. launcher는 base repo와 isolated worktree를
-host-identical path로 제공하므로 상대 Compose bind mount도 동작합니다. 이 모드는
-LAO credential과 host 전체에 접근 가능한 full-host trust mode이므로 신뢰된
-이슈에서만 사용하세요. GUI는 sibling container가 `DISPLAY`/`XAUTHORITY`와
-이 모드에서 worktree에 쓰는 sibling container는 host numeric UID:GID로 실행하고, 종료 전에
-반드시 정리하세요. root-owned 파일이나 남은 bind mount는 LAO의 commit/worktree cleanup을
-막을 수 있습니다.
-`/tmp/.X11-unix`를 받아 host 창을 여는 구조입니다. 설정 예시는
-[README의 대상 Docker 컨테이너 개발과 GUI](../README.md#대상-docker-컨테이너-개발과-gui)를
+container를 build/run할 수 있습니다. launcher는 base repo와
+`AGENT_WORKTREE_ROOT`를 host-identical path로 제공합니다. 기본 변환 결과는
+`<LAO_PROJECT_DIR>-worktrees/<issue>`이며, 그 안에서 상대 Compose bind mount도
+정확히 동작합니다. LAO의 `.runtime/work`는 source checkout이 아니라 runner
+scratch로만 유지됩니다.
+
+이 모드는 LAO credential과 host 전체에 접근 가능한 full-host trust mode이므로
+신뢰된 이슈에서만 사용하세요. GUI는 sibling container가 `DISPLAY`,
+`XAUTHORITY`, `/tmp/.X11-unix`를 받아 host 창을 여는 구조입니다. worktree에
+쓰는 sibling container는 host numeric UID:GID로 실행하고 run 종료 전에 반드시
+정리하세요. root-owned 파일이나 남은 bind mount는 commit/cleanup을 막을 수
+있습니다. 자세한 설정은 [README](../README.md#대상-docker-컨테이너-개발과-gui)를
 참고하세요.
 
 `LINEAR_AUTH_MODE`를 생략하면 기존 호환을 위해 `api_key`로 동작합니다. 한 daemon에는
@@ -142,8 +151,8 @@ git check-ignore .env
 
 - LAO의 `.runtime/data`, `.runtime/work`, `.runtime/artifacts`를 대상 repo 안으로
   만들거나 옮기지 마세요. 대상 repo는 agent가 수정할 작업 checkout일 뿐입니다.
-- **writable한 git 저장소**이고 **커밋이 최소 1개** 있어야 합니다
-  (run마다 HEAD에서 worktree를 분기하므로 빈 repo는 불가).
+- **writable한 Git 저장소**이고 `AGENT_BASE_REF`(기본 `main`)가 commit으로
+  resolve되어야 합니다. 따라서 빈 repo는 사용할 수 없습니다.
 - **`.gitignore`에 agent 런타임 산출물을 등록**하세요. 성공 커밋이
   `git add -A`로 만들어지므로, 없으면 `.omx/` 로그와 `__pycache__/` 같은
   쓰레기가 결과 브랜치에 섞입니다.
@@ -275,8 +284,8 @@ offline preview를 의무화하고, 명시적 생성 요청당 mutation을 한 �
   쓰레기가 섞였다면 통째 머지 대신 필요한 파일만 선별 반영하세요.
 - Done gate는 에이전트의 **자기보고** validation을 신뢰합니다. 중요한
   변경이라면 검증 명령을 직접 재실행해 보세요.
-- **머지를 건너뛰고 후속 이슈를 올리면 새 run은 이전 작업이 없는 HEAD에서
-  시작합니다.** 이어지는 작업이라면 반드시 먼저 머지하세요.
+- **머지를 건너뛰고 후속 이슈를 올리면 새 run은 이전 작업이 없는
+  `AGENT_BASE_REF`에서 시작합니다.** 이어지는 작업이라면 먼저 머지하세요.
 
 ## 9. Slack 알림 설정 (권장)
 
@@ -380,8 +389,8 @@ API key 모드에서는 actor가 다시 사람으로 바뀌므로 self-action �
   rotation 충돌이 원천적으로 사라집니다.
 - **결과 브랜치에 로그 파일이 섞임** — 대상 repo `.gitignore`에 agent
   런타임 산출물 등록(4번 참고).
-- **실패한 run 조사** — Linear 실패 댓글 + `.runtime/work/worktrees/`에
-  보존된 worktree + `.runtime/logs/console/<run_id>/output.log`를 보세요.
+- **실패한 run 조사** — Linear 실패 댓글 + `AGENT_WORKTREE_ROOT/<issue>/`에
+  보존된 checkout + `.runtime/logs/console/<run_id>/output.log`를 보세요.
 
 ## 더 읽을 것
 

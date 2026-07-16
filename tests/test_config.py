@@ -21,6 +21,7 @@ from linear_agent_orchestrator.config import (
 
 def test_config_defaults_include_first_story_constants():
     config = load_config(env={})
+    assert RunnerConfig().base_ref == "main"
 
     assert config.state_db_path is None
     assert config.poll_interval_seconds == DEFAULT_POLL_INTERVAL_SECONDS == 60
@@ -29,6 +30,8 @@ def test_config_defaults_include_first_story_constants():
     assert config.runner.timeout_seconds == DEFAULT_RUNNER_TIMEOUT_SECONDS == 3600
     assert config.runner.max_lifetime_seconds == DEFAULT_RUNNER_MAX_LIFETIME_SECONDS == 21600
     assert config.runner.docker_host is None
+    assert config.runner.worktree_root is None
+    assert config.runner.base_ref == "main"
     assert config.backoff.initial_seconds == DEFAULT_BACKOFF_INITIAL_SECONDS == 5
     assert config.backoff.max_seconds == DEFAULT_BACKOFF_MAX_SECONDS == 300
     assert config.backoff.max_attempts == DEFAULT_BACKOFF_MAX_ATTEMPTS == 5
@@ -57,6 +60,8 @@ def test_config_loads_required_linear_and_runner_values_from_env_without_leaking
             "RUNNER_COMMAND_TEMPLATE": "echo {prompt_path}",
             "RUNNER_ALLOWED_ENV": "PATH,HOME",
             "DOCKER_HOST": "unix:///var/run/docker.sock",
+            "AGENT_WORKTREE_ROOT": "/tmp/spherevla-v2-worktrees",
+            "AGENT_BASE_REF": "release",
         }
     )
 
@@ -67,6 +72,8 @@ def test_config_loads_required_linear_and_runner_values_from_env_without_leaking
     assert config.runner.command_template == "echo {prompt_path}"
     assert config.runner.allowed_env == ("PATH", "HOME")
     assert config.runner.docker_host == "unix:///var/run/docker.sock"
+    assert config.runner.worktree_root == "/tmp/spherevla-v2-worktrees"
+    assert config.runner.base_ref == "release"
     assert config.redacted_dict()["linear"]["api_key"] == "***REDACTED***"
 
 
@@ -366,6 +373,7 @@ def test_docker_host_runtime_requires_allowlist_and_cli(tmp_path, monkeypatch):
         project_dir=str(tmp_path),
         backend="codex",
         docker_host="unix:///var/run/docker.sock",
+        worktree_isolation=False,
     )
 
     errors = validate_agent_runtime(runner, require_auth=False)

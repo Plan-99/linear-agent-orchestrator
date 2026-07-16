@@ -361,6 +361,9 @@ def _runner_dry_run(
         docker_host=config.runner.docker_host,
         project_dir=config.runner.project_dir,
         backend=config.runner.backend,
+        worktree_root=config.runner.worktree_root,
+        base_ref=config.runner.base_ref,
+        worktree_isolation=config.runner.worktree_isolation,
     )
     issue = LinearIssue(
         id="local-dry-run",

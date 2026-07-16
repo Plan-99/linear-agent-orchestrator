@@ -57,7 +57,9 @@ startup check, foreground daemon 실행까지 한 번에 처리합니다.
 - `.env`: ignored secret/config 파일
 - `.runtime/data`: SQLite crash-recovery/idempotency 상태 root
   (`state.sqlite3`는 첫 stateful 실행에서 생성)
-- `.runtime/work`: 이슈별 입력 및 실행 파일
+- `.runtime/work`: prompt/context 등 이슈별 runner scratch 파일
+- `AGENT_WORKTREE_ROOT`: agent가 실제 소스를 수정하는 issue별 Git checkout root
+  (Docker-host 기본값은 대상 repo 옆의 `<target-repo>-worktrees`)
 - `.runtime/artifacts`: 구조화 결과와 artifact
 - `.runtime/agent-home`: agent credential/config 전용 copy
 
@@ -89,6 +91,10 @@ LINEAR_ASSIGNEE_ID=<human-user-id>
 
 # agent가 실제로 수정할 신뢰된 Git checkout의 절대 host 경로입니다.
 LAO_PROJECT_DIR=/absolute/host/path/to/target-repository
+# 모든 issue branch가 시작할 명시적 기준입니다.
+AGENT_BASE_REF=main
+# ordinary Compose 기본값; Docker-host 모드에서는 target sibling으로 변환됩니다.
+AGENT_WORKTREE_ROOT=/workspace/work/worktrees
 
 RUNNER_COMMAND_TEMPLATE='/usr/local/bin/lao-agent-runner {prompt_path} {result_path}'
 AGENT_BACKEND=omx
@@ -102,12 +108,15 @@ AGENT_BYPASS_PERMISSIONS=true
 `LAO_PROJECT_DIR`을 생략하면 orchestrator 폴더 자체가 대상이 됩니다. 대상 경로는
 **writable한 Git 저장소**여야 합니다.
 
-기본값(`AGENT_WORKTREE_ISOLATION=true`)에서는 run마다 HEAD에서 분기한 전용 git
-worktree에서 작업하고, 의미적으로 성공한 run만 로컬 `lao/<issue>-<key>` 브랜치에
-커밋됩니다(push 없음). base 저장소는 항상 clean하게 유지되며, 사람이 브랜치를
-리뷰해 머지하거나 버리면 됩니다. 실패한 run의 변경은 `.runtime/work/worktrees/`에
-조사용으로 남습니다. `false`로 끄면 기존 고정-디렉토리 모드로 돌아가며, 이때는
-run 전 clean worktree가 강제되고 남은 변경이 다음 실행을 fail-closed로 차단합니다.
+기본값(`AGENT_WORKTREE_ISOLATION=true`)에서는 run마다
+`AGENT_BASE_REF`(기본 `main`)에서 분기한 전용 Git worktree에서 작업하고,
+의미적으로 성공한 run만 로컬 `lao/<issue>-<key>` 브랜치에 커밋됩니다(push 없음).
+base 저장소의 현재 checkout이 다른 feature branch여도 새 issue가 이를 상속하지
+않습니다. 실제 source checkout은 `AGENT_WORKTREE_ROOT/<issue>`에 생성되고 실패한
+run은 그곳에 조사용으로 보존됩니다. `RUNNER_WORK_DIR`에는 prompt/context 같은
+scratch만 남습니다. 격리를 `false`로 끄면 기존 고정-디렉토리 모드로 돌아가며,
+이때는 run 전 clean worktree가 강제되고 남은 변경이 다음 실행을 fail-closed로
+차단합니다.
 
 ### 대상 Docker 컨테이너 개발과 GUI
 
@@ -122,10 +131,14 @@ LAO_DOCKER_HOST=true
 ```
 
 활성화하면 launcher가 socket의 실제 numeric GID를 container 보조 그룹에 추가하고,
-이미지에 포함된 Docker CLI·Compose·Buildx를 사용합니다. 또한 대상 저장소와 LAO
-worktree를 host와 container에서 같은 절대경로로 mount합니다. 따라서 격리 worktree
-안에서 실행한 `docker compose up`의 상대 bind source(`.`)도 host daemon에서
-올바르게 해석됩니다.
+이미지에 포함된 Docker CLI·Compose·Buildx를 사용합니다. 대상 base repo와
+`AGENT_WORKTREE_ROOT`를 host와 LAO container에 같은 절대경로로 mount합니다.
+`AGENT_WORKTREE_ROOT=/workspace/work/worktrees` 기본값을 그대로 썼다면 launcher가
+이를 대상 repo의 sibling인 `<LAO_PROJECT_DIR>-worktrees`로 변환하고 directory를
+생성합니다. 예를 들어 target이 `/Project/spherevla-v2`라면 issue checkout은
+`/Project/spherevla-v2-worktrees/DEV-70`입니다. 따라서 그 안에서 실행한
+`docker compose up`의 상대 bind source(`.`)도 host daemon에서 올바르게
+해석됩니다.
 
 이 옵션은 sandbox 기능이 아닙니다. agent는 Docker API로 다음을 수행할 수 있습니다.
 
@@ -373,8 +386,8 @@ custom `RUNNER_COMMAND_TEMPLATE`도 가능하지만 다음 책임은 custom runn
 daemon의 순서는 다음과 같습니다.
 
 1. 설정된 project의 Todo 중 설정된 assignee에게 할당된 유효 이슈를 선택합니다.
-2. 실행 직전에 고정 저장소를 다시 검사하고, 격리 모드에서는 HEAD에서 분기한 run 전용
-   git worktree를 만듭니다(legacy 모드에서는 clean worktree를 요구).
+2. 실행 직전에 고정 저장소와 `AGENT_BASE_REF`를 다시 검사하고, 격리 모드에서는
+   해당 ref에서 run 전용 Git worktree를 만듭니다(legacy 모드는 clean checkout 요구).
 3. 이슈를 In Progress로 바꾸고 agent에 이슈 본문과 실행 context를 전달합니다.
 4. agent가 `{result_path}`에 결과를 기록합니다.
 5. transport와 semantic validation이 모두 성공한 경우에만 이슈를 Done으로 바꾸고,
@@ -599,8 +612,8 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
 - SQLite를 삭제하면 복구/idempotency 기록도 사라지므로 의도적인 reset 외에는 삭제하지
   마세요.
 - 호스트에서 대상 repo에 `git worktree prune`을 실행하지 마세요. run worktree의
-  등록을 살아있는 run 중에 제거할 수 있습니다. 기본 모드에서는 container 전용 경로라
-  host에서 정확히 판단할 수도 없습니다. worktree 정리는 orchestrator가 수행합니다.
+  등록을 살아있는 run 중에 제거할 수 있습니다. source checkout은
+  `AGENT_WORKTREE_ROOT` 아래에 있으며 worktree 정리는 orchestrator가 수행합니다.
 
 ## 주요 모듈
 

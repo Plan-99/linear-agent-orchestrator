@@ -13,6 +13,7 @@ services:
       # host-identical paths keep the base repository and isolated worktrees
       # usable from sibling development containers.
       AGENT_PROJECT_DIR: ${LAO_PROJECT_DIR}
+      AGENT_WORKTREE_ROOT: ${AGENT_WORKTREE_ROOT}
       RUNNER_WORK_DIR: ${LAO_RUNTIME_DIR}/work
       RUNNER_ARTIFACTS_DIR: ${LAO_RUNTIME_DIR}/artifacts
       LAO_HOST_PROJECT_DIR: ${LAO_PROJECT_DIR}
@@ -30,6 +31,9 @@ services:
       - type: bind
         source: ${LAO_PROJECT_DIR}
         target: ${LAO_PROJECT_DIR}
+      - type: bind
+        source: ${AGENT_WORKTREE_ROOT}
+        target: ${AGENT_WORKTREE_ROOT}
       - type: bind
         source: ${LAO_RUNTIME_DIR}/work
         target: ${LAO_RUNTIME_DIR}/work

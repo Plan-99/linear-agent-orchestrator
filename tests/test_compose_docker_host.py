@@ -37,6 +37,7 @@ def _fixture_repo(tmp_path: Path) -> tuple[Path, Path]:
         printf 'socket=%s\n' "${LAO_DOCKER_SOCKET:-}"
         printf 'project=%s\n' "${LAO_PROJECT_DIR:-}"
         printf 'runtime=%s\n' "${LAO_RUNTIME_DIR:-}"
+        printf 'worktree_root=%s\n' "${AGENT_WORKTREE_ROOT:-}"
         printf 'xauthority=%s\n' "${XAUTHORITY:-}"
         printf 'client_host=%s\n' "${DOCKER_HOST:-}"
         for arg in "$@"; do
@@ -58,6 +59,7 @@ def _run(root: Path, fake_bin: Path, **overrides: str) -> subprocess.CompletedPr
     }
     env.pop("LAO_DOCKER_SOCKET", None)
     env.pop("XAUTHORITY", None)
+    env.pop("AGENT_WORKTREE_ROOT", None)
     env.update(overrides)
     return subprocess.run(
         [str(root / "scripts" / "compose.sh"), "version"],
@@ -103,6 +105,9 @@ def test_enabled_mode_loads_override_and_exports_host_identity(tmp_path: Path) -
     assert f"socket={socket_path}" in lines
     assert f"project={root}" in lines
     assert f"runtime={root / '.runtime'}" in lines
+    worktree_root = Path(f"{root}-worktrees")
+    assert f"worktree_root={worktree_root}" in lines
+    assert worktree_root.is_dir()
     assert f"xauthority={root / '.Xauthority'}" in lines
     assert f"client_host=unix://{socket_path}" in lines
     args = [line for line in lines if line.startswith("arg=")]

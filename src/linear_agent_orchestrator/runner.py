@@ -23,7 +23,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol
 
-from .config import AppConfig, LinearConfig, RunnerConfig, validate_project_workspace
+from .config import (
+    AppConfig,
+    LinearConfig,
+    RunnerConfig,
+    agent_worktree_root,
+    validate_agent_worktree_settings,
+    validate_project_workspace,
+)
 from .console_schema import CONSOLE_SCHEMA_VERSION, redact_text
 from .issue_schema import clarification_comment, validate_issue_body
 from .linear_client import LinearComment, LinearIssue, WorkflowRole, WorkflowState
@@ -206,8 +213,8 @@ class _WorkspaceContext:
     project_dir: str
     worktree_path: Path | None = None
     branch: str | None = None
-    # HEAD the worktree branched from; lets finish detect commits the agent
-    # made itself inside the worktree (a clean tree does not mean "no work").
+    # Commit resolved from base_ref when the worktree was created; lets finish
+    # detect agent-made commits even when the working tree itself is clean.
     base_commit: str | None = None
 
 
@@ -232,13 +239,19 @@ class ShellRunner:
 
         if not self._uses_standard_wrapper():
             return []
-        # With worktree isolation each run branches from HEAD into its own
+        # With worktree isolation each run branches from base_ref into its own
         # orchestrator-owned checkout, so the base repository may legitimately
         # be dirty (e.g. an operator reviewing a lao/<issue> branch).
-        return validate_project_workspace(
+        workspace_errors = validate_project_workspace(
             self.config.project_dir,
             require_clean=not self.config.worktree_isolation,
         )
+        return [
+            *workspace_errors,
+            *validate_agent_worktree_settings(
+                self.config, validate_ref=not workspace_errors
+            ),
+        ]
 
     # --- per-run git worktree isolation -----------------------------------
 
@@ -283,7 +296,7 @@ class ShellRunner:
             return _WorkspaceContext(project_dir=self.config.project_dir)
         base = Path(self.config.project_dir)
         safe_name = sanitize_path_part(issue.identifier or issue.id)
-        worktree = Path(self.config.work_dir) / "worktrees" / safe_name
+        worktree = agent_worktree_root(self.config) / safe_name
         # A previous crashed/kept run may have left a worktree directory, a
         # registration without a directory, or a locked entry from a killed
         # `worktree add`; git refuses the add below over any of them, and only
@@ -298,7 +311,7 @@ class ShellRunner:
             "-b",
             branch,
             str(worktree),
-            "HEAD",
+            self.config.base_ref,
             timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
         )
         if code != 0:
@@ -339,13 +352,13 @@ class ShellRunner:
         # Agents sometimes run `git commit` inside the worktree themselves, so
         # a clean tree does NOT mean "no work" — deleting the branch then would
         # destroy committed changes (observed live on DEV-26). Compare the
-        # branch tip against the HEAD it was created from.
+        # branch tip against the resolved base commit it was created from.
         tip = self._git(worktree, "rev-parse", "HEAD")[1].strip()
         agent_committed = bool(workspace.base_commit and tip and tip != workspace.base_commit)
         if not completed:
             if dirty:
                 # Keep partial changes for post-mortem; the next run of this
-                # issue recreates the worktree from a fresh HEAD.
+                # issue recreates the worktree from the configured base ref.
                 return None, (
                     f"Run did not complete semantically; isolated worktree kept for inspection at "
                     f"{worktree} (branch `{workspace.branch}`)"
@@ -2178,6 +2191,8 @@ def execution_key(issue: LinearIssue, runner_config: RunnerConfig) -> str:
     digest.update(runner_config.project_dir.encode())
     digest.update(b"\0")
     digest.update(runner_config.backend.encode())
+    digest.update(b"\0")
+    digest.update(runner_config.base_ref.encode())
     return digest.hexdigest()
 
 

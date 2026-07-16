@@ -1,5 +1,6 @@
 """Per-run git worktree isolation: branch commit, preservation, and preflight."""
 
+from dataclasses import replace
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,6 +41,7 @@ def make_repo(tmp_path):
     (repo / "README.md").write_text("seed\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "seed")
+    git(repo, "branch", "-M", "main")
     return repo
 
 
@@ -126,6 +128,68 @@ def test_prompt_and_env_point_at_the_isolated_worktree(tmp_path):
     prompt = result.paths.prompt_path.read_text(encoding="utf-8")
     assert worktree in prompt
     assert str(repo) not in prompt
+
+
+def test_explicit_worktree_root_is_separate_from_runner_scratch(tmp_path):
+    repo = make_repo(tmp_path)
+    wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)
+    source_root = tmp_path / "spherevla-v2-worktrees"
+    config = replace(
+        make_config(tmp_path, repo, wrapper),
+        worktree_root=str(source_root),
+    )
+
+    result = ShellRunner(config).run(make_issue())
+
+    prompt = result.paths.prompt_path.read_text(encoding="utf-8")
+    assert str(source_root / "DEV-1") in prompt
+    assert not (Path(config.work_dir) / "worktrees").exists()
+    assert not (source_root / "DEV-1").exists()
+
+
+def test_explicit_base_ref_does_not_stack_on_checked_out_branch(tmp_path):
+    repo = make_repo(tmp_path)
+    main_commit = git(repo, "rev-parse", "main").stdout.strip()
+    git(repo, "checkout", "-q", "-b", "operator-review")
+    (repo / "operator-only.txt").write_text("do not inherit\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(
+        repo,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "operator review",
+    )
+    wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)
+    config = replace(
+        make_config(tmp_path, repo, wrapper),
+        worktree_root=str(tmp_path / "spherevla-v2-worktrees"),
+        base_ref="main",
+    )
+
+    result = ShellRunner(config).run(make_issue())
+
+    assert result.worktree_branch
+    parent = git(repo, "rev-parse", f"{result.worktree_branch}^").stdout.strip()
+    tree = git(repo, "ls-tree", "-r", "--name-only", result.worktree_branch).stdout
+    assert parent == main_commit
+    assert "operator-only.txt" not in tree
+
+
+def test_preflight_rejects_unknown_explicit_base_ref(tmp_path):
+    repo = make_repo(tmp_path)
+    wrapper = make_wrapper(tmp_path, result_json=COMPLETED_RESULT)
+    config = replace(make_config(tmp_path, repo, wrapper), base_ref="missing-base")
+
+    errors = ShellRunner(config).preflight_workspace()
+
+    assert errors == [
+        "AGENT_BASE_REF does not resolve to a commit in the target repository: missing-base"
+    ]
 
 
 def test_failed_run_keeps_dirty_worktree_for_inspection(tmp_path):

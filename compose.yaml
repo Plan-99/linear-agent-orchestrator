@@ -56,6 +56,10 @@ services:
       AGENT_MODEL: ${AGENT_MODEL:-}
       AGENT_EFFORT: ${AGENT_EFFORT:-}
       AGENT_PROJECT_DIR: ${AGENT_PROJECT_DIR:-/workspace/project}
+      # Source worktrees are separate from runner scratch data. main prevents
+      # new issues from inheriting the operator's currently checked-out branch.
+      AGENT_WORKTREE_ROOT: ${AGENT_WORKTREE_ROOT:-/workspace/work/worktrees}
+      AGENT_BASE_REF: ${AGENT_BASE_REF:-main}
       # Per-run git worktree isolation; runs commit to local lao/<issue>
       # branches (never pushed) and the base checkout stays clean.
       AGENT_WORKTREE_ISOLATION: ${AGENT_WORKTREE_ISOLATION:-true}

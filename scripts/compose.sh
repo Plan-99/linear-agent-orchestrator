@@ -29,11 +29,11 @@ read_update_value() {
   printf '%s' "$found"
 }
 
-# Read LAO_* values from .env when they are not already in the environment, so
-# shell-exported defaults below never override explicit .env configuration
-# (compose gives shell env precedence over the .env file).
+# Read launcher values from .env when they are not already in the environment,
+# so shell-exported defaults below never override explicit .env configuration
+# (Compose gives shell env precedence over the .env file).
 if [[ -f .env ]]; then
-  for key in LAO_PROJECT_DIR LAO_UID LAO_GID LAO_DOCKER_HOST LAO_DOCKER_SOCKET; do
+  for key in LAO_PROJECT_DIR LAO_UID LAO_GID LAO_DOCKER_HOST LAO_DOCKER_SOCKET AGENT_WORKTREE_ROOT; do
     if [[ -z "${!key:-}" ]]; then
       value="$(grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2- || true)"
       value="${value%\"}" && value="${value#\"}"
@@ -109,6 +109,27 @@ case "${LAO_DOCKER_HOST:-false}" in
       echo "compose.sh: Docker host mode requires bootstrapped runtime work/artifact directories." >&2
       exit 66
     fi
+
+    # In ordinary Compose mode the default stays under RUNNER_WORK_DIR. A host
+    # Docker daemon instead needs a source path it can resolve, so the known
+    # container default becomes a sibling of the target repository.
+    configured_worktree_root="${AGENT_WORKTREE_ROOT:-}"
+    if [[ -z "$configured_worktree_root" || "$configured_worktree_root" == "/workspace/work/worktrees" ]]; then
+      configured_worktree_root="${LAO_PROJECT_DIR%/}-worktrees"
+    fi
+    if [[ "$configured_worktree_root" != /* ]]; then
+      echo "compose.sh: Docker host mode requires an absolute AGENT_WORKTREE_ROOT." >&2
+      exit 66
+    fi
+    if ! mkdir -p -- "$configured_worktree_root"; then
+      echo "compose.sh: could not create AGENT_WORKTREE_ROOT: $configured_worktree_root" >&2
+      exit 77
+    fi
+    if [[ ! -d "$configured_worktree_root" || ! -r "$configured_worktree_root" || ! -w "$configured_worktree_root" || ! -x "$configured_worktree_root" ]]; then
+      echo "compose.sh: AGENT_WORKTREE_ROOT is not a readable and writable directory: $configured_worktree_root" >&2
+      exit 77
+    fi
+    export AGENT_WORKTREE_ROOT="$configured_worktree_root"
 
     docker_gid="$(stat -Lc %g "$docker_socket" 2>/dev/null || true)"
     if [[ ! "$docker_gid" =~ ^[0-9]+$ ]]; then

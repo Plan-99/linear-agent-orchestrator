@@ -174,6 +174,8 @@ ensure_env_default RUNNER_ALLOWED_ENV "$docker_runner_env"
 ensure_env_default AGENT_BACKEND omx
 ensure_env_default AGENT_MODEL gpt-5.5
 ensure_env_default AGENT_PROJECT_DIR /workspace/project
+ensure_env_default AGENT_WORKTREE_ROOT /workspace/work/worktrees
+ensure_env_default AGENT_BASE_REF main
 ensure_env_default AGENT_SANDBOX workspace-write
 ensure_env_default AGENT_PERMISSION_MODE acceptEdits
 # Docker is the boundary: bypass inside the container is the supported default.

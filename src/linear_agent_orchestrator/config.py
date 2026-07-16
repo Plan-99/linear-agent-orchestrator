@@ -161,11 +161,17 @@ class RunnerConfig:
     docker_host: str | None = None
     project_dir: str = "/workspace/project"
     backend: str = "omx"
+    # Git worktrees are source checkouts, not runner scratch data. None keeps
+    # the legacy native default (<work_dir>/worktrees); Compose sets an
+    # explicit path and Docker-host mode replaces it with a host-identical one.
+    worktree_root: str | None = None
+    # Stable commit-ish from which every issue branch is created. Pinning this
+    # avoids accidentally stacking new work on the operator's checked-out HEAD.
+    base_ref: str = "main"
     # Per-run git worktree isolation (standard lao-agent-runner wrapper only).
-    # Each run works in an orchestrator-owned worktree branched from the fixed
-    # repository's HEAD; a semantically successful run is committed to a local
-    # lao/<issue> branch (never pushed) and the worktree is removed. The base
-    # repository therefore stays clean and no longer blocks the next run.
+    # Each run works in an orchestrator-owned worktree branched from base_ref;
+    # a semantically successful run is committed to a local lao/<issue> branch
+    # (never pushed) and the worktree is removed.
     worktree_isolation: bool = True
     # Interactive conversation mode: host the backend's interactive TUI in the
     # per-run console instead of the one-shot exec path. By default the run ends
@@ -418,6 +424,8 @@ def load_config(
             docker_host=_get_optional_str(source, "DOCKER_HOST"),
             project_dir=_get_str(source, "AGENT_PROJECT_DIR", "/workspace/project"),
             backend=_get_str(source, "AGENT_BACKEND", "omx").casefold(),
+            worktree_root=_get_optional_str(source, "AGENT_WORKTREE_ROOT"),
+            base_ref=_get_str(source, "AGENT_BASE_REF", "main"),
             worktree_isolation=_get_bool(source, "AGENT_WORKTREE_ISOLATION", True),
             interactive=_get_bool(source, "AGENT_INTERACTIVE", False),
             interactive_autoclose=_get_bool(source, "AGENT_INTERACTIVE_AUTOCLOSE", False),
@@ -452,8 +460,12 @@ def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[
     project_dir = Path(runner.project_dir)
     # With per-run worktree isolation the base repository never hosts agent
     # edits directly, so a dirty base worktree (e.g. an unreviewed lao/<issue>
-    # branch checkout) must not block runs; each run branches from HEAD.
-    errors.extend(validate_project_workspace(project_dir, require_clean=not runner.worktree_isolation))
+    # branch checkout) must not block runs; each run branches from base_ref.
+    workspace_errors = validate_project_workspace(
+        project_dir, require_clean=not runner.worktree_isolation
+    )
+    errors.extend(workspace_errors)
+    errors.extend(validate_agent_worktree_settings(runner, validate_ref=not workspace_errors))
 
     missing_tools = [tool for tool in ("rg", "ps") if shutil.which(tool) is None]
     if missing_tools:
@@ -523,6 +535,55 @@ def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[
                     )
             except json.JSONDecodeError:
                 errors.append("Claude authentication check returned invalid JSON")
+    return errors
+
+
+def agent_worktree_root(runner: RunnerConfig) -> Path:
+    """Return the explicit source-worktree root or the legacy native default."""
+
+    if runner.worktree_root:
+        return Path(runner.worktree_root)
+    return Path(runner.work_dir) / "worktrees"
+
+
+def validate_agent_worktree_settings(
+    runner: RunnerConfig,
+    *,
+    validate_ref: bool = True,
+) -> list[str]:
+    """Validate isolated-worktree placement and its explicit Git base ref."""
+
+    if not runner.worktree_isolation:
+        return []
+
+    errors: list[str] = []
+    root = agent_worktree_root(runner)
+    if not root.is_absolute():
+        errors.append("AGENT_WORKTREE_ROOT must be an absolute path")
+    elif root.exists() and not root.is_dir():
+        errors.append(f"Agent worktree root is not a directory: {root}")
+
+    base_ref = runner.base_ref.strip()
+    if not base_ref:
+        errors.append("AGENT_BASE_REF must not be empty")
+    elif base_ref.startswith("-"):
+        errors.append("AGENT_BASE_REF must not start with '-'")
+    elif validate_ref:
+        ref_check = _run_preflight_command(
+            (
+                "git",
+                "-C",
+                str(runner.project_dir),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{base_ref}^{{commit}}",
+            )
+        )
+        if ref_check[0] != 0:
+            errors.append(
+                f"AGENT_BASE_REF does not resolve to a commit in the target repository: {base_ref}"
+            )
     return errors
 
 

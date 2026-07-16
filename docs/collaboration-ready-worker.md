@@ -55,14 +55,17 @@ the boundary narrow:
 Permission bypass is a container-scoped operating mode, not a safe default for
 running these backends directly on the host.
 
-`LAO_DOCKER_HOST=true` deliberately replaces that narrow Docker boundary with a
-trusted host-development capability. It mounts the host Docker socket, mirrors
-the configured repository and orchestrator worktree root at host-identical
-absolute paths, and gives the agent root-equivalent control through the Docker
-API. This mode can expose Linear credentials, other containers, and arbitrary
-host files. It is therefore suitable only for trusted issues and repositories;
-it is not an isolation mechanism. The launcher's own LAO mounts remain
-explicitly configured, but the agent can ask the host daemon to bind arbitrary
+`LAO_DOCKER_HOST=true` deliberately replaces that narrow Docker boundary with
+a trusted host-development capability. It mounts the host Docker socket and
+mirrors both the configured repository and `AGENT_WORKTREE_ROOT` at
+host-identical absolute paths. The launcher's default worktree root is the
+target-repository sibling `<LAO_PROJECT_DIR>-worktrees`; `RUNNER_WORK_DIR`
+remains orchestrator scratch storage. Docker access gives the agent
+root-equivalent control through the Docker API. This mode can expose Linear
+credentials, other containers, and arbitrary host files. It is suitable only
+for trusted issues and repositories; it is not an isolation mechanism. The
+launcher's own LAO mounts remain explicitly configured, but the agent can ask
+the host daemon to bind arbitrary
 host paths into sibling containers, including paths derived from issue content.
 Treat issue content as trusted code in this mode.
 
@@ -145,14 +148,16 @@ Before claiming live work, preflight must verify that:
 - the configured Linear assignee can be resolved; and
 - the repository state is safe for the configured workflow.
 
-With worktree isolation enabled (the default), every run branches from `HEAD`
-into a dedicated git worktree; a semantically successful run is committed to a
-local `lao/<issue>-<key>` branch (never pushed) and the base checkout stays
-clean, so operators integrate or discard those branches at their own pace. In
-the legacy fixed-directory mode, an absent repository or a dirty work tree must
-block execution rather than silently bypass the check, and operators must
-integrate or discard the prior issue's changes before another issue can safely
-run.
+With worktree isolation enabled (the default), every run branches from the
+explicit `AGENT_BASE_REF` (default `main`) into
+`AGENT_WORKTREE_ROOT/<issue>`. It never inherits the base checkout's current
+feature branch. A semantically successful run is committed to a local
+`lao/<issue>-<key>` branch (never pushed); failed source checkouts stay under
+the worktree root for inspection. `RUNNER_WORK_DIR` contains only runner
+scratch. In legacy fixed-directory mode, an absent repository or a dirty work
+tree must block execution rather than silently bypass the check, and operators
+must integrate or discard the prior issue's changes before another issue can
+safely run.
 
 ## Failure and retry behavior
 

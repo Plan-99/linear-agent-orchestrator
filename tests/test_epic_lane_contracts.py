@@ -113,6 +113,10 @@ def test_docker_host_override_is_explicit_and_read_only() -> None:
     socket_block = text.split("source: ${LAO_DOCKER_SOCKET}", maxsplit=1)[1]
     socket_block = socket_block.split("- type: bind", maxsplit=1)[0]
     assert "read_only: true" in socket_block
+    assert (
+        "source: ${AGENT_WORKTREE_ROOT}\n"
+        "        target: ${AGENT_WORKTREE_ROOT}"
+    ) in text
 
 
 def test_default_compose_clears_inherited_docker_host() -> None:
