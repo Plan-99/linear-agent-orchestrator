@@ -189,13 +189,15 @@ AGENT_CONSOLE=true" 오류가 나는데, 이는 정상입니다(6번 참고) —
 ## 6. daemon 실행과 fallback
 
 ```bash
-# host tmux 안에서 실행하세요
-tmux new -s lao
+# foreground 터미널에서 실행하면 checkout별 host tmux에 자동 진입합니다
 ./run.sh
 ```
 
-- **`AGENT_INTERACTIVE=true`라면 tmux 안 실행이 필수**입니다. tmux 밖에서는
-  콘솔이 headless로 떨어져 기동이 거부됩니다.
+- 기본 `AGENT_CONSOLE=true`, `AGENT_CONSOLE_AUTO_TMUX=true`,
+  `AGENT_INTERACTIVE=true` 조합에서는 별도로 `tmux new`를 실행할 필요가 없습니다.
+- stdin/stdout이 TTY가 아닌 service·redirect 실행은 outer tmux를 자동 생성하지
+  않습니다. 이 경우 `console-attach.sh`의 수동 attach 경로를 사용하거나 명시적으로
+  headless 설정을 선택해야 합니다.
 - Git working tree가 dirty이거나 upstream 없음/divergence/Git·npm 장애가 있으면
   업데이트를 건너뛰고 기존 검증 이미지로 실행합니다. 최초 실행이라 검증 이미지가
   없으면 중단합니다.
@@ -205,7 +207,8 @@ tmux new -s lao
   daemon을 시작하지 않고 상태만 알립니다.
 - window 0 = daemon, 이슈를 집어갈 때마다 window 1+ 에 `lao:<run_id>`
   콘솔이 열립니다.
-- 종료는 `Ctrl-C` — 유휴 중엔 즉시, 실행 중인 run이 있으면 마무리 후
+- `Ctrl-b d`는 daemon을 유지한 채 tmux에서 detach하고, 종료는 daemon window의
+  `Ctrl-C`입니다 — 유휴 중엔 즉시, 실행 중인 run이 있으면 마무리 후
   종료됩니다.
 - `run.sh`는 foreground를 유지합니다. terminal/tmux를 종료하면 container도
   SIGTERM을 받을 수 있습니다.
@@ -225,12 +228,11 @@ Task / Acceptance Criteria / Validation 3섹션이 미리 채워져 나옵니다
   있으니 피하세요.
 
 Codex에서 어느 저장소를 작업 중이든 LAO 형식 이슈를 만들려면 checkout에 포함된
-skill을 공식 user-scope discovery 위치에 한 번 연결하세요.
+skill을 현재 Codex user-scope discovery 위치에 한 번 설치하세요.
 
 ```bash
 cd /path/to/linear-agent-orchestrator
-mkdir -p "$HOME/.agents/skills"
-ln -sfn "$PWD/skills/linear-create-issue" "$HOME/.agents/skills/linear-create-issue"
+./scripts/install-linear-create-issue-skill.sh
 ```
 
 새 Codex 세션에서 `$linear-create-issue`를 호출할 수 있습니다. skill은 live 생성 전

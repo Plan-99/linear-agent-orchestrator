@@ -60,6 +60,18 @@ check "console_mode false=off"      "off" "$(console_mode 'false' 'x' '%1')"
 check "console_mode true=on"        "on"  "$(console_mode 'true' '' '')"
 check "console_mode auto+tmux=on"   "on"  "$(console_mode 'auto' 'x' '')"
 check "console_mode auto+none=off"  "off" "$(console_mode 'auto' '' '')"
+check "auto-tmux foreground console=on" "on" \
+  "$(console_auto_tmux_mode on true '' '' true true)"
+check "auto-tmux already in tmux=off" "off" \
+  "$(console_auto_tmux_mode on true '/tmp/tmux' '%1' true true)"
+check "auto-tmux redirected stdin=off" "off" \
+  "$(console_auto_tmux_mode on true '' '' false true)"
+check "auto-tmux redirected stdout=off" "off" \
+  "$(console_auto_tmux_mode on true '' '' true false)"
+check "auto-tmux explicit disable=off" "off" \
+  "$(console_auto_tmux_mode on false '' '' true true)"
+check "auto-tmux console disabled=off" "off" \
+  "$(console_auto_tmux_mode off true '' '' true true)"
 _ev="$TMP/dotenv"; printf 'FOO=1\nAGENT_CONSOLE="auto"\n' > "$_ev"
 check "read_env_value quoted" "auto" "$(read_env_value AGENT_CONSOLE "$_ev")"
 printf 'AGENT_CONSOLE=false\n' > "$_ev"

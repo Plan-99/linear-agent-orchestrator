@@ -31,6 +31,37 @@ else
 fi
 console_decision="$(console_mode "$agent_console" "${TMUX:-}" "${TMUX_PANE:-}")"
 
+# When an operator runs ./run.sh from a normal foreground terminal with the
+# console enabled, enter a checkout-specific host tmux session automatically.
+# The second daemon.sh invocation inherits TMUX/TMUX_PANE and continues below,
+# so the existing supervisor can open one focused window per agent TUI. A
+# redirected/non-TTY daemon remains attachable through console-attach.sh and is
+# never made to allocate a surprise terminal session.
+if [[ -n "${AGENT_CONSOLE_AUTO_TMUX+x}" ]]; then
+  auto_tmux="$AGENT_CONSOLE_AUTO_TMUX"
+else
+  auto_tmux="$(read_env_value AGENT_CONSOLE_AUTO_TMUX "$ROOT_DIR/.env" || true)"
+  [[ -n "$auto_tmux" ]] || auto_tmux="true"
+fi
+stdin_tty=false
+stdout_tty=false
+[[ -t 0 ]] && stdin_tty=true
+[[ -t 1 ]] && stdout_tty=true
+if [[ "$(console_auto_tmux_mode "$console_decision" "$auto_tmux" "${TMUX:-}" "${TMUX_PANE:-}" "$stdin_tty" "$stdout_tty")" == "on" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "daemon.sh: AGENT_CONSOLE=true requires host tmux for foreground TUI mode." >&2
+    exit 69
+  fi
+  tmux_session="lao-${LAO_INSTANCE_ID:-daemon}"
+  if [[ ! "$tmux_session" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "daemon.sh: invalid auto-tmux session name '$tmux_session'." >&2
+    exit 64
+  fi
+  printf -v daemon_command '%q ' "$ROOT_DIR/scripts/daemon.sh" "$@"
+  echo "daemon.sh: entering TUI session '$tmux_session' (detach: Ctrl-b d)." >&2
+  exec tmux new-session -A -s "$tmux_session" "$daemon_command"
+fi
+
 run_args=(run --rm)
 if [[ "$console_decision" == "on" ]]; then
   base_container="$(default_container_name)"

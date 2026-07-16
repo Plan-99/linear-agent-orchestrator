@@ -67,11 +67,11 @@ services:
       AGENT_PERMISSION_MODE: ${AGENT_PERMISSION_MODE:-acceptEdits}
       # Docker is the security boundary; agent CLIs bypass permissions inside.
       AGENT_BYPASS_PERMISSIONS: ${AGENT_BYPASS_PERMISSIONS:-true}
-      # Interactive agent console (tmux). Off by default; scripts/daemon.sh may
-      # auto-enable inside a host tmux. The tmux control socket stays container-
-      # private; only the per-run JSONL/output log root is bind-mounted.
-      # auto = scripts/daemon.sh enables the console when inside a host tmux and
-      # falls back to headless otherwise; set true/false to force.
+      # Interactive agent console (tmux). The bootstrapped .env defaults to true
+      # and scripts/daemon.sh supplies that resolved value. The auto fallback is
+      # retained for direct Compose compatibility when no bootstrapped .env is
+      # present. The tmux control socket stays container-private; only per-run
+      # JSONL/output logs are bind-mounted.
       AGENT_CONSOLE: ${AGENT_CONSOLE:-auto}
       AGENT_CONSOLE_LOG_DIR: ${AGENT_CONSOLE_LOG_DIR:-/workspace/logs/console}
       # Explicit direct-input capability; false unless an adapter reads a PTY.

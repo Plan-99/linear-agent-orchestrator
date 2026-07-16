@@ -413,12 +413,11 @@ STATE_DB_PATH="$PWD/.runtime/data/state.sqlite3" \
 ### Codex에서 Linear 이슈 생성 skill 사용
 
 저장소의 `skills/linear-create-issue`는 LAO schema 검증, offline preview, 단일 live
-mutation을 묶은 Codex skill입니다. Codex가 어느 작업 디렉터리에서든 발견하도록 공식
-user-scope 위치에 symlink한 뒤 새 세션을 시작하세요.
+mutation을 묶은 Codex skill입니다. Codex가 어느 작업 디렉터리에서든 발견하도록 현재
+Codex user-scope 위치에 설치한 뒤 새 세션을 시작하세요.
 
 ```bash
-mkdir -p "$HOME/.agents/skills"
-ln -sfn "$PWD/skills/linear-create-issue" "$HOME/.agents/skills/linear-create-issue"
+./scripts/install-linear-create-issue-skill.sh
 ```
 
 Codex에서 `$linear-create-issue`로 명시 호출하거나 "Linear에 이슈로 올려줘"처럼
@@ -428,18 +427,23 @@ state, assignee와 본문 digest를 확인합니다. credential 파일은 `0600`
 
 ## 대화형 agent 콘솔 (tmux)
 
-기본값은 **`auto`**입니다(host tmux 안이면 활성화, 아니면 headless). `true`/`false`로
-강제할 수 있습니다. 활성화되면 각 agent 실행이 컨테이너 안에서 tmux 세션으로 열리고,
-운영자는 host에서 실시간으로 관찰(및 대화 모드에서는 입력)할 수 있습니다.
+기본값은 **`true`**입니다. 일반 foreground 터미널에서 `./run.sh`를 실행하면
+checkout별 host tmux 세션을 자동으로 만들거나 다시 attach합니다. window 0은 daemon,
+window 1+는 agent TUI로 사용합니다. `AGENT_CONSOLE_AUTO_TMUX=false`면 자동 진입만
+끄고 수동 attach 방식을 유지하며, `AGENT_CONSOLE=false`는 console 자체를 끕니다.
 
-`./run.sh`를 host tmux 안에서 실행하면 새 이슈를 claim할 때마다
-`lao:<run_id>` 이름의 **새 tmux window**가 자동으로 열립니다(window 0 = daemon,
-window 1+ = agent run). 실행이 끝나면 해당 window도 종료되고, daemon은 window 0에서
-계속 polling합니다.
+새 이슈를 claim할 때마다 `lao:<run_id>` 이름의 **새 tmux window**가 자동으로
+열립니다. 실행이 끝나면 해당 window도 종료되고 daemon은 window 0에서 계속
+polling합니다. 이미 host tmux 안이라면 새 outer session을 만들지 않고 현재 session을
+그대로 사용합니다.
 
 ```bash
-# 자동 업데이트 후 daemon과 run별 console window 실행
+# 자동 업데이트 후 host tmux + daemon + run별 TUI window 실행
 ./run.sh
+
+# daemon은 유지하고 현재 화면에서 빠져나오기 / 다시 접속
+# Ctrl-b d
+tmux list-sessions
 
 # live/종료 run 조회 또는 수동 attach
 ./scripts/console-attach.sh --list
@@ -448,8 +452,10 @@ window 1+ = agent run). 실행이 끝나면 해당 window도 종료되고, daemo
 ./scripts/console-attach.sh --run <32-char-run-id> --write        # capability=true만 허용
 ```
 
-tmux 밖에서 `auto`는 기존 headless 실행으로 돌아갑니다. `AGENT_CONSOLE=true`로 강제하면
-pane 대신 `.runtime/logs/console/supervisor.log`에 수동 attach 명령을 남깁니다.
+`AGENT_CONSOLE=auto`로 바꾸면 기존처럼 이미 tmux 안일 때만 console을 활성화합니다.
+redirect/service처럼 stdin 또는 stdout이 TTY가 아닌 실행은 host tmux를 자동 생성하지
+않으며, console이 활성화된 경우 `.runtime/logs/console/supervisor.log`에 수동 attach
+명령을 남깁니다.
 `AGENT_CONSOLE_HOST_LOG_DIR`은 console log만 위한 명시적 override로 지원됩니다.
 기본 위치는 orchestrator checkout의 `.runtime/logs/console`이며,
 `LAO_RUNTIME_DIR`은 사용자 override가 아닌 내부 경로 변환용 변수입니다.

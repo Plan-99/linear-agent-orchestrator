@@ -10,6 +10,16 @@ from linear_agent_orchestrator.cli import linear_assignee_preflight_errors, main
 from linear_agent_orchestrator.config import AppConfig, LinearConfig, RunnerConfig
 
 
+def _request_sha256(title, body, target):
+    canonical = json.dumps(
+        {"body": body, "target": target, "title": title.strip()},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 class StubAssigneeClient:
     def __init__(
         self,
@@ -370,6 +380,7 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
     monkeypatch,
 ):
     secret = "dry-run-client-secret"
+    title = "Create a reusable Linear issue skill"
     body = (
         "## Task\n"
         "Implement the requested change without exposing this body.\n\n"
@@ -403,7 +414,7 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
             str(env_file),
             "create-issue",
             "--title",
-            "Create a reusable Linear issue skill",
+            f"  {title}  ",
             "--description-file",
             str(description_file),
             "--dry-run",
@@ -414,6 +425,15 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
     assert exit_code == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
+    request_target = {
+        "assignee_id": "human-user-id",
+        "assignee_source": "configured",
+        "auth_mode": "oauth_client_credentials",
+        "project_id": "project-id",
+        "project_name": "SphereVLA",
+        "queue_state_name": "Todo",
+        "team_id": "DEV",
+    }
     body_bytes = body.encode("utf-8")
     assert payload == {
         "body": {
@@ -421,13 +441,10 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
             "sha256": hashlib.sha256(body_bytes).hexdigest(),
         },
         "dry_run": True,
+        "request_sha256": _request_sha256(title, body, request_target),
         "target": {
-            "assignee_id": "human-user-id",
-            "project_id": "project-id",
-            "project_name": "SphereVLA",
-            "queue_state_name": "Todo",
-            "team_id": "DEV",
-            "title": "Create a reusable Linear issue skill",
+            **request_target,
+            "title": title,
         },
     }
     assert body not in captured.out
@@ -463,7 +480,7 @@ def test_create_issue_invalid_schema_fails_before_network(tmp_path, capsys, monk
         ]
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "Missing required section: Acceptance Criteria" in captured.err
@@ -477,6 +494,17 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
         "## Acceptance Criteria\n- The issue exists once.\n\n"
         "## Validation\n- Return its identifier and URL.\n"
     )
+    title = "Reusable issue creation"
+    request_target = {
+        "assignee_id": "human-user-id",
+        "assignee_source": "configured",
+        "auth_mode": "oauth_client_credentials",
+        "project_id": "project-id",
+        "project_name": None,
+        "queue_state_name": "Todo",
+        "team_id": "DEV",
+    }
+    expected_request_sha256 = _request_sha256(title, body, request_target)
     description_file = tmp_path / "issue.md"
     description_file.write_text(body, encoding="utf-8")
     env_file = tmp_path / ".env"
@@ -513,9 +541,11 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
             str(env_file),
             "create-issue",
             "--title",
-            "Reusable issue creation",
+            f"  {title}  ",
             "--description-file",
             str(description_file),
+            "--expected-request-sha256",
+            expected_request_sha256.upper(),
             "--json",
         ]
     )
@@ -529,11 +559,11 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
         "create_issue",
     ]
     assert sum(call[0] == "create_issue" for call in client.calls) == 1
-    assert client.calls[-1][1:] == ("Reusable issue creation", body)
+    assert client.calls[-1][1:] == (title, body)
     assert json.loads(capsys.readouterr().out) == {
         "identifier": "DEV-456",
         "issue_id": "issue-id",
-        "title": "Reusable issue creation",
+        "title": title,
         "url": "https://linear.example/DEV-456",
     }
 
@@ -576,10 +606,252 @@ def test_create_issue_redacts_configured_secret_from_preflight_errors(tmp_path, 
         ]
     )
 
-    assert exit_code == 1
+    assert exit_code == 3
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
     assert "***REDACTED***" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("expected_request_sha256", "expected_error"),
+    [
+        ("not-a-sha256", "must be exactly 64 hexadecimal characters"),
+        ("0" * 64, "does not match the validated request"),
+    ],
+)
+def test_create_issue_expected_hash_failure_prevents_network(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    expected_request_sha256,
+    expected_error,
+):
+    secret = "hash-check-api-secret"
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(
+        "## Task\nCreate an issue after hash validation.\n\n"
+        "## Acceptance Criteria\n- No request is sent on mismatch.\n\n"
+        "## Validation\n- Observe the local exit code.\n",
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"LINEAR_API_KEY={secret}\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_network_boundary(*args, **kwargs):
+        raise AssertionError("hash failure must happen before client construction")
+
+    monkeypatch.setattr(cli, "_linear_client_factory", unexpected_network_boundary)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            "Hash-guarded request",
+            "--description-file",
+            str(description_file),
+            "--expected-request-sha256",
+            expected_request_sha256,
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert expected_error in captured.err
+    assert secret not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("credential_name", "secret", "location", "extra_env"),
+    [
+        (
+            "LINEAR_API_KEY",
+            "lin_api_title_content_secret",
+            "title",
+            "",
+        ),
+        (
+            "LINEAR_OAUTH_CLIENT_SECRET",
+            "oauth-body-content-secret",
+            "body",
+            "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+            "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+            "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        ),
+    ],
+)
+def test_create_issue_rejects_configured_credential_in_title_or_body_before_network(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    credential_name,
+    secret,
+    location,
+    extra_env,
+):
+    title = f"Create issue containing {secret}" if location == "title" else "Safe issue title"
+    task = f"Never publish {secret}." if location == "body" else "Create a safe issue."
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(
+        f"## Task\n{task}\n\n"
+        "## Acceptance Criteria\n- Credential content is rejected.\n\n"
+        "## Validation\n- No Linear client is constructed.\n",
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"{credential_name}={secret}\n"
+        f"{extra_env}"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_network_boundary(*args, **kwargs):
+        raise AssertionError("content credential rejection must happen before client construction")
+
+    monkeypatch.setattr(cli, "_linear_client_factory", unexpected_network_boundary)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            title,
+            "--description-file",
+            str(description_file),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Issue title or body contains a configured Linear credential" in captured.err
+    assert secret not in captured.err
+
+
+def test_create_issue_api_key_dry_run_identifies_viewer_assignee_source(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    secret = "viewer-source-api-secret"
+    title = "API viewer assignment"
+    body = (
+        "## Task\nCreate an issue assigned to the API key viewer.\n\n"
+        "## Acceptance Criteria\n- The dry-run reports the assignment source.\n\n"
+        "## Validation\n- Inspect the target metadata.\n"
+    )
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"LINEAR_API_KEY={secret}\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_NAME=SphereVLA\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_network_boundary(*args, **kwargs):
+        raise AssertionError("dry-run must not resolve the API key viewer")
+
+    monkeypatch.setattr(cli, "_linear_client_factory", unexpected_network_boundary)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            title,
+            "--description-file",
+            str(description_file),
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    request_target = {
+        "assignee_id": None,
+        "assignee_source": "api_key_viewer",
+        "auth_mode": "api_key",
+        "project_id": None,
+        "project_name": "SphereVLA",
+        "queue_state_name": "Todo",
+        "team_id": "DEV",
+    }
+    assert payload["target"] == {**request_target, "title": title}
+    assert payload["request_sha256"] == _request_sha256(title, body, request_target)
+    assert secret not in captured.out + captured.err
+
+
+def test_create_issue_mutation_exception_is_uncertain_without_secret_leak(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    secret = "mutation-exception-oauth-secret"
+    body = (
+        "## Task\nCreate an issue once.\n\n"
+        "## Acceptance Criteria\n- An uncertain transport outcome is not retried.\n\n"
+        "## Validation\n- Return exit code 4.\n"
+    )
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        f"LINEAR_OAUTH_CLIENT_SECRET={secret}\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+
+    class UncertainCreateClient(StubAssigneeClient):
+        def __init__(self):
+            super().__init__(assignee_id="human-user-id", project_id="project-id")
+
+        def create_issue(self, config, *, title, description):
+            self.calls.append(("create_issue", title, description))
+            raise RuntimeError(f"ambiguous transport failure involving {secret}")
+
+    client = UncertainCreateClient()
+    monkeypatch.setattr(cli, "_linear_client_factory", lambda config: lambda: client)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            "Uncertain mutation",
+            "--description-file",
+            str(description_file),
+        ]
+    )
+
+    assert exit_code == 4
+    assert sum(call[0] == "create_issue" for call in client.calls) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "mutation outcome is uncertain" in captured.err
+    assert secret not in captured.err
 
 
 def test_process_once_rejects_oauth_without_explicit_assignee_before_network(

@@ -18,6 +18,32 @@ console_mode() {
   if [[ -n "$tmux" || -n "$pane" ]]; then printf 'on\n'; else printf 'off\n'; fi
 }
 
+# console_auto_tmux_mode <console_mode> <auto_tmux_flag> <tmux> <tmux_pane>
+#                        <stdin_is_tty> <stdout_is_tty> -> "on" | "off"
+#
+# A foreground operator who explicitly enabled the console should not have to
+# know that the host-side window supervisor needs an outer tmux session. The
+# launcher may create/attach that session only when both standard streams are
+# terminals and it is not already running under tmux. Non-interactive service,
+# cron, test, and redirected invocations retain the manual-attach/headless path.
+console_auto_tmux_mode() {
+  local console="${1:-off}" flag="${2:-true}" tmux="${3:-}" pane="${4:-}"
+  local stdin_tty="${5:-false}" stdout_tty="${6:-false}"
+  local lc="${flag,,}"
+
+  [[ "$console" == "on" ]] || { printf 'off\n'; return; }
+  case "$lc" in
+    false|0|off|no|disabled) printf 'off\n'; return ;;
+    true|1|on|yes|enabled|auto|'') : ;;
+    *) printf 'off\n'; return ;;
+  esac
+  if [[ -z "$tmux" && -z "$pane" && "$stdin_tty" == "true" && "$stdout_tty" == "true" ]]; then
+    printf 'on\n'
+  else
+    printf 'off\n'
+  fi
+}
+
 # read_env_value <key> <dotenv_file> -> value (stdout), or non-zero if absent.
 # Safely reads a single KEY=VALUE from a .env file WITHOUT sourcing it (never
 # executes the file). Last assignment wins; surrounding quotes are stripped.

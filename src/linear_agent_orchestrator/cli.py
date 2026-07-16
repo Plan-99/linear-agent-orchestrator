@@ -7,6 +7,7 @@ from collections.abc import Callable
 import hashlib
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 import sys
@@ -32,6 +33,10 @@ STATE_DB_PATH_REQUIRED = (
     "or run via ./scripts/compose.sh"
 )
 STATEFUL_COMMANDS = frozenset({"daemon", "state-init", "process-once"})
+CREATE_ISSUE_LOCAL_ERROR = 2
+CREATE_ISSUE_PREFLIGHT_ERROR = 3
+CREATE_ISSUE_MUTATION_UNCERTAIN = 4
+_SHA256_HEX_RE = re.compile(r"[0-9a-fA-F]{64}")
 LINEAR_ACCESS_PREFLIGHT_QUERY = """
 query LinearAccessPreflight($teamId: String!, $projectId: ID!, $assigneeId: String!) {
   viewer { id }
@@ -142,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate without contacting Linear; print only target metadata and a body digest",
     )
+    create_issue.add_argument(
+        "--expected-request-sha256",
+        help="Require this validated request digest before contacting Linear",
+    )
 
     create_test_issue = subparsers.add_parser(
         "create-test-issue",
@@ -200,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             description_file=args.description_file,
             as_json=args.json,
             dry_run=args.dry_run,
+            expected_request_sha256=args.expected_request_sha256,
         )
     if args.command == "create-test-issue":
         return _create_test_issue(config, title=args.title, as_json=args.json)
@@ -397,6 +407,7 @@ def _create_issue(
     description_file: Path,
     as_json: bool,
     dry_run: bool,
+    expected_request_sha256: str | None,
 ) -> int:
     """Validate and create one issue without retrying the mutation."""
 
@@ -405,14 +416,22 @@ def _create_issue(
     except (OSError, UnicodeError) as exc:
         LOGGER.error(
             "create_issue_description_error",
-            extra={"error": f"{type(exc).__name__}: {exc}"},
+            extra={
+                "error": _redact_linear_secrets(
+                    f"{type(exc).__name__}: {exc}",
+                    config.linear,
+                )
+            },
         )
-        return 1
+        return CREATE_ISSUE_LOCAL_ERROR
 
+    issue_title = title.strip()
     schema = validate_issue_body(body)
     errors = list(schema.diagnostics)
-    if not title.strip():
+    if not issue_title:
         errors.append("--title must not be blank")
+    if _issue_content_contains_linear_secret(title, body, config.linear):
+        errors.append("Issue title or body contains a configured Linear credential")
     errors.extend(config.linear.validation_errors(require_secrets=True))
     if errors:
         for error in errors:
@@ -420,20 +439,45 @@ def _create_issue(
                 "create_issue_validation_error",
                 extra={"error": _redact_linear_secrets(error, config.linear)},
             )
-        return 1
+        return CREATE_ISSUE_LOCAL_ERROR
+
+    target = _create_issue_target(config.linear)
+    request_sha256 = _create_issue_request_sha256(
+        title=issue_title,
+        body=body,
+        target=target,
+    )
+    if expected_request_sha256 is not None:
+        if _SHA256_HEX_RE.fullmatch(expected_request_sha256) is None:
+            LOGGER.error(
+                "create_issue_validation_error",
+                extra={
+                    "error": (
+                        "--expected-request-sha256 must be exactly "
+                        "64 hexadecimal characters"
+                    )
+                },
+            )
+            return CREATE_ISSUE_LOCAL_ERROR
+        if expected_request_sha256.casefold() != request_sha256:
+            LOGGER.error(
+                "create_issue_validation_error",
+                extra={
+                    "error": (
+                        "--expected-request-sha256 does not match "
+                        "the validated request"
+                    )
+                },
+            )
+            return CREATE_ISSUE_LOCAL_ERROR
 
     body_bytes = body.encode("utf-8")
     if dry_run:
+        dry_run_target = {**target, "title": issue_title}
         payload = {
             "dry_run": True,
-            "target": {
-                "assignee_id": config.linear.assignee_id,
-                "project_id": config.linear.project_id,
-                "project_name": config.linear.project_name,
-                "queue_state_name": config.linear.queue_state_name,
-                "team_id": config.linear.team_id,
-                "title": title,
-            },
+            "request_sha256": request_sha256,
+            "target": dry_run_target,
             "body": {
                 "length_bytes": len(body_bytes),
                 "sha256": hashlib.sha256(body_bytes).hexdigest(),
@@ -447,14 +491,28 @@ def _create_issue(
             print("create issue dry-run: valid")
             print(
                 "target "
-                f"team={target['team_id']} project_id={target['project_id']} "
-                f"project_name={target['project_name']} state={target['queue_state_name']} "
-                f"assignee={target['assignee_id']} title={target['title']}"
+                f"auth_mode={config.linear.auth_mode} team={config.linear.team_id} "
+                f"project_id={config.linear.project_id} project_name={config.linear.project_name} "
+                f"state={config.linear.queue_state_name} assignee={config.linear.assignee_id} "
+                f"assignee_source={target['assignee_source']} title={issue_title}"
             )
             print(f"body sha256={digest['sha256']} length_bytes={digest['length_bytes']}")
+            print(f"request sha256={request_sha256}")
         return 0
 
-    client = _linear_client_factory(config.linear)()
+    try:
+        client = _linear_client_factory(config.linear)()
+    except Exception as exc:  # noqa: BLE001 - client setup is part of fail-closed preflight
+        LOGGER.error(
+            "create_issue_preflight_error",
+            extra={
+                "error": _redact_linear_secrets(
+                    f"Linear client setup failed: {type(exc).__name__}: {exc}",
+                    config.linear,
+                )
+            },
+        )
+        return CREATE_ISSUE_PREFLIGHT_ERROR
     preflight_errors = linear_assignee_preflight_errors(config, client=client)
     if preflight_errors:
         for error in preflight_errors:
@@ -462,19 +520,66 @@ def _create_issue(
                 "create_issue_preflight_error",
                 extra={"error": _redact_linear_secrets(error, config.linear)},
             )
-        return 1
+        return CREATE_ISSUE_PREFLIGHT_ERROR
 
     try:
-        issue = client.create_issue(config.linear, title=title, description=body)
+        issue = client.create_issue(config.linear, title=issue_title, description=body)
     except Exception as exc:  # noqa: BLE001 - CLI fails closed and must not retry a mutation
-        error = f"{type(exc).__name__}: {exc}"
         LOGGER.error(
             "create_issue_failed",
-            extra={"error": _redact_linear_secrets(error, config.linear)},
+            extra={
+                "error": (
+                    f"{type(exc).__name__}: Linear issue mutation outcome is uncertain"
+                )
+            },
         )
-        return 1
+        return CREATE_ISSUE_MUTATION_UNCERTAIN
     _print_created_issue(issue, as_json=as_json)
     return 0
+
+
+def _create_issue_target(config: LinearConfig) -> dict[str, str | None]:
+    assignee_source = "configured" if config.assignee_id else "api_key_viewer"
+    return {
+        "assignee_id": config.assignee_id,
+        "assignee_source": assignee_source,
+        "auth_mode": config.auth_mode,
+        "project_id": config.project_id,
+        "project_name": config.project_name,
+        "queue_state_name": config.queue_state_name,
+        "team_id": config.team_id,
+    }
+
+
+def _create_issue_request_sha256(
+    *,
+    title: str,
+    body: str,
+    target: dict[str, str | None],
+) -> str:
+    canonical_request = json.dumps(
+        {
+            "body": body,
+            "target": target,
+            "title": title,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_request).hexdigest()
+
+
+def _issue_content_contains_linear_secret(
+    title: str,
+    body: str,
+    config: LinearConfig,
+) -> bool:
+    return any(
+        secret in title or secret in body
+        for secret in (config.api_key, config.oauth_client_secret)
+        if secret
+    )
 
 
 def _redact_linear_secrets(message: str, config: LinearConfig) -> str:
