@@ -5,8 +5,9 @@
 # backend run in a private tmux session on a container-private socket and emits
 # a lifecycle JSONL under the bind-mounted console log root. This script lets an
 # operator (or the console supervisor) attach a host terminal to that session by
-# reaching *into* the container with the host's own docker CLI. The container
-# never sees the host tmux or docker socket (trust direction preserved).
+# reaching *into* the container with the host's own docker CLI. The host tmux
+# socket is never shared. Docker access, when LAO_DOCKER_HOST=true, is a
+# separate full-host trust mode and not part of this console feature.
 #
 # Two capabilities, deliberately distinct:
 #   * live view (read-only, default)  — always available; "live backend output

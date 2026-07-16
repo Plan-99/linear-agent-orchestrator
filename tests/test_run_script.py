@@ -177,6 +177,7 @@ def make_launcher_repo(tmp_path: Path, env_text: str = "AGENT_BACKEND=omx\n") ->
         "LAO_INSTANCE_ID",
         "LAO_VERIFIED_IMAGE",
         "LAO_PREVIOUS_IMAGE",
+        "LAO_DOCKER_HOST",
         "COMPOSE_PROJECT_NAME",
         "LAO_RUN_LOCK_HELD",
         "LAO_RUN_REEXECED",
@@ -289,6 +290,19 @@ def test_launcher_rejects_executable_backend_value_without_running_it(tmp_path: 
     calls = read_calls(call_log)
     assert not any(line.startswith("updater|") for line in calls)
     assert not any(line.startswith("daemon|") for line in calls)
+
+
+def test_launcher_rejects_invalid_docker_host_mode_before_update(tmp_path: Path):
+    repo, env, call_log = make_launcher_repo(
+        tmp_path,
+        "AGENT_BACKEND=codex\nLAO_DOCKER_HOST=sometimes\n",
+    )
+
+    result = run_launcher(repo, env)
+
+    assert result.returncode == 20
+    assert not any(line.startswith(("updater|", "daemon|")) for line in read_calls(call_log))
+    assert "invalid LAO_DOCKER_HOST" in result.stderr
 
 
 def test_refresh_and_daemon_arguments_are_forwarded(tmp_path: Path):
@@ -607,6 +621,14 @@ def make_updater_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
           esac
           exit 0
         fi
+        if [[ "${1:-}" == run && "$*" == *'--entrypoint docker '* ]]; then
+          if [[ "${FAKE_IMAGE_DOCKER_STATUS:-0}" != 0 ]]; then
+            exit "$FAKE_IMAGE_DOCKER_STATUS"
+          fi
+          printf '%s\n' 'Docker tooling available'
+          exit 0
+        fi
+
         if [[ "${1:-}" == run && "$*" == *'--entrypoint codex '* ]]; then
           [[ "$*" == *' --version' ]] && { printf 'codex %s\n' "${CLI_CODEX:-1.0.0}"; exit 0; }
           if [[ "${5:-}" == "$verified" && "${FAKE_VERIFIED_HELP_STATUS:-0}" != 0 ]]; then
@@ -643,6 +665,8 @@ def make_updater_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         "LAO_PREVIOUS_IMAGE",
         "COMPOSE_PROJECT_NAME",
         "FAKE_GIT_MODE",
+        "LAO_DOCKER_HOST",
+        "FAKE_IMAGE_DOCKER_STATUS",
         "FAKE_DIRTY_DURING_VALIDATION",
         "FAKE_VERIFIED_HELP_STATUS",
     ):
@@ -788,6 +812,29 @@ def test_fallback_only_rejects_verified_image_with_incompatible_backend_help(tmp
         line.startswith("compose|") and "|orchestrator|startup-check" in line
         for line in calls
     )
+    assert "incompatible with the configured backend" in result.stderr
+
+
+def test_fallback_only_rejects_image_without_docker_tooling_in_trust_mode(tmp_path: Path):
+    repo, env, call_log = make_updater_repo(tmp_path)
+    write_verified_state(env)
+    env.update(
+        {
+            "LAO_DOCKER_HOST": "true",
+            "FAKE_IMAGE_DOCKER_STATUS": "127",
+        }
+    )
+
+    result = run_updater(repo, env, "codex", fallback_only=True)
+
+    assert result.returncode == 21, result.stderr
+    calls = read_calls(call_log)
+    assert any(
+        line.startswith("docker|run|")
+        and f"|--entrypoint|docker|{TEST_VERIFIED_IMAGE}|--version" in line
+        for line in calls
+    )
+    assert not any(line.startswith("compose|") for line in calls)
     assert "incompatible with the configured backend" in result.stderr
 
 

@@ -2,10 +2,13 @@
 
 # Exact, pinned top-level defaults for direct and first-time builds. The update
 # launcher may override these with equally exact, validated versions.
+ARG DOCKER_CLI_VERSION=29.6.1
 ARG CODEX_VERSION=0.144.1
 ARG OMX_VERSION=0.20.0
 ARG CLAUDE_CODE_VERSION=2.1.195
 ARG LAO_SOURCE_REVISION=unknown
+
+FROM docker:${DOCKER_CLI_VERSION}-cli AS docker-cli
 
 FROM node:22-slim AS agent-cli
 
@@ -51,11 +54,14 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
+# Candidate tests run from the built image with no source bind mount, so every
+# repository-root fixture they inspect must be present in /app.
+COPY pyproject.toml README.md Dockerfile run.sh compose.yaml compose.docker-host.yaml .env.example ./
 COPY src ./src
 COPY tests ./tests
 COPY docs ./docs
 COPY scripts ./scripts
+COPY skills ./skills
 RUN pip install --upgrade pip \
     && pip install -e '.[test]'
 
@@ -63,12 +69,17 @@ RUN pip install --upgrade pip \
 COPY --from=agent-cli /usr/local/bin/node /usr/local/bin/node
 COPY --from=agent-cli /usr/local/lib/node_modules /usr/local/lib/node_modules
 
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+
 RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex \
     && ln -s /usr/local/lib/node_modules/oh-my-codex/dist/cli/omx.js /usr/local/bin/omx \
     && ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude \
     && install -m 0755 scripts/agent-runner.sh /usr/local/bin/lao-agent-runner \
     && install -m 0755 scripts/lao-pty-host.sh /usr/local/bin/lao-pty-host \
-    && install -m 0755 scripts/lao-pty-entry.sh /usr/local/bin/lao-pty-entry
+    && install -m 0755 scripts/lao-pty-entry.sh /usr/local/bin/lao-pty-entry \
+    && docker --version \
+    && docker compose version
 
 # Match the host user so bind-mounted files are never written as root. Keep
 # these build args close to their first use so host-ID changes do not invalidate

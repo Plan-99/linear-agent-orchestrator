@@ -25,6 +25,9 @@ services:
       - path: .env
         required: false
     environment:
+      # Fail closed: .env cannot enable a remote daemon; the opt-in override
+      # replaces this only after scripts/compose.sh validates host Docker access.
+      DOCKER_HOST: ""
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
@@ -93,7 +96,8 @@ services:
       # Dedicated persistent agent home with credential copies; never the live
       # host CLI homes. Seeded by scripts/bootstrap.sh.
       - ${LAO_RUNTIME_DIR:-./.runtime}/agent-home:/home/agent
-      # Exactly one fixed, trusted repository per daemon. No Docker socket.
+      # Exactly one fixed, trusted repository per daemon. The base file has no
+      # Docker socket; compose.docker-host.yaml is the explicit trust override.
       - ${LAO_PROJECT_DIR:-.}:/workspace/project
     command: ["startup-check", "--allow-missing-secrets"]
 

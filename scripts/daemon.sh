@@ -21,8 +21,9 @@ _container_exists() { docker inspect "$1" >/dev/null 2>&1; }
 # hosts sessions when a host supervisor is actually watching. When on we also
 # (1) pin a collision-safe deterministic container name so the host console
 # scripts can `docker exec` into the daemon, and (2) start
-# scripts/console-supervisor.sh beside this pane. The container never sees the
-# host tmux/docker socket; the host reaches in with its own docker CLI.
+# scripts/console-supervisor.sh beside this pane. The host tmux socket always
+# stays outside the container. The Docker socket is absent by default and is
+# unrelated to TUI; LAO_DOCKER_HOST=true may add it as a separate trust mode.
 if [[ -n "${AGENT_CONSOLE+x}" ]]; then
   agent_console="$AGENT_CONSOLE"
 else

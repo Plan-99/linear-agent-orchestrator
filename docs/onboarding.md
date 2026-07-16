@@ -83,12 +83,27 @@ LINEAR_ASSIGNEE_ID=<human-user-id>
 # 에이전트가 실제로 수정할 신뢰된 Git checkout의 절대 host 경로
 LAO_PROJECT_DIR=/absolute/path/to/target-repo
 
+# 신뢰된 이슈가 대상 Docker container를 직접 개발해야 할 때만 true
+# (host root와 동등한 권한)
+LAO_DOCKER_HOST=false
+
 AGENT_BACKEND=omx                 # omx | codex | claude
 AGENT_MODEL=gpt-5.6-sol
 AGENT_EFFORT=high
 ```
 
 전체 항목과 기본값은 [.env.example](../.env.example)을 참고하세요.
+`LAO_DOCKER_HOST=true`이면 agent가 host Docker daemon으로 sibling project
+container를 build/run할 수 있습니다. launcher는 base repo와 isolated worktree를
+host-identical path로 제공하므로 상대 Compose bind mount도 동작합니다. 이 모드는
+LAO credential과 host 전체에 접근 가능한 full-host trust mode이므로 신뢰된
+이슈에서만 사용하세요. GUI는 sibling container가 `DISPLAY`/`XAUTHORITY`와
+이 모드에서 worktree에 쓰는 sibling container는 host numeric UID:GID로 실행하고, 종료 전에
+반드시 정리하세요. root-owned 파일이나 남은 bind mount는 LAO의 commit/worktree cleanup을
+막을 수 있습니다.
+`/tmp/.X11-unix`를 받아 host 창을 여는 구조입니다. 설정 예시는
+[README의 대상 Docker 컨테이너 개발과 GUI](../README.md#대상-docker-컨테이너-개발과-gui)를
+참고하세요.
 
 `LINEAR_AUTH_MODE`를 생략하면 기존 호환을 위해 `api_key`로 동작합니다. 한 daemon에는
 credential set을 정확히 하나만 설정하세요. OAuth client ID/secret과

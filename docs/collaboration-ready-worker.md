@@ -25,9 +25,11 @@ The worker must:
 - move an issue to Done only after backend-neutral semantic completion is
   proven by structured validation evidence.
 
-The worker must not add webhooks, Linear native agent sessions, Docker socket
-access, issue-controlled host paths, automatic pushes, pull-request creation or
-merge, issue deletion, or any automatic terminal transition other than Done.
+The worker must not add webhooks, Linear native agent sessions, automatic
+pushes, pull-request creation or merge, issue deletion, or any automatic
+terminal transition other than Done. In default mode it must not add
+issue-controlled host paths. Docker socket access is allowed only through the
+explicit `LAO_DOCKER_HOST=true` full-host trust mode described below.
 
 ## Isolation and trust boundary
 
@@ -37,7 +39,7 @@ inside that boundary. This is safe only when the container configuration keeps
 the boundary narrow:
 
 - mount one explicitly configured repository at `/workspace/project`;
-- never mount `/var/run/docker.sock`;
+- keep `/var/run/docker.sock` unmounted in the default mode;
 - run as the invoking Linux user's UID/GID rather than root;
 - drop Linux capabilities and enable `no-new-privileges`;
 - use dedicated, persistent agent credential homes instead of read-write mounts
@@ -47,10 +49,22 @@ the boundary narrow:
   logs under `.runtime` — as host-owned, non-issue-controlled paths, and keep
   the tmux control socket container-private so the console never widens the
   host/container boundary (see [agent-console.md](agent-console.md)); and
-- never derive a bind-mount source or other host path from issue content.
+- in default mode, never derive a bind-mount source or other host path from
+  issue content.
 
 Permission bypass is a container-scoped operating mode, not a safe default for
 running these backends directly on the host.
+
+`LAO_DOCKER_HOST=true` deliberately replaces that narrow Docker boundary with a
+trusted host-development capability. It mounts the host Docker socket, mirrors
+the configured repository and orchestrator worktree root at host-identical
+absolute paths, and gives the agent root-equivalent control through the Docker
+API. This mode can expose Linear credentials, other containers, and arbitrary
+host files. It is therefore suitable only for trusted issues and repositories;
+it is not an isolation mechanism. The launcher's own LAO mounts remain
+explicitly configured, but the agent can ask the host daemon to bind arbitrary
+host paths into sibling containers, including paths derived from issue content.
+Treat issue content as trusted code in this mode.
 
 The optional agent console defaults to `auto` (enabled inside a host tmux,
 headless otherwise) and, when enabled, gives read-only live observation for every
@@ -176,8 +190,9 @@ Issue-level worktrees, concurrent issue execution (`MAX_PARALLEL_RUNS`), and
 live observation of backend output through the agent console have since been
 implemented and are no longer deferred.
 
-These deferrals do not weaken the invariants above. In particular, Docker socket
-mounts and automatic push/PR/merge behavior remain out of scope.
+These deferrals do not weaken the default-mode invariants above. Automatic
+push/PR/merge behavior remains out of scope; Docker socket access is confined
+to the explicit full-host trust mode.
 
 ## Verification checklist
 
@@ -188,7 +203,9 @@ Complete all checks without performing a destructive live Linear mutation:
 2. Run Python compilation/type checking and shell syntax checks.
 3. Inspect the resolved Compose model without publishing expanded secrets and
    prove non-root UID/GID, capability drop, `no-new-privileges`, one repository
-   mount, dedicated credential sources, bypass defaults, and no Docker socket.
+   mount, dedicated credential sources, and bypass defaults. Prove no Docker
+   socket in default mode; when trust mode is enabled, prove the explicit
+   override, socket GID, and host-identical repository/worktree mounts.
 4. Smoke-test the built container for baseline tools, backend versions,
    non-interactive authentication, repository ownership, and repository writes.
 5. Use a fake backend for end-to-end cases proving that only a completed result

@@ -25,12 +25,15 @@ sandbox를 우회할 수 있지만, 컨테이너에는 다음 제한이 적용�
 - host 사용자 UID/GID로 non-root 실행
 - Linux capability 전체 제거 및 `no-new-privileges`
 - 정확히 하나의 대상 저장소만 read-write mount
-- Docker socket 미마운트
+- 기본 모드에서는 Docker socket 미마운트
 - host의 live Codex/Claude home 대신 `.runtime/agent-home`의 전용 credential copy 사용
 
 agent는 orchestrator와 같은 컨테이너에서 실행되므로 이 컨테이너 안에서 신뢰할 수 없는
 명령을 실행해서는 안 됩니다. 현재 네트워크 egress 제한과 agent process의 별도 격리는
 구현 범위 밖입니다.
+`LAO_DOCKER_HOST=true`는 이 경계를 의도적으로 해제하는 full-host 신뢰 모드입니다.
+이 모드의 agent는 Docker API를 통해 host root와 동등한 권한을 가지므로, 신뢰된
+이슈와 저장소에서만 사용해야 합니다.
 
 ## 빠른 시작
 
@@ -105,6 +108,67 @@ worktree에서 작업하고, 의미적으로 성공한 run만 로컬 `lao/<issue
 리뷰해 머지하거나 버리면 됩니다. 실패한 run의 변경은 `.runtime/work/worktrees/`에
 조사용으로 남습니다. `false`로 끄면 기존 고정-디렉토리 모드로 돌아가며, 이때는
 run 전 clean worktree가 강제되고 남은 변경이 다음 실행을 fail-closed로 차단합니다.
+
+### 대상 Docker 컨테이너 개발과 GUI
+
+LAO 컨테이너에 프로젝트별 simulator·CUDA·MuJoCo 의존성을 넣는 대신, agent가 host
+Docker daemon을 사용해 대상 프로젝트의 sibling 컨테이너를 직접 build/run하도록 할 수
+있습니다.
+
+```dotenv
+LAO_DOCKER_HOST=true
+# 기본값을 바꿔야 할 때만 지정합니다.
+# LAO_DOCKER_SOCKET=/var/run/docker.sock
+```
+
+활성화하면 launcher가 socket의 실제 numeric GID를 container 보조 그룹에 추가하고,
+이미지에 포함된 Docker CLI·Compose·Buildx를 사용합니다. 또한 대상 저장소와 LAO
+worktree를 host와 container에서 같은 절대경로로 mount합니다. 따라서 격리 worktree
+안에서 실행한 `docker compose up`의 상대 bind source(`.`)도 host daemon에서
+올바르게 해석됩니다.
+
+이 옵션은 sandbox 기능이 아닙니다. agent는 Docker API로 다음을 수행할 수 있습니다.
+
+- host 전체 경로를 새 container에 mount하여 읽고 쓰기
+- LAO를 포함한 다른 container 조회·중지
+- container 환경에서 Linear/agent credential 확인
+- privileged container 실행
+
+즉 신뢰되지 않은 이슈에는 사용하면 안 됩니다. run이 끝나기 전에 agent는 자신이 만든
+sibling container를 `docker compose down` 또는 `docker rm -f`로 정리해야 합니다.
+실행 중인 child가 worktree를 bind한 채 남으면 LAO의 worktree 정리와 충돌할 수 있습니다.
+
+worktree에 파일을 쓰는 child는 root가 아니라 현재 numeric UID:GID로 실행하세요. one-off는
+`docker compose run --user "$(id -u):$(id -g)" ...`를 사용하고, 장기 service는 같은 값을
+service의 `user`에 설정해야 합니다. child 안에서 `git` 또는 `setuptools_scm`도 사용한다면
+worktree의 `.git` 파일이 가리키는 `${LAO_HOST_PROJECT_DIR}/.git`을 동일한 절대경로로
+추가 mount해야 합니다. 소스 Git 작업 자체는 LAO container에서 수행하는 것이 기본입니다.
+
+GUI는 LAO TUI 안에 그리는 것이 아니라 **대상 프로젝트 container가 host X11에 창을
+여는 방식**입니다. 대상 Compose service에는 예를 들어 다음 연결이 필요합니다.
+
+```yaml
+services:
+  simulator:
+    environment:
+      DISPLAY: ${DISPLAY}
+      XAUTHORITY: ${XAUTHORITY}
+      MUJOCO_GL: glfw
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - "${XAUTHORITY:?set absolute XAUTHORITY}:${XAUTHORITY:?set absolute XAUTHORITY}:ro"
+```
+
+graphical login terminal에서 `./run.sh`를 시작하면 `DISPLAY`와 `XAUTHORITY` host 경로가
+agent에 전달됩니다. `XAUTHORITY`가 비어 있고 읽을 수 있는 `~/.Xauthority`가 있으면
+launcher가 그 경로를 자동 선택합니다. 둘 다 없으면 실행 전에 올바른 절대 host 파일로
+`XAUTHORITY`를 설정해야 하며, 위 Compose 예시는 누락을 명확한 오류로 중단합니다.
+project image에는 GLFW/OpenGL/X11 runtime이 있어야 합니다. `MUJOCO_GL=egl`은
+offscreen/headless backend이므로 실제 창을 보려면 `glfw`를 사용하세요.
+
+TUI의 agent는 창을 실행하고 로그를 읽을 수 있지만 사람처럼 창의 픽셀을 직접 보는 것은
+아닙니다. 사용자는 host에서 실시간 창을 보고 TUI로 피드백할 수 있고, agent가 스스로
+검증하려면 screenshot artifact나 automated image/state assertion도 함께 남겨야 합니다.
 
 OAuth app credential을 여러 운영자가 사용하더라도 각 daemon은
 `LINEAR_ASSIGNEE_ID`로 실제 사람 담당자를 명시해야 합니다. 미할당 이슈와 다른 사람에게
@@ -479,7 +543,9 @@ redirect/service처럼 stdin 또는 stdout이 TTY가 아닌 실행은 host tmux�
   (기본 `/workspace/logs/console`)에 기록되며, Compose가 이를 `.runtime/logs/console`
   에 bind-mount하여 host 소유로 durable하게 남깁니다.
 - tmux 제어 socket은 컨테이너-private이며 bind-mount되지 않습니다. host는 자신의
-  `docker exec`로만 접근합니다(컨테이너는 host tmux/Docker socket을 보지 않음).
+  `docker exec`로만 접근합니다. host tmux socket은 항상 container 밖에 있습니다.
+  Docker socket은 기본 모드에서는 없으며, 별도 `LAO_DOCKER_HOST=true` 신뢰 모드에서만
+  제공됩니다.
 
 이벤트 스키마 계약과 host/container tmux 보안 리뷰는
 [docs/agent-console.md](docs/agent-console.md)를 참고하세요.
@@ -524,15 +590,17 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
   (`MAX_PARALLEL_RUNS`로 동일 저장소 내 병렬 처리 가능).
 - 동일 assignee를 사용하는 여러 machine 사이의 distributed claim은 없습니다.
 - 자동 push/PR/merge/이슈 삭제는 없습니다.
-- Docker socket과 issue-controlled bind mount는 지원하지 않습니다.
+- 기본 모드에서는 issue 내용으로 host bind source를 정할 수 없습니다. 명시적
+  `LAO_DOCKER_HOST=true`에서는 agent가 임의 host path를 새 container에 bind할 수 있으므로
+  issue 내용 자체도 full-host 권한을 가진 trusted input으로 취급해야 합니다.
 - credential copy는 `run.sh` 시작의 bootstrap 단계에서만 갱신됩니다(host 원본이 더
   최신이면 자동 재복사, `./run.sh --refresh-credentials`로 강제 재복사). 장기 실행 중 divergence는 여전히
   가능합니다("3. agent 인증 준비" 참고).
 - SQLite를 삭제하면 복구/idempotency 기록도 사라지므로 의도적인 reset 외에는 삭제하지
   마세요.
 - 호스트에서 대상 repo에 `git worktree prune`을 실행하지 마세요. run worktree의
-  컨테이너 경로(`/workspace/...`)가 호스트에서 해석되지 않아 살아있는 run의 등록까지
-  파괴될 수 있습니다. worktree 정리는 orchestrator가 컨테이너 안에서 수행합니다.
+  등록을 살아있는 run 중에 제거할 수 있습니다. 기본 모드에서는 container 전용 경로라
+  host에서 정확히 판단할 수도 없습니다. worktree 정리는 orchestrator가 수행합니다.
 
 ## 주요 모듈
 

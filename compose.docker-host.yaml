@@ -1,0 +1,38 @@
+# Opt-in Docker-outside-of-Docker bridge. scripts/compose.sh merges this file
+# only when LAO_DOCKER_HOST=true and validates the host socket first.
+#
+# Docker API access is equivalent to root-level control of the host. Enable it
+# only for trusted Linear issues and trusted target repositories.
+services:
+  orchestrator:
+    group_add:
+      - "${LAO_DOCKER_GID}"
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # Docker Compose resolves bind sources on the host daemon. These
+      # host-identical paths keep the base repository and isolated worktrees
+      # usable from sibling development containers.
+      AGENT_PROJECT_DIR: ${LAO_PROJECT_DIR}
+      RUNNER_WORK_DIR: ${LAO_RUNTIME_DIR}/work
+      RUNNER_ARTIFACTS_DIR: ${LAO_RUNTIME_DIR}/artifacts
+      LAO_HOST_PROJECT_DIR: ${LAO_PROJECT_DIR}
+      LAO_HOST_RUNTIME_DIR: ${LAO_RUNTIME_DIR}
+      # Passed as path metadata for sibling GUI containers. The LAO container
+      # itself does not mount the X11 socket or Xauthority file.
+      DISPLAY: ${DISPLAY:-}
+      XAUTHORITY: ${XAUTHORITY:-}
+      LAO_HOST_X11_SOCKET_DIR: /tmp/.X11-unix
+    volumes:
+      - type: bind
+        source: ${LAO_DOCKER_SOCKET}
+        target: /var/run/docker.sock
+        read_only: true
+      - type: bind
+        source: ${LAO_PROJECT_DIR}
+        target: ${LAO_PROJECT_DIR}
+      - type: bind
+        source: ${LAO_RUNTIME_DIR}/work
+        target: ${LAO_RUNTIME_DIR}/work
+      - type: bind
+        source: ${LAO_RUNTIME_DIR}/artifacts
+        target: ${LAO_RUNTIME_DIR}/artifacts

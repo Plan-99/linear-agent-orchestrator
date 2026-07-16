@@ -231,9 +231,29 @@ case "$backend" in
     exit 20
     ;;
 esac
-# Keep candidate selection and the eventual Compose daemon on the same backend
-# even when the invoking shell exported a different AGENT_BACKEND value.
+
+if [[ -n "${LAO_DOCKER_HOST+x}" ]]; then
+  docker_host_mode="$LAO_DOCKER_HOST"
+else
+  docker_host_mode="$(read_env_value LAO_DOCKER_HOST "$ROOT_DIR/.env" 2>/dev/null || true)"
+fi
+case "${docker_host_mode:-false}" in
+  1 | true | TRUE | yes | YES | on | ON)
+    docker_host_mode=true
+    ;;
+  0 | false | FALSE | no | NO | off | OFF | "")
+    docker_host_mode=false
+    ;;
+  *)
+    echo "run.sh: invalid LAO_DOCKER_HOST '$docker_host_mode' (expected true or false)." >&2
+    exit 20
+    ;;
+esac
+
+# Keep candidate validation and the eventual Compose daemon on the same
+# backend/trust mode even when the invoking shell exported different values.
 export AGENT_BACKEND="$backend"
+export LAO_DOCKER_HOST="$docker_host_mode"
 
 git_sha="$(git rev-parse HEAD 2>/dev/null || printf 'unknown')"
 updater_args=(--backend "$backend" --git-sha "$git_sha")
@@ -289,5 +309,10 @@ esac
 # The verified tag is the only image run by the daemon. Passing it explicitly
 # prevents a standalone Compose invocation from accidentally replacing it.
 export LAO_IMAGE="$LAO_VERIFIED_IMAGE"
-echo "run.sh: starting the verified LAO daemon (backend=$backend, image=$LAO_IMAGE)."
+if [[ "$docker_host_mode" == "true" ]]; then
+  trust_mode="host-root-docker"
+else
+  trust_mode="container"
+fi
+echo "run.sh: starting the verified LAO daemon (backend=$backend, trust=$trust_mode, image=$LAO_IMAGE)."
 exec "$ROOT_DIR/scripts/daemon.sh" "${daemon_args[@]}"

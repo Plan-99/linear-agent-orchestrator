@@ -33,7 +33,7 @@ read_update_value() {
 # shell-exported defaults below never override explicit .env configuration
 # (compose gives shell env precedence over the .env file).
 if [[ -f .env ]]; then
-  for key in LAO_PROJECT_DIR LAO_UID LAO_GID; do
+  for key in LAO_PROJECT_DIR LAO_UID LAO_GID LAO_DOCKER_HOST LAO_DOCKER_SOCKET; do
     if [[ -z "${!key:-}" ]]; then
       value="$(grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2- || true)"
       value="${value%\"}" && value="${value#\"}"
@@ -89,4 +89,49 @@ export COMPOSE_PROJECT_NAME="lao-${instance_id}"
 export LAO_PROJECT_DIR="${LAO_PROJECT_DIR:-$orchestrator_dir}"
 export LAO_RUNTIME_DIR="$orchestrator_dir/.runtime"
 
-exec docker compose "$@"
+compose_args=()
+case "${LAO_DOCKER_HOST:-false}" in
+  1 | true | TRUE | yes | YES | on | ON)
+    docker_socket="${LAO_DOCKER_SOCKET:-/var/run/docker.sock}"
+    if [[ "$docker_socket" != /* || ! -S "$docker_socket" ]]; then
+      echo "compose.sh: Docker socket is missing, not a socket, or not absolute: $docker_socket" >&2
+      exit 66
+    fi
+    if [[ ! -r "$docker_socket" || ! -w "$docker_socket" ]]; then
+      echo "compose.sh: current host user cannot read and write Docker socket: $docker_socket" >&2
+      exit 77
+    fi
+    if [[ "$LAO_PROJECT_DIR" != /* || ! -d "$LAO_PROJECT_DIR" ]]; then
+      echo "compose.sh: LAO_DOCKER_HOST=true requires an absolute existing LAO_PROJECT_DIR." >&2
+      exit 66
+    fi
+    if [[ "$LAO_RUNTIME_DIR" != /* || ! -d "$LAO_RUNTIME_DIR/work" || ! -d "$LAO_RUNTIME_DIR/artifacts" ]]; then
+      echo "compose.sh: Docker host mode requires bootstrapped runtime work/artifact directories." >&2
+      exit 66
+    fi
+
+    docker_gid="$(stat -Lc %g "$docker_socket" 2>/dev/null || true)"
+    if [[ ! "$docker_gid" =~ ^[0-9]+$ ]]; then
+      echo "compose.sh: could not determine the Docker socket group ID." >&2
+      exit 66
+    fi
+    export LAO_DOCKER_SOCKET="$docker_socket"
+    export LAO_DOCKER_GID="$docker_gid"
+    # Use the exact socket just validated even if the invoking shell named a remote daemon.
+    export DOCKER_HOST="unix://$docker_socket"
+    # XAUTHORITY is commonly unset even in an X11 login. Resolve the traditional
+    # host file when available; otherwise leave it empty for an explicit GUI error.
+    if [[ -z "${XAUTHORITY:-}" && -n "${HOME:-}" && "$HOME" == /* && -r "$HOME/.Xauthority" ]]; then
+      export XAUTHORITY="$HOME/.Xauthority"
+    fi
+    compose_args=(-f compose.yaml -f compose.docker-host.yaml)
+    ;;
+  0 | false | FALSE | no | NO | off | OFF | "")
+    ;;
+  *)
+    echo "compose.sh: LAO_DOCKER_HOST must be true or false (got '${LAO_DOCKER_HOST}')." >&2
+    exit 64
+    ;;
+esac
+
+exec docker compose "${compose_args[@]}" "$@"

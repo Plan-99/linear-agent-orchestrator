@@ -12,6 +12,8 @@ from linear_agent_orchestrator.config import (
     DEFAULT_RUNNER_TIMEOUT_SECONDS,
     LINEAR_AUTH_MODE_API_KEY,
     LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS,
+    RunnerConfig,
+    validate_agent_runtime,
     load_config,
     load_dotenv_file,
 )
@@ -26,6 +28,7 @@ def test_config_defaults_include_first_story_constants():
     assert config.lease_renewal_interval_seconds == DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS == 120
     assert config.runner.timeout_seconds == DEFAULT_RUNNER_TIMEOUT_SECONDS == 3600
     assert config.runner.max_lifetime_seconds == DEFAULT_RUNNER_MAX_LIFETIME_SECONDS == 21600
+    assert config.runner.docker_host is None
     assert config.backoff.initial_seconds == DEFAULT_BACKOFF_INITIAL_SECONDS == 5
     assert config.backoff.max_seconds == DEFAULT_BACKOFF_MAX_SECONDS == 300
     assert config.backoff.max_attempts == DEFAULT_BACKOFF_MAX_ATTEMPTS == 5
@@ -53,6 +56,7 @@ def test_config_loads_required_linear_and_runner_values_from_env_without_leaking
             "LINEAR_PROJECT_NAME": "TEST",
             "RUNNER_COMMAND_TEMPLATE": "echo {prompt_path}",
             "RUNNER_ALLOWED_ENV": "PATH,HOME",
+            "DOCKER_HOST": "unix:///var/run/docker.sock",
         }
     )
 
@@ -62,6 +66,7 @@ def test_config_loads_required_linear_and_runner_values_from_env_without_leaking
     assert config.linear.project_name == "TEST"
     assert config.runner.command_template == "echo {prompt_path}"
     assert config.runner.allowed_env == ("PATH", "HOME")
+    assert config.runner.docker_host == "unix:///var/run/docker.sock"
     assert config.redacted_dict()["linear"]["api_key"] == "***REDACTED***"
 
 
@@ -343,3 +348,61 @@ def test_validate_project_workspace_requires_clean_git_worktree(tmp_path):
     errors = validate_project_workspace(tmp_path)
 
     assert errors == [f"Agent project git worktree is dirty: {tmp_path}"]
+
+
+def test_docker_host_runtime_requires_allowlist_and_cli(tmp_path, monkeypatch):
+    import subprocess
+
+    import linear_agent_orchestrator.config as config_module
+
+    subprocess.run(("git", "init", "--quiet", str(tmp_path)), check=True)
+    real_which = config_module.shutil.which
+    monkeypatch.setattr(
+        config_module.shutil,
+        "which",
+        lambda tool: None if tool == "docker" else real_which(tool),
+    )
+    runner = RunnerConfig(
+        project_dir=str(tmp_path),
+        backend="codex",
+        docker_host="unix:///var/run/docker.sock",
+    )
+
+    errors = validate_agent_runtime(runner, require_auth=False)
+
+    assert "Docker host mode requires DOCKER_HOST in RUNNER_ALLOWED_ENV" in errors
+    assert "Docker host mode requires the Docker CLI on PATH" in errors
+
+
+def test_docker_host_runtime_checks_daemon_compose_and_buildx(tmp_path, monkeypatch):
+    import subprocess
+
+    import linear_agent_orchestrator.config as config_module
+
+    subprocess.run(("git", "init", "--quiet", str(tmp_path)), check=True)
+    monkeypatch.setattr(config_module.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    calls = []
+
+    def fake_preflight(command):
+        if command[0] == "git":
+            return 0, "true\n", ""
+        calls.append(command)
+        if command[:2] == ("docker", "version"):
+            return 1, "", "permission denied"
+        return 0, "", ""
+
+    monkeypatch.setattr(config_module, "_run_preflight_command", fake_preflight)
+    runner = RunnerConfig(
+        project_dir=str(tmp_path),
+        backend="codex",
+        allowed_env=("DOCKER_HOST",),
+        docker_host="unix:///var/run/docker.sock",
+    )
+
+    errors = validate_agent_runtime(runner, require_auth=False)
+
+    assert errors == [
+        "Docker host daemon check failed: permission denied",
+    ]
+    assert ("docker", "compose", "version") in calls
+    assert ("docker", "buildx", "version") in calls

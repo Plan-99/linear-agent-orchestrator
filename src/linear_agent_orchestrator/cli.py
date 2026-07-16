@@ -358,6 +358,7 @@ def _runner_dry_run(
         work_dir=work_dir,
         artifacts_dir=artifacts_dir,
         allowed_env=config.runner.allowed_env,
+        docker_host=config.runner.docker_host,
         project_dir=config.runner.project_dir,
         backend=config.runner.backend,
     )

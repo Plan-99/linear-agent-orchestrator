@@ -11,7 +11,7 @@ still landing across the team:
 The tests below split into two kinds:
 
 1. **Standing safety guards** that assert facts which must hold in every commit,
-   epic or not (shell scripts parse; no host tmux/docker socket is mounted).
+   epic or not (shell scripts parse; host tmux is forbidden and Docker is opt-in).
    These run and pass today and fail loudly if any worker regresses them.
 2. **Forward contracts** for artifacts that do not exist yet. They locate the
    production artifact and ``skip`` with an explicit reason when it is absent, so
@@ -87,17 +87,42 @@ def test_shell_scripts_parse(script: Path):
 
 
 @pytest.mark.parametrize("compose", _compose_files(), ids=lambda p: p.name)
-def test_no_host_tmux_or_docker_socket_mount(compose: Path):
-    """No compose service may bind-mount a host tmux server socket or docker socket.
+def test_host_socket_mount_policy(compose: Path):
+    """Host tmux is always forbidden; Docker is limited to its explicit override."""
 
-    The tmux UI must run on a *private* container socket (task 6); the host tmux
-    socket must never be mounted (task 4), and the docker socket stays out.
-    """
+    configuration = "\n".join(
+        line for line in compose.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    tmux_socket = re.compile(r"/tmp/tmux|tmux-\d+|\$\{?TMUX", re.IGNORECASE)
+    assert not tmux_socket.search(configuration), (
+        f"{compose.name} mounts or references a forbidden host tmux socket"
+    )
+    if compose.name != "compose.docker-host.yaml":
+        assert "docker.sock" not in configuration, (
+            f"{compose.name} exposes Docker outside the explicit opt-in override"
+        )
 
-    mounts = _volume_mounts(compose.read_text(encoding="utf-8"))
-    forbidden = re.compile(r"docker\.sock|/tmp/tmux|tmux-\d+|\$\{?TMUX", re.IGNORECASE)
-    offenders = [mount for mount in mounts if forbidden.search(mount)]
-    assert not offenders, f"{compose.name} mounts a forbidden host socket: {offenders}"
+
+def test_docker_host_override_is_explicit_and_read_only() -> None:
+    override = ROOT / "compose.docker-host.yaml"
+    text = override.read_text(encoding="utf-8")
+
+    assert "source: ${LAO_DOCKER_SOCKET}" in text
+    assert "target: /var/run/docker.sock" in text
+    socket_block = text.split("source: ${LAO_DOCKER_SOCKET}", maxsplit=1)[1]
+    socket_block = socket_block.split("- type: bind", maxsplit=1)[0]
+    assert "read_only: true" in socket_block
+
+
+def test_default_compose_clears_inherited_docker_host() -> None:
+    base = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    override = (ROOT / "compose.docker-host.yaml").read_text(encoding="utf-8")
+
+    assert re.search(r'^\s+DOCKER_HOST:\s+""\s*$', base, re.MULTILINE)
+    assert re.search(
+        r"^\s+DOCKER_HOST:\s+unix:///var/run/docker\.sock\s*$", override, re.MULTILINE
+    )
 
 
 # --------------------------------------------------------------------------- #

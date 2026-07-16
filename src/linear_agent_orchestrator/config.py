@@ -158,6 +158,7 @@ class RunnerConfig:
     work_dir: str = "/workspace/work"
     artifacts_dir: str = "/workspace/artifacts"
     allowed_env: tuple[str, ...] = field(default_factory=tuple)
+    docker_host: str | None = None
     project_dir: str = "/workspace/project"
     backend: str = "omx"
     # Per-run git worktree isolation (standard lao-agent-runner wrapper only).
@@ -414,6 +415,7 @@ def load_config(
             work_dir=_get_str(source, "RUNNER_WORK_DIR", "/workspace/work"),
             artifacts_dir=_get_str(source, "RUNNER_ARTIFACTS_DIR", "/workspace/artifacts"),
             allowed_env=_get_csv_tuple(source, "RUNNER_ALLOWED_ENV"),
+            docker_host=_get_optional_str(source, "DOCKER_HOST"),
             project_dir=_get_str(source, "AGENT_PROJECT_DIR", "/workspace/project"),
             backend=_get_str(source, "AGENT_BACKEND", "omx").casefold(),
             worktree_isolation=_get_bool(source, "AGENT_WORKTREE_ISOLATION", True),
@@ -456,6 +458,26 @@ def validate_agent_runtime(runner: RunnerConfig, *, require_auth: bool) -> list[
     missing_tools = [tool for tool in ("rg", "ps") if shutil.which(tool) is None]
     if missing_tools:
         errors.append(f"Missing required worker tooling: {', '.join(missing_tools)}")
+
+    if runner.docker_host:
+        if "DOCKER_HOST" not in runner.allowed_env:
+            errors.append(
+                "Docker host mode requires DOCKER_HOST in RUNNER_ALLOWED_ENV"
+            )
+        if shutil.which("docker") is None:
+            errors.append("Docker host mode requires the Docker CLI on PATH")
+        else:
+            docker_checks = (
+                ("daemon", ("docker", "version", "--format", "{{.Server.Version}}")),
+                ("Compose plugin", ("docker", "compose", "version")),
+                ("Buildx plugin", ("docker", "buildx", "version")),
+            )
+            for label, command in docker_checks:
+                check = _run_preflight_command(command)
+                if check[0] != 0:
+                    errors.append(
+                        f"Docker host {label} check failed: {_preflight_output(check)}"
+                    )
     backend_tools = ("omx", "codex") if runner.backend == "omx" else (runner.backend,)
     for tool in backend_tools:
         if shutil.which(tool) is None:

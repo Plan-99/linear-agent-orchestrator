@@ -152,12 +152,14 @@ as an argv list (never a shell string). Dropping `-r` gives a writable attach.
 
 ## Security review — host/container tmux boundary
 
-Trust direction: **the host reaches into the container using its own
-`docker` CLI; the container never sees the host tmux server or the Docker
-socket.** No new host→container privilege is granted by this feature.
+In the default mode, **the host reaches into the container using its own
+`docker` CLI; the container never sees the host tmux server or Docker
+socket.** The tmux feature itself grants no new host→container privilege.
 
-- **No Docker socket in the container.** Unchanged: `/var/run/docker.sock` is
-  never mounted. `docker exec` is a host-side capability; a host that can run it
+- **Docker access is separate and opt-in.** By default `/var/run/docker.sock`
+  is not mounted. `LAO_DOCKER_HOST=true` deliberately switches to a full-host
+  trusted development mode; that permission comes from the Docker override,
+  not from tmux. `docker exec` is otherwise a host-side capability; a host that can run it
   already has full control of the container, so attach does not widen the
   boundary.
 - **Control socket is container-private.** `tmux.sock`, `argv`, and `exit_code`

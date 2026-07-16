@@ -1672,6 +1672,12 @@ def test_prompt_and_context_carry_workspace_and_result_contract(tmp_path):
     assert "Transport exit code 0 without this file is a failure." in prompt
     assert "Linear moves to Done only for status `completed`" in prompt
     assert issue.schema.parsed.get("Task") in prompt
+    assert "`DOCKER_HOST` is explicitly present" in prompt
+    assert "relative Compose bind mounts are valid" in prompt
+    assert "current numeric UID:GID" in prompt
+    assert "`${LAO_HOST_PROJECT_DIR}/.git`" in prompt
+    assert "Stop and remove sibling containers" in prompt
+    assert "GLFW rather than EGL" in prompt
     assert issue.schema.parsed.get("Acceptance Criteria") in prompt
     assert issue.schema.parsed.get("Validation") in prompt
 

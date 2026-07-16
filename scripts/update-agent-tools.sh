@@ -267,8 +267,31 @@ help_has() {
   done
 }
 
+check_docker_tooling() {
+  local image="$1"
+  case "${LAO_DOCKER_HOST:-false}" in
+    1 | true | TRUE | yes | YES | on | ON)
+      if ! docker run --rm --entrypoint docker "$image" --version >/dev/null 2>&1; then
+        warn "Docker host mode requires a Docker CLI in the verified image."
+        return 1
+      fi
+      if ! docker run --rm --entrypoint docker "$image" compose version >/dev/null 2>&1; then
+        warn "Docker host mode requires the Docker Compose plugin."
+        return 1
+      fi
+      if ! docker run --rm --entrypoint docker "$image" buildx version >/dev/null 2>&1; then
+        warn "Docker host mode requires the Docker Buildx plugin."
+        return 1
+      fi
+      ;;
+    0 | false | FALSE | no | NO | off | OFF | "") ;;
+    *) warn "invalid LAO_DOCKER_HOST value"; return 1 ;;
+  esac
+}
+
 check_backend_help() {
   local image="$1" selected_backend="$2" root_help exec_help
+  check_docker_tooling "$image" || return 1
   case "$selected_backend" in
     codex)
       root_help="$(docker run --rm --entrypoint codex "$image" --help 2>&1)" || return 1
