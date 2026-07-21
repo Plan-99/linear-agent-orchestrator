@@ -9,6 +9,7 @@ from linear_agent_orchestrator.config import (
     DEFAULT_LEASE_TTL_SECONDS,
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_RUNNER_MAX_LIFETIME_SECONDS,
+    DEFAULT_RUNNER_TIMEOUT_ENABLED,
     DEFAULT_RUNNER_TIMEOUT_SECONDS,
     LINEAR_AUTH_MODE_API_KEY,
     LINEAR_AUTH_MODE_OAUTH_CLIENT_CREDENTIALS,
@@ -27,6 +28,7 @@ def test_config_defaults_include_first_story_constants():
     assert config.poll_interval_seconds == DEFAULT_POLL_INTERVAL_SECONDS == 60
     assert config.lease_ttl_seconds == DEFAULT_LEASE_TTL_SECONDS == 900
     assert config.lease_renewal_interval_seconds == DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS == 120
+    assert config.runner.timeout_enabled is DEFAULT_RUNNER_TIMEOUT_ENABLED is True
     assert config.runner.timeout_seconds == DEFAULT_RUNNER_TIMEOUT_SECONDS == 3600
     assert config.runner.max_lifetime_seconds == DEFAULT_RUNNER_MAX_LIFETIME_SECONDS == 21600
     assert config.runner.docker_host is None
@@ -217,6 +219,22 @@ def test_runner_max_lifetime_loads_from_env_and_rejects_non_positive():
         config = load_config(env={"RUNNER_MAX_LIFETIME_SECONDS": invalid})
         errors = config.validate_startup(require_secrets=False)
         assert "runner_max_lifetime_seconds must be positive" in errors
+
+
+def test_runner_timeout_enabled_loads_from_env_and_defaults_on():
+    assert load_config(env={}).runner.timeout_enabled is True
+    assert load_config(env={"RUNNER_TIMEOUT_ENABLED": "false"}).runner.timeout_enabled is False
+    assert load_config(env={"RUNNER_TIMEOUT_ENABLED": "true"}).runner.timeout_enabled is True
+    assert load_config(env={"RUNNER_TIMEOUT_ENABLED": "treu"}).runner.timeout_enabled is True
+
+
+def test_runner_timeout_switch_is_wired_to_compose_and_bootstrap():
+    root = Path(__file__).parents[1]
+    compose = (root / "compose.yaml").read_text(encoding="utf-8")
+    bootstrap = (root / "scripts" / "bootstrap.sh").read_text(encoding="utf-8")
+
+    assert "RUNNER_TIMEOUT_ENABLED: ${RUNNER_TIMEOUT_ENABLED:-true}" in compose
+    assert "ensure_env_default RUNNER_TIMEOUT_ENABLED true" in bootstrap
 
 
 def test_environment_overrides_dotenv_file(tmp_path: Path):

@@ -97,6 +97,8 @@ AGENT_BASE_REF=main
 AGENT_WORKTREE_ROOT=/workspace/work/worktrees
 
 RUNNER_COMMAND_TEMPLATE='/usr/local/bin/lao-agent-runner {prompt_path} {result_path}'
+# false면 one-shot/interactive runner 실행 timeout을 모두 끕니다.
+RUNNER_TIMEOUT_ENABLED=true
 AGENT_BACKEND=omx
 AGENT_MODEL=gpt-5.6-sol
 # Reasoning effort (비우면 backend 기본값).
@@ -586,7 +588,11 @@ tmux 세션에서 열리고, 이슈 prompt가 첫 메시지로 주입됩니다. 
   않습니다. 전환은 run당 한 번만 best-effort로 시도되며, 실패해도 대화는 계속됩니다.
   operator가 TUI에서 exit하여 프로세스가 종료된 뒤 orchestrator가 `result.json`을
   다시 로드/검증하고, Done 게이트를 통과하면 Done으로 전환합니다.
-  `RUNNER_TIMEOUT_SECONDS`는 대화형 모드에서
+  `RUNNER_TIMEOUT_ENABLED=false`면 one-shot 고정 timeout과 대화형 idle timeout 및
+  hard cap이 모두 비활성화되어, backend가 스스로 종료할 때까지 기다립니다.
+  멈춘 backend가 worker slot을 무기한 점유할 수 있으므로 이 경우 운영자가
+  backend를 명시적으로 종료해야 합니다.
+  timeout이 활성화된 경우 `RUNNER_TIMEOUT_SECONDS`는 대화형 모드에서
   **idle timeout**으로 동작합니다 — 콘솔 출력 활동이 이어지는 동안 마감이 계속
   연장되고, 활동 없이 해당 시간이 지나면 종료됩니다. 활동과 무관한 hard cap은
   `RUNNER_MAX_LIFETIME_SECONDS`(기본 21600초 = 6시간)입니다.

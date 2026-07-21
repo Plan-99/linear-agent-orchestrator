@@ -179,10 +179,12 @@ socket.** The tmux feature itself grants no new host→container privilege.
   read the PTY); they do not, and are not claimed to, reflexively refuse
   keystrokes from a trusted host operator. The trust boundary remains "who can
   reach the Docker/container", not the attach flags.
-- **Session reaping is authoritative at the process level.** The core wrapper
-  timeout is the authoritative deadline (surfaced as `session_killed reason=
-  timeout`); on daemon crash the container process exit reaps the in-container
-  tmux session, so no orphaned interactive session outlives the run.
+- **Session reaping is authoritative at the process level.** When
+  `RUNNER_TIMEOUT_ENABLED=true`, the runner deadline is authoritative
+  (surfaced as `session_killed reason=timeout`). When it is false, the
+  operator/backend must end the session explicitly. On daemon crash the
+  container process exit still reaps the in-container tmux session, so no
+  orphaned interactive session outlives the run.
 - **Secret exposure surface (gap to enforce).** `lifecycle.jsonl` is designed to
   be secret-free: no argv, no env, no agent output — only ids, pids, paths,
   timestamps. `redact_event` is a defensive second pass. **However

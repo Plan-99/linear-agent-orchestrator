@@ -46,6 +46,8 @@ services:
       LINEAR_DONE_STATE_NAME: ${LINEAR_DONE_STATE_NAME:-Done}
       LINEAR_ATTENTION_STATE_NAME: ${LINEAR_ATTENTION_STATE_NAME:-In Review}
       RUNNER_COMMAND_TEMPLATE: ${RUNNER_COMMAND_TEMPLATE:-}
+      # false disables one-shot and interactive backend execution deadlines.
+      RUNNER_TIMEOUT_ENABLED: ${RUNNER_TIMEOUT_ENABLED:-true}
       RUNNER_TIMEOUT_SECONDS: ${RUNNER_TIMEOUT_SECONDS:-3600}
       # Interactive hard cap: idle-timeout resets never extend a run past this.
       RUNNER_MAX_LIFETIME_SECONDS: ${RUNNER_MAX_LIFETIME_SECONDS:-21600}

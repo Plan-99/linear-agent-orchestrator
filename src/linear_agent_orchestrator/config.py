@@ -21,6 +21,7 @@ import subprocess
 DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_LEASE_TTL_SECONDS = 900
 DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS = 120
+DEFAULT_RUNNER_TIMEOUT_ENABLED = True
 DEFAULT_RUNNER_TIMEOUT_SECONDS = 3600
 DEFAULT_RUNNER_MAX_LIFETIME_SECONDS = 21600
 DEFAULT_BACKOFF_INITIAL_SECONDS = 5
@@ -149,6 +150,10 @@ class RunnerConfig:
     """Generic shell runner configuration placeholders for later stories."""
 
     command_template: str | None = None
+    # Disable every backend execution deadline (one-shot fixed timeout plus
+    # interactive idle timeout and hard lifetime cap) when false. Bounded
+    # setup/cleanup operations keep their own defensive timeouts.
+    timeout_enabled: bool = DEFAULT_RUNNER_TIMEOUT_ENABLED
     timeout_seconds: int = DEFAULT_RUNNER_TIMEOUT_SECONDS
     # Interactive runs treat timeout_seconds as an idle timeout: console output
     # activity keeps pushing the deadline back. This hard cap ends the run
@@ -412,6 +417,11 @@ def load_config(
         ),
         runner=RunnerConfig(
             command_template=_get_optional_str(source, "RUNNER_COMMAND_TEMPLATE"),
+            timeout_enabled=_get_bool(
+                source,
+                "RUNNER_TIMEOUT_ENABLED",
+                DEFAULT_RUNNER_TIMEOUT_ENABLED,
+            ),
             timeout_seconds=_get_int(source, "RUNNER_TIMEOUT_SECONDS", DEFAULT_RUNNER_TIMEOUT_SECONDS),
             max_lifetime_seconds=_get_int(
                 source,
@@ -662,4 +672,11 @@ def _get_bool(source: Mapping[str, str], key: str, default: bool) -> bool:
     raw = source.get(key)
     if raw is None or raw == "":
         return default
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    # Preserve the declared default for unknown spellings. In particular, a
+    # typo must never silently turn off a default-on safety boundary.
+    return default

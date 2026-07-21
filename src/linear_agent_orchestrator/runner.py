@@ -471,6 +471,9 @@ class ShellRunner:
                 stderr_path.read_text(encoding="utf-8", errors="replace"),
             )
 
+        execution_timeout = (
+            self.config.timeout_seconds if self.config.timeout_enabled else None
+        )
         try:
             try:
                 if self.config.interactive and console is not None:
@@ -517,7 +520,7 @@ class ShellRunner:
                         return result
                     # outcome == "exited": the operator or backend ended the
                     # TUI itself; fall through to the one-shot handling below.
-                stdout, stderr = finish_output(timeout=self.config.timeout_seconds)
+                stdout, stderr = finish_output(timeout=execution_timeout)
                 if console is not None:
                     stdout = self._console_stdout(console, stdout)
                 structured_result, result_error = load_structured_result(paths.result_path)
@@ -594,17 +597,23 @@ class ShellRunner:
         ``activity_path`` (the run's console output log) pushes the deadline
         back, so the session survives as long as the backend keeps producing
         output or the operator keeps the conversation going. max_lifetime_seconds
-        caps the run regardless of activity. A parseable structured result
-        invokes ``on_result_submitted`` at most once without ending the default
-        interactive session. If ``interactive_autoclose`` is true, also returns
-        "result" after that notification, restoring the legacy result-driven
-        teardown behavior.
+        caps the run regardless of activity. When timeout_enabled is false,
+        neither deadline is applied. A parseable structured result invokes
+        ``on_result_submitted`` at most once without ending the default
+        interactive session. If ``interactive_autoclose`` is true, also
+        returns "result" after that notification, restoring the legacy
+        result-driven teardown behavior.
         """
 
-        now = time.monotonic()
-        hard_deadline = now + self.config.max_lifetime_seconds
-        idle_deadline = now + self.config.timeout_seconds
-        last_activity = self._activity_signature(activity_path)
+        if self.config.timeout_enabled:
+            now = time.monotonic()
+            hard_deadline: float | None = now + self.config.max_lifetime_seconds
+            idle_deadline: float | None = now + self.config.timeout_seconds
+            last_activity = self._activity_signature(activity_path)
+        else:
+            hard_deadline = None
+            idle_deadline = None
+            last_activity = None
         result_submitted = False
         while True:
             if not result_submitted:
@@ -617,6 +626,9 @@ class ShellRunner:
                         return "result"
             if process.poll() is not None:
                 return "exited"
+            if hard_deadline is None or idle_deadline is None:
+                time.sleep(2.0)
+                continue
             now = time.monotonic()
             activity = self._activity_signature(activity_path)
             if activity != last_activity:

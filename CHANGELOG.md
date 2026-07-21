@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Added `RUNNER_TIMEOUT_ENABLED=false` to disable one-shot and interactive
+  backend execution deadlines, including the interactive hard lifetime cap.
 - Introduced the Linear agent orchestrator CLI/daemon, configuration, Linear client, issue schema, state handling, runner, Docker/Compose runtime, bootstrap/test scripts, docs, and tests.
 - Added collaboration-ready worker and Linear test issue documentation.
 - Added model-neutral tmux/PTY agent-console support with host/container entry scripts, lifecycle JSONL schema, config/env surface, console docs, and live backend attach tooling.

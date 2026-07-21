@@ -156,9 +156,10 @@ def issue_state(issue, *, state_id=None, state_name=None):
     }
 
 
-def runner_config(tmp_path, command, timeout=5, allowed_env=()):
+def runner_config(tmp_path, command, timeout=5, allowed_env=(), timeout_enabled=True):
     return RunnerConfig(
         command_template=command,
+        timeout_enabled=timeout_enabled,
         timeout_seconds=timeout,
         work_dir=str(tmp_path / "work"),
         artifacts_dir=str(tmp_path / "artifacts"),
@@ -262,6 +263,19 @@ def test_runner_timeout_captures_timeout_result(tmp_path):
     assert result.succeeded is False
     assert result.timed_out is True
     assert result.exit_code is None
+
+
+def test_runner_timeout_disabled_waits_for_process_exit(tmp_path):
+    command = f"{sys.executable} -c 'import time; time.sleep(1.2); print(\"finished\")'"
+
+    result = ShellRunner(
+        runner_config(tmp_path, command, timeout=1, timeout_enabled=False)
+    ).run(make_issue(identifier="DEV-NO-TIMEOUT"))
+
+    assert result.succeeded is True
+    assert result.timed_out is False
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "finished"
 
 
 def test_runner_timeout_kills_descendant_process_group(tmp_path):

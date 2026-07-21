@@ -264,6 +264,7 @@ def _startup_check(
             "linear_auth_mode": config.linear.auth_mode,
             "poll_interval_seconds": config.poll_interval_seconds,
             "lease_ttl_seconds": config.lease_ttl_seconds,
+            "runner_timeout_enabled": config.runner.timeout_enabled,
             "runner_timeout_seconds": config.runner.timeout_seconds,
         },
     )
@@ -354,6 +355,7 @@ def _runner_dry_run(
         return 1
     runner_config = RunnerConfig(
         command_template=command_template or config.runner.command_template,
+        timeout_enabled=config.runner.timeout_enabled,
         timeout_seconds=config.runner.timeout_seconds,
         work_dir=work_dir,
         artifacts_dir=artifacts_dir,

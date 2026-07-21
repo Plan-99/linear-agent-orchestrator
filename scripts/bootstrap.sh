@@ -158,6 +158,7 @@ if grep -Fqx "RUNNER_COMMAND_TEMPLATE='/usr/local/bin/lao-agent-runner {prompt_p
   sed -i "s|^RUNNER_COMMAND_TEMPLATE=.*$|RUNNER_COMMAND_TEMPLATE='/usr/local/bin/lao-agent-runner {prompt_path} {result_path}'|" .env
 fi
 ensure_env_default RUNNER_COMMAND_TEMPLATE "'/usr/local/bin/lao-agent-runner {prompt_path} {result_path}'"
+ensure_env_default RUNNER_TIMEOUT_ENABLED true
 ensure_env_default RUNNER_WORK_DIR /workspace/work
 ensure_env_default RUNNER_ARTIFACTS_DIR /workspace/artifacts
 docker_runner_env='PATH,HOME,CODEX_HOME,AGENT_BACKEND,AGENT_MODEL,AGENT_EFFORT,AGENT_PROJECT_DIR,AGENT_SANDBOX,AGENT_PERMISSION_MODE,AGENT_BYPASS_PERMISSIONS,DOCKER_HOST,DISPLAY,XAUTHORITY,LAO_HOST_PROJECT_DIR,LAO_HOST_RUNTIME_DIR,LAO_HOST_X11_SOCKET_DIR'

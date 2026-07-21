@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+import linear_agent_orchestrator.runner as runner_module
 from linear_agent_orchestrator.config import RunnerConfig, load_config
 from linear_agent_orchestrator.issue_schema import validate_issue_body
 from linear_agent_orchestrator.linear_client import LinearIssue
@@ -172,9 +173,18 @@ class FakeProcess:
         return None
 
 
-def interactive_config(tmp_path, command, *, timeout=6, autoclose=False, max_lifetime=21600):
+def interactive_config(
+    tmp_path,
+    command,
+    *,
+    timeout=6,
+    autoclose=False,
+    max_lifetime=21600,
+    timeout_enabled=True,
+):
     return RunnerConfig(
         command_template=command,
+        timeout_enabled=timeout_enabled,
         timeout_seconds=timeout,
         max_lifetime_seconds=max_lifetime,
         work_dir=str(tmp_path / "work"),
@@ -312,6 +322,40 @@ def test_wait_interactive_hard_cap_overrides_activity(tmp_path):
 
     assert outcome == "timeout"
     assert elapsed < 5, f"hard cap must end the run despite continuous activity ({elapsed:.1f}s)"
+
+
+def test_wait_interactive_timeout_disabled_ignores_idle_and_hard_deadlines(
+    tmp_path, monkeypatch
+):
+    config = interactive_config(
+        tmp_path,
+        "/bin/true {prompt_path} {result_path}",
+        timeout=1,
+        max_lifetime=1,
+        timeout_enabled=False,
+    )
+    runner = ShellRunner(config)
+    clock = {"now": 0.0}
+
+    class ClockProcess:
+        def poll(self):
+            return 0 if clock["now"] >= 10 else None
+
+    monkeypatch.setattr(runner_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        runner_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+
+    outcome = runner._wait_interactive(
+        ClockProcess(),
+        tmp_path / "result.json",
+        activity_path=tmp_path / "output.log",
+    )
+
+    assert outcome == "exited"
+    assert clock["now"] >= 10
 
 
 def test_wait_interactive_autoclose_detects_result(tmp_path):
