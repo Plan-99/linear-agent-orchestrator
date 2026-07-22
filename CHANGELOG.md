@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Added project milestone support to issue creation: `create-issue
+  --milestone-name` resolves the milestone by name inside the configured
+  project before the mutation (fail-closed preflight) and binds it into the
+  request digest, a read-only `list-milestones` command lists the configured
+  project's milestones, and the linear-create-issue skill launcher gained
+  `--milestone-name`, `--list-milestones`, and an explicit `--state-name`
+  (default remains Backlog) so a fitting milestone and an explicitly requested
+  creation state can be set at creation time.
 - Added `RUNNER_TIMEOUT_ENABLED=false` to disable one-shot and interactive
   backend execution deadlines, including the interactive hard lifetime cap.
 - Introduced the Linear agent orchestrator CLI/daemon, configuration, Linear client, issue schema, state handling, runner, Docker/Compose runtime, bootstrap/test scripts, docs, and tests.

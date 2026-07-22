@@ -432,6 +432,7 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
         "assignee_source": "configured",
         "auth_mode": "oauth_client_credentials",
         "creation_state_name": "Backlog",
+        "milestone_name": None,
         "project_id": "project-id",
         "project_name": "SphereVLA",
         "queue_state_name": "Todo",
@@ -503,6 +504,7 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
         "assignee_source": "configured",
         "auth_mode": "oauth_client_credentials",
         "creation_state_name": "Backlog",
+        "milestone_name": None,
         "project_id": "project-id",
         "project_name": None,
         "queue_state_name": "Todo",
@@ -796,6 +798,7 @@ def test_create_issue_api_key_dry_run_identifies_viewer_assignee_source(
         "assignee_source": "api_key_viewer",
         "auth_mode": "api_key",
         "creation_state_name": "Todo",
+        "milestone_name": None,
         "project_id": None,
         "project_name": "SphereVLA",
         "queue_state_name": "Todo",
@@ -983,3 +986,256 @@ def test_state_init_uses_env_file_database_path(tmp_path, monkeypatch, capsys):
     assert exit_code == 0
     assert json.loads(capsys.readouterr().out)["db_path"] == str(db_path)
     assert db_path.exists()
+
+
+def test_create_issue_milestone_dry_run_binds_milestone_into_digest(tmp_path, capsys, monkeypatch):
+    title = "Assign milestone at creation"
+    body = (
+        "## Task\nCreate the issue with a milestone.\n\n"
+        "## Acceptance Criteria\n- The milestone is bound to the digest.\n\n"
+        "## Validation\n- Compare request digests.\n"
+    )
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        "LINEAR_OAUTH_CLIENT_SECRET=client-secret\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_network_boundary(*args, **kwargs):
+        raise AssertionError("dry-run must not construct a Linear client")
+
+    monkeypatch.setattr(cli, "_linear_client_factory", unexpected_network_boundary)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            title,
+            "--description-file",
+            str(description_file),
+            "--state-name",
+            "Backlog",
+            "--milestone-name",
+            "  Stage 1 - Perception  ",
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    request_target = {
+        "assignee_id": "human-user-id",
+        "assignee_source": "configured",
+        "auth_mode": "oauth_client_credentials",
+        "creation_state_name": "Backlog",
+        "milestone_name": "Stage 1 - Perception",
+        "project_id": "project-id",
+        "project_name": None,
+        "queue_state_name": "Todo",
+        "team_id": "DEV",
+    }
+    assert payload["target"] == {**request_target, "title": title}
+    assert payload["request_sha256"] == _request_sha256(title, body, request_target)
+    assert payload["request_sha256"] != _request_sha256(
+        title, body, {**request_target, "milestone_name": None}
+    )
+
+
+def test_create_issue_live_resolves_milestone_before_single_mutation(tmp_path, capsys, monkeypatch):
+    title = "Milestone-bound creation"
+    body = (
+        "## Task\nCreate the issue in its milestone.\n\n"
+        "## Acceptance Criteria\n- The milestone id reaches the mutation.\n\n"
+        "## Validation\n- Inspect the stub call order.\n"
+    )
+    request_target = {
+        "assignee_id": "human-user-id",
+        "assignee_source": "configured",
+        "auth_mode": "oauth_client_credentials",
+        "creation_state_name": "Backlog",
+        "milestone_name": "Stage 1",
+        "project_id": "project-id",
+        "project_name": None,
+        "queue_state_name": "Todo",
+        "team_id": "DEV",
+    }
+    expected_request_sha256 = _request_sha256(title, body, request_target)
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        "LINEAR_OAUTH_CLIENT_SECRET=client-secret\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+
+    class StubMilestoneClient(StubAssigneeClient):
+        def __init__(self):
+            super().__init__(assignee_id="human-user-id", project_id="project-id")
+
+        def resolve_project_milestone_id(self, config, milestone_name):
+            self.calls.append(("resolve_project_milestone_id", milestone_name))
+            return "milestone-1"
+
+        def create_issue(self, config, *, title, description, state_name=None, project_milestone_id=None):
+            self.calls.append(("create_issue", title, description, state_name, project_milestone_id))
+            return SimpleNamespace(
+                id="issue-id",
+                identifier="DEV-777",
+                url="https://linear.example/DEV-777",
+                title=title,
+            )
+
+    client = StubMilestoneClient()
+    monkeypatch.setattr(cli, "_linear_client_factory", lambda config: lambda: client)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            title,
+            "--description-file",
+            str(description_file),
+            "--state-name",
+            "Backlog",
+            "--milestone-name",
+            "Stage 1",
+            "--expected-request-sha256",
+            expected_request_sha256,
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert client.calls[-2] == ("resolve_project_milestone_id", "Stage 1")
+    assert client.calls[-1] == ("create_issue", title, body, "Backlog", "milestone-1")
+    assert sum(call[0] == "create_issue" for call in client.calls) == 1
+    assert json.loads(capsys.readouterr().out)["identifier"] == "DEV-777"
+
+
+def test_create_issue_unknown_milestone_fails_preflight_without_mutation(tmp_path, capsys, monkeypatch):
+    title = "Unknown milestone stays premutation"
+    body = (
+        "## Task\nAttempt a creation with a bad milestone.\n\n"
+        "## Acceptance Criteria\n- No mutation happens.\n\n"
+        "## Validation\n- Exit code 3 and no create_issue call.\n"
+    )
+    request_target = {
+        "assignee_id": "human-user-id",
+        "assignee_source": "configured",
+        "auth_mode": "oauth_client_credentials",
+        "creation_state_name": "Backlog",
+        "milestone_name": "Ghost",
+        "project_id": "project-id",
+        "project_name": None,
+        "queue_state_name": "Todo",
+        "team_id": "DEV",
+    }
+    expected_request_sha256 = _request_sha256(title, body, request_target)
+    description_file = tmp_path / "issue.md"
+    description_file.write_text(body, encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        "LINEAR_OAUTH_CLIENT_SECRET=client-secret\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+
+    class StubUnknownMilestoneClient(StubAssigneeClient):
+        def __init__(self):
+            super().__init__(assignee_id="human-user-id", project_id="project-id")
+
+        def resolve_project_milestone_id(self, config, milestone_name):
+            self.calls.append(("resolve_project_milestone_id", milestone_name))
+            raise linear_client_module.LinearGraphQLError(
+                "Could not resolve Linear project milestone 'Ghost' (available: Stage 1)"
+            )
+
+        def create_issue(self, config, **kwargs):
+            self.calls.append(("create_issue",))
+            raise AssertionError("unknown milestone must never reach the mutation")
+
+    client = StubUnknownMilestoneClient()
+    monkeypatch.setattr(cli, "_linear_client_factory", lambda config: lambda: client)
+
+    exit_code = main(
+        [
+            "--env-file",
+            str(env_file),
+            "create-issue",
+            "--title",
+            title,
+            "--description-file",
+            str(description_file),
+            "--state-name",
+            "Backlog",
+            "--milestone-name",
+            "Ghost",
+            "--expected-request-sha256",
+            expected_request_sha256,
+            "--json",
+        ]
+    )
+
+    assert exit_code == 3
+    assert all(call[0] != "create_issue" for call in client.calls)
+
+
+def test_list_milestones_reports_configured_project_milestones(tmp_path, capsys, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LINEAR_AUTH_MODE=oauth_client_credentials\n"
+        "LINEAR_OAUTH_CLIENT_ID=client-id\n"
+        "LINEAR_OAUTH_CLIENT_SECRET=client-secret\n"
+        "LINEAR_TEAM_ID=DEV\n"
+        "LINEAR_PROJECT_ID=project-id\n"
+        "LINEAR_ASSIGNEE_ID=human-user-id\n",
+        encoding="utf-8",
+    )
+    milestones = [
+        {
+            "id": "m-1",
+            "name": "Stage 1",
+            "description": "perception",
+            "target_date": "2026-08-01",
+            "sort_order": 1.0,
+        }
+    ]
+
+    class StubListClient(StubAssigneeClient):
+        def __init__(self):
+            super().__init__(assignee_id="human-user-id", project_id="project-id")
+
+        def list_project_milestones(self, project_id):
+            self.calls.append(("list_project_milestones", project_id))
+            return milestones
+
+    client = StubListClient()
+    monkeypatch.setattr(cli, "_linear_client_factory", lambda config: lambda: client)
+
+    exit_code = main(["--env-file", str(env_file), "list-milestones", "--json"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"milestones": milestones, "project_id": "project-id"}
+    assert client.calls[-1] == ("list_project_milestones", "project-id")

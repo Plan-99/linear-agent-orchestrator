@@ -639,6 +639,56 @@ class LinearClient:
             raise LinearGraphQLError(f"Could not resolve Linear project named {config.project_name!r}")
         return str(nodes[0]["id"])
 
+    def list_project_milestones(self, project_id: str) -> list[dict[str, Any]]:
+        """List a project's milestones for review and deterministic name resolution."""
+
+        data = self.graphql(PROJECT_MILESTONES_QUERY, {"projectId": project_id})
+        project = data.get("project") or {}
+        nodes = ((project.get("projectMilestones") or {}).get("nodes")) or []
+        milestones: list[dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, Mapping) or not node.get("id"):
+                continue
+            milestones.append(
+                {
+                    "id": str(node["id"]),
+                    "name": str(node.get("name") or ""),
+                    "description": node.get("description"),
+                    "target_date": node.get("targetDate"),
+                    "sort_order": node.get("sortOrder"),
+                }
+            )
+        return milestones
+
+    def resolve_project_milestone_id(self, config: LinearConfig, milestone_name: str) -> str:
+        """Resolve a milestone name to its ID within the configured project."""
+
+        wanted = milestone_name.strip()
+        if not wanted:
+            raise ValueError("Milestone name must not be blank")
+        project_id = self.resolve_project_id(config)
+        if not project_id:
+            raise ValueError(
+                "A configured Linear project (LINEAR_PROJECT_ID or LINEAR_PROJECT_NAME) "
+                "is required to assign a milestone"
+            )
+        milestones = self.list_project_milestones(project_id)
+        matches = [
+            milestone
+            for milestone in milestones
+            if milestone["name"].strip().casefold() == wanted.casefold()
+        ]
+        if not matches:
+            available = ", ".join(sorted(m["name"] for m in milestones)) or "none"
+            raise LinearGraphQLError(
+                f"Could not resolve Linear project milestone {wanted!r} (available: {available})"
+            )
+        if len(matches) > 1:
+            raise LinearGraphQLError(
+                f"Linear project milestone name {wanted!r} is ambiguous in the configured project"
+            )
+        return str(matches[0]["id"])
+
     def create_issue(
         self,
         config: LinearConfig,
@@ -646,6 +696,7 @@ class LinearClient:
         title: str,
         description: str,
         state_name: str | None = None,
+        project_milestone_id: str | None = None,
     ) -> LinearIssue:
         """Create a Linear issue in the configured team/project for live smoke tests."""
 
@@ -666,6 +717,8 @@ class LinearClient:
         }
         if project_id:
             input_value["projectId"] = project_id
+        if project_milestone_id:
+            input_value["projectMilestoneId"] = project_milestone_id
         data = self.graphql(ISSUE_CREATE_MUTATION, {"input": input_value})
         payload = data.get("issueCreate") or {}
         if payload.get("success") is not True:
@@ -816,6 +869,18 @@ query ProjectByName($teamId: String!, $projectName: String!) {
     id
     projects(filter: { name: { eq: $projectName } }) {
       nodes { id name }
+    }
+  }
+}
+"""
+
+PROJECT_MILESTONES_QUERY = """
+query ProjectMilestones($projectId: String!) {
+  project(id: $projectId) {
+    id
+    name
+    projectMilestones(first: 100) {
+      nodes { id name description targetDate sortOrder }
     }
   }
 }

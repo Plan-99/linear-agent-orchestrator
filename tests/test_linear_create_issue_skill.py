@@ -421,3 +421,100 @@ def test_uncertain_mutation_blocks_automatic_retry(tmp_path, monkeypatch, capsys
     assert "check Linear before any manual retry" in capsys.readouterr().err
     with sqlite3.connect(state_db) as connection:
         assert connection.execute("SELECT status FROM requests").fetchone() == ("uncertain",)
+
+
+def test_explicit_state_and_milestone_are_passed_through(tmp_path, monkeypatch):
+    root = _fake_lao_root(tmp_path)
+    env_file = _secure_env(root / ".env")
+    description = _description(tmp_path / "issue.md")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed(stdout='{"dry_run": true}\n')
+
+    monkeypatch.setattr(skill_script.subprocess, "run", fake_run)
+
+    result = skill_script.main(
+        [
+            "--lao-root",
+            str(root),
+            "--env-file",
+            str(env_file),
+            "--title",
+            "Create guarded issue",
+            "--description-file",
+            str(description),
+            "--state-name",
+            " Todo ",
+            "--milestone-name",
+            " Stage 1 ",
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert result == 0
+    command, _ = calls[0]
+    state_index = command.index("--state-name")
+    assert command[state_index + 1] == "Todo"
+    milestone_index = command.index("--milestone-name")
+    assert command[milestone_index + 1] == "Stage 1"
+
+
+def test_list_milestones_is_read_only_and_needs_no_title(tmp_path, monkeypatch):
+    root = _fake_lao_root(tmp_path)
+    env_file = _secure_env(root / ".env")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed(stdout='{"milestones": [], "project_id": "p"}\n')
+
+    monkeypatch.setattr(skill_script.subprocess, "run", fake_run)
+
+    result = skill_script.main(
+        [
+            "--lao-root",
+            str(root),
+            "--env-file",
+            str(env_file),
+            "--list-milestones",
+            "--json",
+        ]
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    command, options = calls[0]
+    assert command[:3] == [sys.executable, "-I", "-c"]
+    assert command[4:7] == ["--env-file", str(env_file.resolve()), "list-milestones"]
+    assert command[-1] == "--json"
+    assert "--title" not in command
+    assert "--state-name" not in command
+    assert options["cwd"] == root.resolve()
+
+
+def test_list_milestones_rejects_creation_arguments(tmp_path, monkeypatch, capsys):
+    root = _fake_lao_root(tmp_path)
+    env_file = _secure_env(root / ".env")
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("--list-milestones must fail before any subprocess")
+
+    monkeypatch.setattr(skill_script.subprocess, "run", unexpected_run)
+
+    result = skill_script.main(
+        [
+            "--lao-root",
+            str(root),
+            "--env-file",
+            str(env_file),
+            "--list-milestones",
+            "--title",
+            "not allowed",
+        ]
+    )
+
+    assert result == 2
+    assert "cannot be combined" in capsys.readouterr().err

@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 
 _LAO_MODULE = Path("src/linear_agent_orchestrator/cli.py")
-_CREATION_STATE_NAME = "Backlog"
+_DEFAULT_CREATION_STATE_NAME = "Backlog"
 _REQUEST_SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _PREMUTATION_EXIT_CODES = frozenset({2, 3})
 _LINEAR_CONFIG_KEYS = frozenset(
@@ -47,12 +47,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create one LAO-compatible Linear issue using the configured OAuth/API actor."
     )
-    parser.add_argument("--title", required=True, help="Linear issue title")
+    parser.add_argument("--title", help="Linear issue title (required unless --list-milestones)")
     parser.add_argument(
         "--description-file",
-        required=True,
         type=Path,
-        help="UTF-8 Markdown body containing Task, Acceptance Criteria, and Validation",
+        help="UTF-8 Markdown body containing Task, Acceptance Criteria, and Validation "
+        "(required unless --list-milestones)",
+    )
+    parser.add_argument(
+        "--state-name",
+        default=_DEFAULT_CREATION_STATE_NAME,
+        help="Workflow state used for creation (default: Backlog, the review gate)",
+    )
+    parser.add_argument(
+        "--milestone-name",
+        help="Project milestone assigned at creation, resolved by exact name before the mutation",
+    )
+    parser.add_argument(
+        "--list-milestones",
+        action="store_true",
+        help="List the configured project's milestones (read-only) and exit",
     )
     parser.add_argument("--lao-root", type=Path, help="Linear Agent Orchestrator checkout")
     parser.add_argument("--env-file", type=Path, help="LAO dotenv file containing Linear configuration")
@@ -214,13 +228,35 @@ def _command(
         "--description-file",
         str(description_file),
         "--state-name",
-        _CREATION_STATE_NAME,
+        args.state_name.strip(),
     ]
+    if args.milestone_name:
+        command.extend(("--milestone-name", args.milestone_name.strip()))
     if args.expected_request_sha256:
         command.extend(("--expected-request-sha256", args.expected_request_sha256))
     if args.dry_run:
         command.append("--dry-run")
     if force_json or args.json:
+        command.append("--json")
+    return command
+
+
+def _list_milestones_command(
+    args: argparse.Namespace,
+    *,
+    lao_root: Path,
+    env_file: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        _isolated_bootstrap(lao_root),
+        "--env-file",
+        str(env_file),
+        "list-milestones",
+    ]
+    if args.json:
         command.append("--json")
     return command
 
@@ -492,6 +528,33 @@ def _run_live(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.list_milestones:
+            if (
+                args.title is not None
+                or args.description_file is not None
+                or args.expected_request_sha256
+                or args.dry_run
+            ):
+                raise LauncherError(
+                    "--list-milestones cannot be combined with issue creation arguments."
+                )
+            explicit_env = _explicit_env_file(args)
+            lao_root = _resolve_lao_root(args)
+            env_file = _resolve_env_file(explicit_env, lao_root)
+            completed = subprocess.run(
+                _list_milestones_command(args, lao_root=lao_root, env_file=env_file),
+                cwd=lao_root,
+                env=_child_environment(),
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            _emit_child(completed)
+            return completed.returncode
+        if args.title is None or args.description_file is None:
+            raise LauncherError("--title and --description-file are required to create an issue.")
+        if not args.state_name.strip():
+            raise LauncherError("--state-name must not be blank.")
         description_file, clean_title = _validate_inputs(args.title, args.description_file)
         explicit_env = _explicit_env_file(args)
         lao_root = _resolve_lao_root(args)

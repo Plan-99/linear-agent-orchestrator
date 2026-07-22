@@ -725,3 +725,98 @@ def test_list_issue_comments_uses_issue_comments_pagination():
     assert "comments" in transport.calls[0]["query"]
     assert transport.calls[0]["variables"] == {"issueId": "issue-1", "first": 1, "after": None}
     assert transport.calls[1]["variables"]["after"] == "cursor-1"
+
+
+def test_create_issue_includes_project_milestone_when_requested():
+    transport = MockTransport([
+        {"data": {"team": {"projects": {"nodes": [{"id": "project-test", "name": "TEST"}]}}}},
+        workflow_response(),
+        {"data": {"team": {"id": "team-uuid", "key": "DEV", "name": "Development"}}},
+        {"data": {"issueCreate": {"success": True, "issue": issue_node("DEV-101")}}},
+    ])
+    client = LinearClient(transport)
+    config = LinearConfig(team_id="DEV", project_name="TEST", assignee_id="user-42")
+
+    issue = client.create_issue(
+        config,
+        title="Smoke",
+        description="Body",
+        state_name="Backlog",
+        project_milestone_id="milestone-9",
+    )
+
+    assert issue.identifier == "DEV-101"
+    assert transport.calls[3]["variables"]["input"]["projectMilestoneId"] == "milestone-9"
+
+
+def _milestones_response():
+    return {
+        "data": {
+            "project": {
+                "id": "project-1",
+                "name": "TEST",
+                "projectMilestones": {
+                    "nodes": [
+                        {
+                            "id": "m-1",
+                            "name": "Stage 1",
+                            "description": "perception",
+                            "targetDate": "2026-08-01",
+                            "sortOrder": 1.0,
+                        },
+                        {
+                            "id": "m-2",
+                            "name": "Stage 2",
+                            "description": None,
+                            "targetDate": None,
+                            "sortOrder": 2.0,
+                        },
+                        {"name": "node-without-id-is-skipped"},
+                    ]
+                },
+            }
+        }
+    }
+
+
+def test_list_project_milestones_parses_and_skips_invalid_nodes():
+    transport = MockTransport([_milestones_response()])
+    client = LinearClient(transport)
+
+    milestones = client.list_project_milestones("project-1")
+
+    assert milestones == [
+        {
+            "id": "m-1",
+            "name": "Stage 1",
+            "description": "perception",
+            "target_date": "2026-08-01",
+            "sort_order": 1.0,
+        },
+        {
+            "id": "m-2",
+            "name": "Stage 2",
+            "description": None,
+            "target_date": None,
+            "sort_order": 2.0,
+        },
+    ]
+    assert "projectMilestones" in transport.calls[0]["query"]
+    assert transport.calls[0]["variables"] == {"projectId": "project-1"}
+
+
+def test_resolve_project_milestone_id_matches_name_case_insensitively():
+    transport = MockTransport([_milestones_response()])
+    client = LinearClient(transport)
+    config = LinearConfig(team_id="DEV", project_id="project-1")
+
+    assert client.resolve_project_milestone_id(config, "  stage 1 ") == "m-1"
+
+
+def test_resolve_project_milestone_id_fails_closed_on_unknown_name():
+    transport = MockTransport([_milestones_response()])
+    client = LinearClient(transport)
+    config = LinearConfig(team_id="DEV", project_id="project-1")
+
+    with pytest.raises(LinearGraphQLError, match="available: Stage 1, Stage 2"):
+        client.resolve_project_milestone_id(config, "Ghost")
