@@ -18,6 +18,7 @@ from typing import Any, Iterable
 
 
 _LAO_MODULE = Path("src/linear_agent_orchestrator/cli.py")
+_CREATION_STATE_NAME = "Backlog"
 _REQUEST_SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _PREMUTATION_EXIT_CODES = frozenset({2, 3})
 _LINEAR_CONFIG_KEYS = frozenset(
@@ -212,6 +213,8 @@ def _command(
         args.title.strip(),
         "--description-file",
         str(description_file),
+        "--state-name",
+        _CREATION_STATE_NAME,
     ]
     if args.expected_request_sha256:
         command.extend(("--expected-request-sha256", args.expected_request_sha256))

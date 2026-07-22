@@ -141,6 +141,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="UTF-8 markdown file containing the canonical issue body",
     )
+    create_issue.add_argument(
+        "--state-name",
+        help="Workflow state used for creation; defaults to LINEAR_QUEUE_STATE_NAME",
+    )
     create_issue.add_argument("--json", action="store_true", help="Print result as JSON")
     create_issue.add_argument(
         "--dry-run",
@@ -207,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             config,
             title=args.title,
             description_file=args.description_file,
+            state_name=args.state_name,
             as_json=args.json,
             dry_run=args.dry_run,
             expected_request_sha256=args.expected_request_sha256,
@@ -411,6 +416,7 @@ def _create_issue(
     *,
     title: str,
     description_file: Path,
+    state_name: str | None,
     as_json: bool,
     dry_run: bool,
     expected_request_sha256: str | None,
@@ -432,10 +438,15 @@ def _create_issue(
         return CREATE_ISSUE_LOCAL_ERROR
 
     issue_title = title.strip()
+    issue_state_name = (
+        state_name.strip() if state_name is not None else config.linear.queue_state_name
+    )
     schema = validate_issue_body(body)
     errors = list(schema.diagnostics)
     if not issue_title:
         errors.append("--title must not be blank")
+    if not issue_state_name:
+        errors.append("--state-name must not be blank")
     if _issue_content_contains_linear_secret(title, body, config.linear):
         errors.append("Issue title or body contains a configured Linear credential")
     errors.extend(config.linear.validation_errors(require_secrets=True))
@@ -447,7 +458,7 @@ def _create_issue(
             )
         return CREATE_ISSUE_LOCAL_ERROR
 
-    target = _create_issue_target(config.linear)
+    target = _create_issue_target(config.linear, state_name=issue_state_name)
     request_sha256 = _create_issue_request_sha256(
         title=issue_title,
         body=body,
@@ -499,7 +510,8 @@ def _create_issue(
                 "target "
                 f"auth_mode={config.linear.auth_mode} team={config.linear.team_id} "
                 f"project_id={config.linear.project_id} project_name={config.linear.project_name} "
-                f"state={config.linear.queue_state_name} assignee={config.linear.assignee_id} "
+                f"state={issue_state_name} queue_state={config.linear.queue_state_name} "
+                f"assignee={config.linear.assignee_id} "
                 f"assignee_source={target['assignee_source']} title={issue_title}"
             )
             print(f"body sha256={digest['sha256']} length_bytes={digest['length_bytes']}")
@@ -529,7 +541,12 @@ def _create_issue(
         return CREATE_ISSUE_PREFLIGHT_ERROR
 
     try:
-        issue = client.create_issue(config.linear, title=issue_title, description=body)
+        issue = client.create_issue(
+            config.linear,
+            title=issue_title,
+            description=body,
+            state_name=issue_state_name,
+        )
     except Exception as exc:  # noqa: BLE001 - CLI fails closed and must not retry a mutation
         LOGGER.error(
             "create_issue_failed",
@@ -544,12 +561,17 @@ def _create_issue(
     return 0
 
 
-def _create_issue_target(config: LinearConfig) -> dict[str, str | None]:
+def _create_issue_target(
+    config: LinearConfig,
+    *,
+    state_name: str,
+) -> dict[str, str | None]:
     assignee_source = "configured" if config.assignee_id else "api_key_viewer"
     return {
         "assignee_id": config.assignee_id,
         "assignee_source": assignee_source,
         "auth_mode": config.auth_mode,
+        "creation_state_name": state_name,
         "project_id": config.project_id,
         "project_name": config.project_name,
         "queue_state_name": config.queue_state_name,

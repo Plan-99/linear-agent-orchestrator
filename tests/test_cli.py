@@ -417,6 +417,8 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
             f"  {title}  ",
             "--description-file",
             str(description_file),
+            "--state-name",
+            "Backlog",
             "--dry-run",
             "--json",
         ]
@@ -429,6 +431,7 @@ def test_create_issue_valid_dry_run_has_no_network_and_reports_only_digest_metad
         "assignee_id": "human-user-id",
         "assignee_source": "configured",
         "auth_mode": "oauth_client_credentials",
+        "creation_state_name": "Backlog",
         "project_id": "project-id",
         "project_name": "SphereVLA",
         "queue_state_name": "Todo",
@@ -499,6 +502,7 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
         "assignee_id": "human-user-id",
         "assignee_source": "configured",
         "auth_mode": "oauth_client_credentials",
+        "creation_state_name": "Backlog",
         "project_id": "project-id",
         "project_name": None,
         "queue_state_name": "Todo",
@@ -522,8 +526,8 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
         def __init__(self):
             super().__init__(assignee_id="human-user-id", project_id="project-id")
 
-        def create_issue(self, config, *, title, description):
-            self.calls.append(("create_issue", title, description))
+        def create_issue(self, config, *, title, description, state_name=None):
+            self.calls.append(("create_issue", title, description, state_name))
             assert config.auth_mode == "oauth_client_credentials"
             return SimpleNamespace(
                 id="issue-id",
@@ -544,6 +548,8 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
             f"  {title}  ",
             "--description-file",
             str(description_file),
+            "--state-name",
+            "Backlog",
             "--expected-request-sha256",
             expected_request_sha256.upper(),
             "--json",
@@ -559,7 +565,7 @@ def test_create_issue_oauth_live_preflights_then_creates_exactly_once(tmp_path, 
         "create_issue",
     ]
     assert sum(call[0] == "create_issue" for call in client.calls) == 1
-    assert client.calls[-1][1:] == (title, body)
+    assert client.calls[-1][1:] == (title, body, "Backlog")
     assert json.loads(capsys.readouterr().out) == {
         "identifier": "DEV-456",
         "issue_id": "issue-id",
@@ -789,6 +795,7 @@ def test_create_issue_api_key_dry_run_identifies_viewer_assignee_source(
         "assignee_id": None,
         "assignee_source": "api_key_viewer",
         "auth_mode": "api_key",
+        "creation_state_name": "Todo",
         "project_id": None,
         "project_name": "SphereVLA",
         "queue_state_name": "Todo",
@@ -827,8 +834,8 @@ def test_create_issue_mutation_exception_is_uncertain_without_secret_leak(
         def __init__(self):
             super().__init__(assignee_id="human-user-id", project_id="project-id")
 
-        def create_issue(self, config, *, title, description):
-            self.calls.append(("create_issue", title, description))
+        def create_issue(self, config, *, title, description, state_name=None):
+            self.calls.append(("create_issue", title, description, state_name))
             raise RuntimeError(f"ambiguous transport failure involving {secret}")
 
     client = UncertainCreateClient()

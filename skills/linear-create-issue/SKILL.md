@@ -1,11 +1,11 @@
 ---
 name: linear-create-issue
-description: Create or draft Linear issues from concise requests in fresh Codex sessions by producing LAO-compatible Markdown and invoking a guarded local launcher. Use when the user asks to upload, create, register, file, post, or add an issue, task, feature, or bug to Linear, including Korean requests such as "리니어 이슈로 올려줘", "이슈 등록해", "이슈 추가해", or "Linear에 생성해". Also use for Linear issue previews or drafts, but never mutate Linear unless the current user request explicitly requests creation.
+description: Create Linear issues in Backlog, or draft them, from concise requests in fresh Codex sessions by producing LAO-compatible Markdown and invoking a guarded local launcher. Use when the user asks to upload, create, register, file, post, or add an issue, task, feature, or bug to Linear, including Korean requests such as "리니어 이슈로 올려줘", "이슈 등록해", "이슈 추가해", or "Linear에 생성해". Also use for Linear issue previews or drafts, but never mutate Linear unless the current user request explicitly requests creation.
 ---
 
 # Linear Create Issue
 
-Create a structured issue for the Linear team and project configured in Linear Agent Orchestrator (LAO). Keep credentials outside the skill and use the bundled launcher from any working directory.
+Create a structured Backlog issue for the Linear team and project configured in Linear Agent Orchestrator (LAO). Keep credentials outside the skill and use the bundled launcher from any working directory. Backlog is the mandatory review gate; only the user promotes an approved issue to Todo so LAO can claim it.
 
 ## Decide whether creation is authorized
 
@@ -15,6 +15,7 @@ Create a structured issue for the Linear team and project configured in Linear A
 - Never reuse write authorization from an earlier turn.
 - Do not broaden a request for one issue into multiple issues.
 - Do not retry a failed or interrupted live creation automatically.
+- Always create in Backlog. Do not create directly in Todo or change the issue to Todo after creation, even when Todo is LAO's configured queue state.
 
 ## Prepare the issue
 
@@ -35,7 +36,7 @@ Use a concise, actionable title and this exact non-empty Markdown schema:
 
 State uncertain requirements explicitly instead of inventing them. Keep validation proportional to the requested work.
 
-The launcher supports title and description; LAO configuration supplies team, project, queue state, and assignee. If the request requires a different target, priority, labels, cycle, parent, or due date, do not silently pretend those fields were set. Draft the issue and explain the unsupported field or target mismatch.
+The launcher supports title and description and fixes the creation state to Backlog; LAO configuration supplies team, project, Todo queue state, and assignee. If the request requires a different creation state, priority, labels, cycle, parent, or due date, do not silently pretend those fields were set. Keep the issue in Backlog and explain that the user must promote it manually after review.
 
 ## Preview the exact request
 
@@ -51,7 +52,7 @@ python3 -I <skill-dir>/scripts/create_linear_issue.py \
   --json
 ```
 
-The preview validates configuration, secret exclusion, and body schema without constructing a Linear client. Verify the reported team, project, state, and assignee source. Capture `request_sha256`; it binds the stripped title, exact body, and configured nonsecret target fields. If the target conflicts with the request, stop rather than overriding or guessing.
+The preview validates configuration, secret exclusion, and body schema without constructing a Linear client. Verify that `creation_state_name` is `Backlog`; `queue_state_name` may remain `Todo` for the daemon. Also verify the reported team, project, and assignee source. Capture `request_sha256`; it binds the stripped title, exact body, Backlog creation state, and configured nonsecret target fields. If the target conflicts with the request, stop rather than overriding or guessing.
 
 ## Create exactly once
 
@@ -71,7 +72,7 @@ The launcher verifies the digest immediately before network access. It records t
 - Release a request that failed before mutation so it can be corrected.
 - Mark an interrupted or mutation-time failure uncertain and block automatic retries.
 
-Return the created issue identifier and URL. Remove the temporary file after success or a logged `create_issue_description_error`, `create_issue_validation_error`, or `create_issue_preflight_error`. For `create_issue_failed`, interruption, or an uncertain-ledger message, report the title and preview `request_sha256`, keep the mutation blocked, and tell the user to check Linear before any manual recovery.
+Return the created issue identifier and URL, state that it was created in Backlog, and remind the user to promote it to Todo only after review. Remove the temporary file after success or a logged `create_issue_description_error`, `create_issue_validation_error`, or `create_issue_preflight_error`. For `create_issue_failed`, interruption, or an uncertain-ledger message, report the title and preview `request_sha256`, keep the mutation blocked, and tell the user to check Linear before any manual recovery.
 
 ## Configuration discovery
 

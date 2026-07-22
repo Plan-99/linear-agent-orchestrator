@@ -122,6 +122,8 @@ def test_dry_run_uses_isolated_python_and_scrubs_inherited_python_and_linear_env
     assert command[:3] == [sys.executable, "-I", "-c"]
     assert str(root.resolve() / "src") in command[3]
     assert command[4:7] == ["--env-file", str(env_file.resolve()), "create-issue"]
+    state_index = command.index("--state-name")
+    assert command[state_index + 1] == "Backlog"
     assert command[-2:] == ["--dry-run", "--json"]
     assert options["cwd"] == root.resolve()
     assert options["check"] is False

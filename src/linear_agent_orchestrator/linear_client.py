@@ -408,17 +408,25 @@ class WorkflowStateCache:
         self.client = client
         self._by_team: dict[str, dict[str, WorkflowState]] = {}
 
-    def resolve_required(self, team_id: str, config: LinearConfig) -> dict[WorkflowRole, WorkflowState]:
+    def _states_for_team(self, team_id: str) -> dict[str, WorkflowState]:
         states = self._by_team.get(team_id)
         if states is None:
             states = {_state_key(state.name): state for state in self.client.list_workflow_states(team_id)}
             self._by_team[team_id] = states
+        return states
+
+    def resolve_required(self, team_id: str, config: LinearConfig) -> dict[WorkflowRole, WorkflowState]:
+        states = self._states_for_team(team_id)
         return {
             WorkflowRole.QUEUE: _lookup_state(states, config.queue_state_name, "queue/Todo"),
             WorkflowRole.IN_PROGRESS: _lookup_state(states, config.in_progress_state_name, "In Progress"),
             WorkflowRole.DONE: _lookup_state(states, config.done_state_name, "Done"),
             WorkflowRole.ATTENTION: _lookup_state(states, config.attention_state_name, "attention/In Review"),
         }
+
+    def resolve_named(self, team_id: str, state_name: str) -> WorkflowState:
+        states = self._states_for_team(team_id)
+        return _lookup_state(states, state_name, "issue creation")
 
     def clear(self) -> None:
         self._by_team.clear()
@@ -631,19 +639,29 @@ class LinearClient:
             raise LinearGraphQLError(f"Could not resolve Linear project named {config.project_name!r}")
         return str(nodes[0]["id"])
 
-    def create_issue(self, config: LinearConfig, *, title: str, description: str) -> LinearIssue:
+    def create_issue(
+        self,
+        config: LinearConfig,
+        *,
+        title: str,
+        description: str,
+        state_name: str | None = None,
+    ) -> LinearIssue:
         """Create a Linear issue in the configured team/project for live smoke tests."""
 
         if not config.team_id:
             raise ValueError("LINEAR_TEAM_ID is required to create issues")
         project_id = self.resolve_project_id(config)
-        states = self.resolve_workflow_states(config)
+        creation_state = self.workflow_states.resolve_named(
+            config.team_id,
+            state_name or config.queue_state_name,
+        )
         team_uuid = self.resolve_team_uuid(config.team_id)
         input_value = {
             "teamId": team_uuid,
             "title": title,
             "description": description,
-            "stateId": states[WorkflowRole.QUEUE].id,
+            "stateId": creation_state.id,
             "assigneeId": self.resolve_assignee_id(config),
         }
         if project_id:

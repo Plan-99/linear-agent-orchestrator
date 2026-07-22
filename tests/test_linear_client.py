@@ -425,6 +425,7 @@ def workflow_response():
             "team": {
                 "states": {
                     "nodes": [
+                        {"id": "state-backlog", "name": "Backlog", "type": "backlog"},
                         {"id": "state-todo", "name": "Todo", "type": "unstarted"},
                         {"id": "state-started", "name": "In Progress", "type": "started"},
                         {"id": "state-done", "name": "Done", "type": "completed"},
@@ -658,7 +659,12 @@ def test_create_issue_resolves_project_name_viewer_assignee_and_uses_issue_creat
     ])
     client = LinearClient(transport)
 
-    issue = client.create_issue(LinearConfig(team_id="DEV", project_name="TEST"), title="Smoke", description="Body")
+    issue = client.create_issue(
+        LinearConfig(team_id="DEV", project_name="TEST"),
+        title="Smoke",
+        description="Body",
+        state_name="Backlog",
+    )
 
     assert issue.identifier == "DEV-99"
     assert "projects" in transport.calls[0]["query"]
@@ -669,7 +675,7 @@ def test_create_issue_resolves_project_name_viewer_assignee_and_uses_issue_creat
         "teamId": "team-uuid",
         "title": "Smoke",
         "description": "Body",
-        "stateId": "state-todo",
+        "stateId": "state-backlog",
         "assigneeId": "viewer-1",
         "projectId": "project-test",
     }
