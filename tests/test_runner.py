@@ -1583,6 +1583,42 @@ def test_completed_and_validated_result_moves_done(tmp_path):
     assert not any(update["state_id"] == "state-review" for update in fake.state_updates)
 
 
+def test_report_leads_result_comment_and_replaces_stdout_on_success(tmp_path):
+    report = "## 작업 내용\n다이얼로그를 분리했습니다.\n\n## 검증\npytest 통과"
+    source = tmp_path / "payload.json"
+    source.write_text(json.dumps(make_result_payload(report=report)), encoding="utf-8")
+    script = 'import shutil,sys; print("NOISY-STDOUT"); shutil.copyfile(sys.argv[2], sys.argv[1])'
+    command = f"{sys.executable} -c '{script}' {{result_path}} {source}"
+
+    result, fake, claim = process_single(tmp_path, command, "DEV-REPORT-OK")
+
+    assert result.status == "completed"
+    bodies = [comment["body"] for comment in fake.comments if "Runner completed successfully" in comment["body"]]
+    assert bodies
+    body = bodies[0]
+    assert report in body
+    assert body.index(report) < body.index("Exit code:")
+    assert "NOISY-STDOUT" not in body
+    assert "Stdout:" not in body
+
+
+def test_report_kept_with_logs_when_run_fails_semantically(tmp_path):
+    report = "## 작업 내용\n작업 중 실패했습니다."
+    source = tmp_path / "payload.json"
+    source.write_text(json.dumps(make_result_payload(status="failed", report=report)), encoding="utf-8")
+    script = 'import shutil,sys; print("NOISY-STDOUT"); shutil.copyfile(sys.argv[2], sys.argv[1])'
+    command = f"{sys.executable} -c '{script}' {{result_path}} {source}"
+
+    result, fake, claim = process_single(tmp_path, command, "DEV-REPORT-FAIL")
+
+    assert result.status == "failed"
+    failure_bodies = [comment["body"] for comment in fake.comments if "Runner" in comment["body"] and "Started" not in comment["body"]]
+    assert failure_bodies
+    body = failure_bodies[-1]
+    assert report in body
+    assert "NOISY-STDOUT" in body
+
+
 def test_completed_semantically_rejects_blank_validation_evidence(tmp_path):
     paths = RunnerPaths(*(tmp_path,) * 7)
     result = RunnerResult(
@@ -1623,6 +1659,8 @@ def test_completed_semantically_rejects_blank_validation_evidence(tmp_path):
         ),
         (json.dumps(make_result_payload(artifacts=["/absolute/path"])), "relative path without '..'"),
         (json.dumps(make_result_payload(files_changed=["a/../escape"])), "relative path without '..'"),
+        (json.dumps(make_result_payload(report="  ")), "report must be a nonempty string when present"),
+        (json.dumps(make_result_payload(report=42)), "report must be a nonempty string when present"),
     ],
 )
 def test_load_structured_result_rejects_contract_violations(tmp_path, payload, expected_error):
@@ -1665,6 +1703,20 @@ def test_load_structured_result_valid_roundtrip(tmp_path):
     assert parsed.validation == (ValidationEvidence("check", "true", 0, "ok"),)
     assert parsed.artifacts == ("out/report.md",)
     assert parsed.files_changed == ("src/app.py",)
+    assert parsed.report is None
+
+
+def test_load_structured_result_accepts_optional_report(tmp_path):
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(make_result_payload(report="## 작업 내용\n제어 탭을 분리했습니다.")),
+        encoding="utf-8",
+    )
+
+    parsed, error = load_structured_result(result_path)
+
+    assert error is None
+    assert parsed.report == "## 작업 내용\n제어 탭을 분리했습니다."
 
 
 # ---------------------------------------------------------------------------
@@ -1685,6 +1737,8 @@ def test_prompt_and_context_carry_workspace_and_result_contract(tmp_path):
     assert str(paths.result_path) in prompt
     assert "Transport exit code 0 without this file is a failure." in prompt
     assert "Linear moves to Done only for status `completed`" in prompt
+    assert "## Required Report" in prompt
+    assert '"report":"markdown report"' in prompt
     assert issue.schema.parsed.get("Task") in prompt
     assert "`DOCKER_HOST` is explicitly present" in prompt
     assert "relative Compose bind mounts are valid" in prompt

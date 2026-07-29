@@ -142,6 +142,9 @@ class StructuredResult:
     validation: tuple[ValidationEvidence, ...]
     artifacts: tuple[str, ...] = ()
     files_changed: tuple[str, ...] = ()
+    # Optional operator-facing markdown report; when present it becomes the
+    # body of the Linear completion comment.
+    report: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1870,13 +1873,23 @@ def _parse_structured_result_payload(payload: object) -> StructuredResult:
         )
     artifacts = _result_relative_paths(payload, "artifacts")
     files_changed = _result_relative_paths(payload, "files_changed")
-    return StructuredResult(version, status, summary, tuple(validation), artifacts, files_changed)
+    report = _optional_result_string(payload, "report")
+    return StructuredResult(version, status, summary, tuple(validation), artifacts, files_changed, report)
 
 
 def _required_result_string(payload: Mapping[str, Any], key: str, *, prefix: str = "") -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"structured result {prefix}{key} must be a nonempty string")
+    return value.strip()
+
+
+def _optional_result_string(payload: Mapping[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"structured result {key} must be a nonempty string when present")
     return value.strip()
 
 
@@ -1913,6 +1926,7 @@ def _structured_result_to_state(result: StructuredResult | None) -> dict[str, An
         ],
         "artifacts": list(result.artifacts),
         "files_changed": list(result.files_changed),
+        "report": result.report,
     }
 
 
@@ -2158,11 +2172,22 @@ def render_prompt(
             f"Before finishing, write a JSON result to `{result_path}` with this exact contract:",
             "```json",
             '{"version":1,"status":"completed|failed|blocked|needs_clarification","summary":"outcome",'
+            '"report":"markdown report",'
             '"validation":[{"description":"check","command":"command","exit_code":0,"evidence":"output"}],'
             '"artifacts":["relative/path"],"files_changed":["relative/path"]}',
             "```",
             "Linear moves to Done only for status `completed` with nonempty validation evidence and all exit codes equal to 0.",
             "Transport exit code 0 without this file is a failure.",
+            "",
+            "## Required Report",
+            "The `report` field is posted verbatim as the Linear completion comment, so write it as a",
+            "well-organized markdown report for a human reviewer. Write the body in the language the issue",
+            "is written in, using exactly these section headers:",
+            "- `## 작업 내용` — what was done and the approach taken, briefly.",
+            "- `## 변경 사항` — each changed file with why it changed.",
+            "- `## 검증` — how the result was verified, with the key evidence.",
+            "- `## 남은 작업 / 참고` — follow-ups, caveats, or decisions the reviewer should know; omit if none.",
+            "Keep it factual and reviewer-oriented; do not paste raw logs (validation evidence already covers that).",
             "",
         ]
     )
@@ -2261,25 +2286,35 @@ def in_doubt_failure_comment(issue: LinearIssue, message: str) -> str:
 
 
 def _result_body(title: str, result: RunnerResult) -> str:
+    report = result.structured_result.report if result.structured_result is not None else None
     lines = [
         title,
         "",
         f"Issue: `{result.issue_identifier}`",
-        f"Exit code: `{result.exit_code}`",
-        f"Timed out: `{result.timed_out}`",
-        f"Artifacts: `{result.paths.artifacts_dir}`",
-        f"Structured result: `{result.paths.result_path}`",
     ]
+    if report:
+        lines.extend(["", _truncate_head(redact_sensitive_text(report), limit=12000), "", "---"])
+    lines.extend(
+        [
+            f"Exit code: `{result.exit_code}`",
+            f"Timed out: `{result.timed_out}`",
+            f"Artifacts: `{result.paths.artifacts_dir}`",
+            f"Structured result: `{result.paths.result_path}`",
+        ]
+    )
     if result.worktree_branch:
         lines.append(f"Local branch (not pushed): `{result.worktree_branch}` — review and merge or discard manually.")
     if result.worktree_note:
         lines.append(f"Workspace note: {redact_sensitive_text(result.worktree_note)}")
-    stdout = _truncate_tail(redact_sensitive_text(result.stdout.strip()))
-    stderr = _truncate_tail(redact_sensitive_text(result.stderr.strip()))
-    if stdout:
-        lines.extend(["", "Stdout:", "```", stdout, "```"])
-    if stderr:
-        lines.extend(["", "Stderr:", "```", stderr, "```"])
+    # A semantically complete run with a report replaces the raw log dump; any
+    # failure keeps the stdout/stderr tail because that is where errors live.
+    if not (report and result.completed_semantically):
+        stdout = _truncate_tail(redact_sensitive_text(result.stdout.strip()))
+        stderr = _truncate_tail(redact_sensitive_text(result.stderr.strip()))
+        if stdout:
+            lines.extend(["", "Stdout:", "```", stdout, "```"])
+        if stderr:
+            lines.extend(["", "Stderr:", "```", stderr, "```"])
     if result.result_error:
         lines.extend(["", f"Result contract error: `{_sanitize_error_message(result.result_error)}`"])
     if result.structured_result is not None:
@@ -2360,6 +2395,14 @@ def _truncate_tail(value: str, limit: int = 4000) -> str:
     if len(value) <= limit:
         return value
     return "... <truncated; showing tail>\n" + value[-limit:]
+
+
+def _truncate_head(value: str, limit: int = 4000) -> str:
+    """Keep the head, where a report's structure and conclusions appear."""
+
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n... <truncated>"
 
 
 def sanitize_path_part(value: str) -> str:
