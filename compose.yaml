@@ -20,6 +20,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # The container network has no IPv6 route but DNS returns AAAA records
+    # first; Node-based agent CLIs then hang on IPv6 until ETIMEDOUT. Disable
+    # IPv6 inside the container so they resolve/connect over IPv4 only.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     working_dir: /workspace/project
     env_file:
       - path: .env
