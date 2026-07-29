@@ -486,13 +486,15 @@ class ShellRunner:
                     if outcome == "timeout":
                         raise subprocess.TimeoutExpired(exec_command, self.config.timeout_seconds)
                     if outcome == "result":
-                        # Legacy opt-in behavior: the agent submitted its
-                        # structured result; the still-running TUI session is
-                        # reaped deliberately, so the transport exit code is the
-                        # orchestrator's (0), not the killed TUI's. The default
-                        # interactive path no longer reaches this branch; it
-                        # waits for the operator/backend to exit the TUI, then
-                        # loads and validates the same result file below.
+                        # The agent submitted its structured result; the
+                        # still-running TUI session is reaped deliberately, so
+                        # the transport exit code is the orchestrator's (0),
+                        # not the killed TUI's. Reached via autoclose or when
+                        # the idle/lifetime deadline passes after submission
+                        # (an unattended TUI must not fail a finished run).
+                        # Otherwise the default interactive path waits for the
+                        # operator/backend to exit the TUI, then loads and
+                        # validates the same result file below.
                         self._teardown_console(console, reason="teardown")
                         try:
                             os.killpg(process.pid, signal.SIGKILL)
@@ -602,7 +604,10 @@ class ShellRunner:
         ``on_result_submitted`` at most once without ending the default
         interactive session. If ``interactive_autoclose`` is true, also
         returns "result" after that notification, restoring the legacy
-        result-driven teardown behavior.
+        result-driven teardown behavior. A deadline reached *after* the result
+        was submitted also returns "result": the work is semantically done and
+        only the idle TUI is being reaped, so it must not be reported as a
+        timeout failure.
         """
 
         if self.config.timeout_enabled:
@@ -636,7 +641,7 @@ class ShellRunner:
                 idle_deadline = now + self.config.timeout_seconds
             remaining = min(idle_deadline, hard_deadline) - now
             if remaining <= 0:
-                return "timeout"
+                return "result" if result_submitted else "timeout"
             time.sleep(min(2.0, max(0.05, remaining)))
 
     @staticmethod

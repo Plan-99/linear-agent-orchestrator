@@ -198,28 +198,29 @@ def interactive_config(
     )
 
 
-def test_wait_interactive_default_waits_for_exit_and_keeps_timeout(tmp_path):
+def test_wait_interactive_default_waits_for_exit_and_deadline_honors_result(tmp_path):
     config = interactive_config(tmp_path, "/bin/true {prompt_path} {result_path}", timeout=1)
     runner = ShellRunner(config)
     result_path = tmp_path / "result.json"
     submitted = []
 
-    # A result file triggers one notification but does not end the run, even
-    # though the poller continues to see the same file until timeout.
+    # A result file triggers one notification but does not end the run; when
+    # the idle deadline then passes with the TUI unattended, the submitted
+    # result wins and the run finishes as "result", not a timeout failure.
     result_path.write_text(COMPLETED_RESULT, encoding="utf-8")
     started = time.monotonic()
     assert runner._wait_interactive(
         FakeProcess(),
         result_path,
         on_result_submitted=lambda: submitted.append("submitted"),
-    ) == "timeout"
+    ) == "result"
     assert time.monotonic() - started < 5
     assert submitted == ["submitted"]
 
     # Process exit is the normal completion path even after a result exists.
     assert runner._wait_interactive(FakeProcess(exits_after_polls=1), result_path) == "exited"
 
-    # Neither -> timeout after timeout_seconds.
+    # No result and no exit -> timeout after timeout_seconds.
     result_path.unlink()
     started = time.monotonic()
     assert runner._wait_interactive(FakeProcess(), result_path) == "timeout"
