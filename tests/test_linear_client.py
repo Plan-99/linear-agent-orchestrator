@@ -437,7 +437,7 @@ def workflow_response():
     }
 
 
-def issue_node(identifier="DEV-1", description=None):
+def issue_node(identifier="DEV-1", description=None, created_at="2026-07-01T00:00:00.000Z"):
     return {
         "id": f"issue-{identifier}",
         "identifier": identifier,
@@ -445,6 +445,7 @@ def issue_node(identifier="DEV-1", description=None):
         "description": description
         or "## Task\nDo it\n\n## Acceptance Criteria\n- Done\n\n## Validation\n- pytest -q",
         "url": "https://linear.app/test/issue/DEV-1",
+        "createdAt": created_at,
         "updatedAt": "2026-07-09T13:00:00.000Z",
         "state": {"id": "state-todo", "name": "Todo", "type": "unstarted"},
         "project": {"id": "project-test", "name": "TEST"},
@@ -599,6 +600,51 @@ def test_iter_todo_issues_uses_cursor_pagination():
     assert transport.calls[2]["variables"]["after"] is None
     assert transport.calls[3]["variables"]["after"] == "cursor-1"
     assert transport.calls[2]["variables"]["filter"]["project"] == {"id": {"eq": "project-test"}}
+
+
+def test_iter_todo_issues_returns_oldest_created_first():
+    transport = MockTransport(
+        [
+            workflow_response(),
+            viewer_response(),
+            poll_response(
+                [
+                    issue_node("DEV-9", created_at="2026-07-03T00:00:00.000Z"),
+                    issue_node("DEV-2", created_at="2026-07-01T00:00:00.000Z"),
+                    issue_node("DEV-5", created_at="2026-07-02T00:00:00.000Z"),
+                ]
+            ),
+        ]
+    )
+    client = LinearClient(transport)
+    config = LinearConfig(team_id="DEV", project_id="project-test")
+
+    issues = client.iter_todo_issues(config)
+
+    assert [issue.identifier for issue in issues] == ["DEV-2", "DEV-5", "DEV-9"]
+    assert issues[0].created_at == "2026-07-01T00:00:00.000Z"
+
+
+def test_iter_todo_issues_sorts_missing_created_at_last_by_issue_number():
+    transport = MockTransport(
+        [
+            workflow_response(),
+            viewer_response(),
+            poll_response(
+                [
+                    issue_node("DEV-9", created_at=""),
+                    issue_node("DEV-2", created_at=""),
+                    issue_node("DEV-5", created_at="2026-07-02T00:00:00.000Z"),
+                ]
+            ),
+        ]
+    )
+    client = LinearClient(transport)
+    config = LinearConfig(team_id="DEV", project_id="project-test")
+
+    issues = client.iter_todo_issues(config)
+
+    assert [issue.identifier for issue in issues] == ["DEV-5", "DEV-2", "DEV-9"]
 
 
 def test_schema_missing_issue_gets_clarification_comment_without_execution_path():

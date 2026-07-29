@@ -385,6 +385,7 @@ class LinearIssue:
     schema: IssueSchemaResult
     assignee_id: str | None = None
     assignee_name: str | None = None
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -548,7 +549,7 @@ class LinearClient:
         )
 
     def iter_todo_issues(self, config: LinearConfig, *, first: int = DEFAULT_PAGE_SIZE) -> tuple[LinearIssue, ...]:
-        """Fetch all currently visible Todo pages for the configured project."""
+        """Fetch all currently visible Todo pages, oldest-created issue first."""
 
         all_issues: list[LinearIssue] = []
         after: str | None = None
@@ -556,7 +557,7 @@ class LinearClient:
             page = self.poll_todo_issues(config, after=after, first=first)
             all_issues.extend(page.issues)
             if not page.has_next_page:
-                return tuple(all_issues)
+                return tuple(sorted(all_issues, key=_creation_order_key))
             after = page.end_cursor
 
 
@@ -746,7 +747,16 @@ def _issue_from_node(node: Mapping[str, Any]) -> LinearIssue:
         schema=validate_issue_body(str(description)),
         assignee_id=assignee.get("id") if isinstance(assignee, dict) else None,
         assignee_name=assignee.get("name") if isinstance(assignee, dict) else None,
+        created_at=str(node.get("createdAt") or ""),
     )
+
+
+def _creation_order_key(issue: LinearIssue) -> tuple[bool, str, int, str]:
+    """Oldest-created first; issues missing createdAt go last, then number order."""
+
+    number_text = issue.identifier.rsplit("-", 1)[-1]
+    number = int(number_text) if number_text.isdigit() else 0
+    return (not issue.created_at, issue.created_at, number, issue.identifier)
 
 
 def _lookup_state(states: Mapping[str, WorkflowState], name: str, role: str) -> WorkflowState:
@@ -822,6 +832,7 @@ query PollTodoIssues($teamId: String!, $filter: IssueFilter, $first: Int!, $afte
         title
         description
         url
+        createdAt
         updatedAt
         state { id name type }
         project { id name }
